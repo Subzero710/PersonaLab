@@ -79,14 +79,24 @@ def save_landmark_overlay(
     predicted = projected_gnm.detach().cpu().tolist()
     observed = observation.aligned_pixels().detach().cpu().tolist()
 
-    def mark(draw, position, label, color, dy):
+    # Draw text first and markers last, so neighboring index labels cannot
+    # erase a point's status color. Draw observed markers above predictions.
+    mesh_markers = []
+    overlay_markers = []
+
+    def mark(draw, markers, position, label, color, dy):
         x, y = position
-        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color, outline="white")
         draw.text((x + 3, y + dy), label, fill=color, stroke_width=1, stroke_fill="white")
+        markers.append((position, color))
+
+    def paint_markers(draw, markers):
+        for (x, y), color in markers:
+            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color, outline="white")
 
     for index, position in enumerate(predicted):
-        mark(mesh_plot, position, str(index), GNM_COLOR, -12)
+        mark(mesh_plot, mesh_markers, position, str(index), GNM_COLOR, -12)
 
+    observed_markers = []
     squared_errors = []
     for entry in observation.correspondences.entries:
         index, target = entry.dfl_index, entry.gnm_index
@@ -100,11 +110,15 @@ def save_landmark_overlay(
             color = UNSUPPORTED_COLOR
         elif active[index]:
             color = OBSERVED_COLOR
-            mark(overlay, predicted[target], str(target), GNM_COLOR, -12)
+            mark(overlay, overlay_markers, predicted[target], str(target), GNM_COLOR, -12)
         else:
             color = CONTOUR_COLOR if entry.region == Region.CONTOUR else EXCLUDED_COLOR
         label = str(index) if target in (None, index) else f"{index}->{target}"
-        mark(overlay, observed[index], label, color, 1)
+        mark(overlay, observed_markers, observed[index], label, color, 1)
+
+    paint_markers(mesh_plot, mesh_markers)
+    paint_markers(overlay, overlay_markers)
+    paint_markers(overlay, observed_markers)
 
     canvas = Image.new("RGB", (2 * max(width, 260) + 3 * PADDING, height + 150), "white")
     right_origin = 2 * PADDING + max(width, 260)

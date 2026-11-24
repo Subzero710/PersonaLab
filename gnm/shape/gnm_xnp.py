@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 import copy
 import dataclasses
 import functools
+import inspect
 from typing import Any, Self
 
 from absl import logging
@@ -40,6 +41,50 @@ enpt = gnm_typing.enpt
 
 _NONZERO_THRESHOLD = 1e-4
 _EPSILON = 1e-8
+
+
+def _normalize_model_arrays(fn):
+  """Validate model inputs without dropping native PyTorch autograd history.
+
+  etils 1.15.0 normalizes every array through xnp.asarray. PyTorch's
+  asarray defaults to requires_grad=False, including for existing tensors.
+  Use the native tensor directly for PyTorch model methods; retain the
+  existing etils normalizer for the other backends.
+  """
+  normalized = enp.check_and_normalize_arrays(strict=False)(fn)
+  signature = inspect.signature(fn)
+
+  @functools.wraps(fn)
+  def wrapped(self, *args, **kwargs):
+    xnp = self.xnp
+    if not enp.lazy.is_torch_xnp(xnp):
+      return normalized(self, *args, **kwargs)
+
+    requested_backend = kwargs.pop('xnp', None)
+    if requested_backend is not None and requested_backend is not xnp:
+      raise ValueError('GNM PyTorch inputs must use the PyTorch backend.')
+    bound = signature.bind(self, *args, **kwargs)
+    # All array parameters on these methods are floating point. The sole
+    # non-array parameter (apart from self) is the landmark configuration.
+    for name, value in bound.arguments.items():
+      if name in ('self', 'landmarks_type') or value is None:
+        continue
+      if not isinstance(value, xnp.Tensor):
+        if isinstance(value, (np.ndarray, np.generic)):
+          value = xnp.as_tensor(value, device=self.template_vertex_positions.device)
+        elif isinstance(value, (list, tuple, float, int, bool)):
+          value = xnp.as_tensor(
+              value, dtype=xnp.float32,
+              device=self.template_vertex_positions.device,
+          )
+        else:
+          raise TypeError(f'Invalid {name}: expected a tensor or numeric array.')
+      if not value.is_floating_point():
+        raise ValueError(f'Invalid {name}: expected floating-point data.')
+      bound.arguments[name] = value
+    return fn(*bound.args, **bound.kwargs)
+
+  return wrapped
 
 
 @dataclasses.dataclass(frozen=False, kw_only=True, init=False)
@@ -314,7 +359,7 @@ class GNM(gnm_base.GNMBase):
             f' {translation.shape}'
         )
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def __call__(
       self,
       identity: enpt.FloatArray['A1 ... An I'] | None = None,
@@ -387,7 +432,7 @@ class GNM(gnm_base.GNMBase):
 
     return self.vertex_positions_world(vertices, joints, rotations, translation)
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def vertices_and_landmarks(
       self,
       landmarks_type: gnm_landmarks.GNMLandmarksType,
@@ -594,7 +639,7 @@ class GNM(gnm_base.GNMBase):
         axis=0
     )
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def vertex_positions_bind_pose(
       self,
       identity: enpt.FloatArray['A1 ... An I'],
@@ -619,7 +664,7 @@ class GNM(gnm_base.GNMBase):
         self.expression_basis,
     )
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def joint_positions_bind_pose(
       self,
       identity: enpt.FloatArray['A1 ... An I'],
@@ -640,7 +685,7 @@ class GNM(gnm_base.GNMBase):
         self.joint_identity_basis,
     )
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def compute_pose_correctives(
       self,
       rotations: enpt.FloatArray['A1 ... An J 3'],
@@ -664,7 +709,7 @@ class GNM(gnm_base.GNMBase):
         self.num_vertices,
     )
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def joint_transforms_world(
       self,
       joints: enpt.FloatArray['A1 ... An J 3'],
@@ -685,7 +730,7 @@ class GNM(gnm_base.GNMBase):
         joints, rotations, translation, self.joint_parent_indices
     )
 
-  @enp.check_and_normalize_arrays(strict=False)
+  @_normalize_model_arrays
   def get_posed_joint_transforms(
       self,
       identity: enpt.FloatArray['A1 ... An I'],

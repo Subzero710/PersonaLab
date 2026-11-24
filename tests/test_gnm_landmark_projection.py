@@ -227,6 +227,9 @@ def test_end_to_end_gradients_and_shared_identity_finite_difference(head_model, 
         return project(gnm_to_frontal_axes(points), camera)
 
     target = predict(*variables).detach() + template.new_tensor((2.5, -1.75))
+    assert all(parameter.requires_grad for parameter in variables), (
+        "GNM must not mutate the caller's requires_grad flags"
+    )
     observations = [
         LandmarkObservation(observation_id=f"view-{index}", image_size=SIZE, landmarks=values)
         for index, values in enumerate(target)
@@ -360,6 +363,10 @@ def test_overlay_includes_indices_correspondences_and_mask_colors(tmp_path):
     assert np.any(np.all(left == ImageColor.getrgb(GNM_COLOR), axis=-1))
     for color in [OBSERVED_COLOR, RESIDUAL_COLOR, CONTOUR_COLOR, UNSUPPORTED_COLOR]:
         assert np.any(np.all(right == ImageColor.getrgb(color), axis=-1)), color
+    # Check the actual observed centers, not just the presence of a color.
+    for index, color in [(0, CONTOUR_COLOR), (19, UNSUPPORTED_COLOR)]:
+        x, y = observed[index].to(torch.int64).tolist()
+        np.testing.assert_array_equal(right[y, x], ImageColor.getrgb(color))
     # Index text extends beyond its landmark marker.
     x, y = projected[0].to(torch.int64).tolist()
     index_text = left[y - 12:y - 2, x + 3:x + 12]
