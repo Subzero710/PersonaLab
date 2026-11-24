@@ -13,7 +13,7 @@ from zlib import crc32
 import numpy as np
 import pytest
 
-from personalab.dfl import (
+from persona_lab.dfl import (
     DFLFaceSample, DatasetError, DFLError, ErrorCode, SampleRejection,
     iter_dataset, validate_dataset,
 )
@@ -257,7 +257,7 @@ def test_closing_iterator_releases_dataset_handles(tmp_path, dfl_jpeg, container
 
 def _run_cli(*args):
     return subprocess.run(
-        [sys.executable, "-m", "personalab.dfl_import", *map(str, args)],
+        [sys.executable, "-m", "persona_lab.dfl_import", *map(str, args)],
         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, check=False,
     )
 
@@ -300,7 +300,7 @@ import sys
 import time
 import tracemalloc
 
-from personalab.dfl import DFLFaceSample, iter_dataset
+from persona_lab.dfl import DFLFaceSample, iter_dataset
 
 def peak_rss_kib():
     for line in Path("/proc/self/status").read_text().splitlines():

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from personalab.dfl import ErrorCode, SampleError, read_jpeg
+from persona_lab.dfl import ErrorCode, SampleError, read_jpeg
 
 
 @pytest.mark.parametrize("progressive", [False, True])

@@ -417,13 +417,26 @@ class GNM(gnm_base.GNMBase):
       ([A1, ..., An], V, 3) and landmarks has shape ([A1, ..., An], L, 3).
     """
     gnm_landmarks.check_body_part_compatibility(landmarks_type, self.body_part)
+    template = self.template_vertex_positions
     if landmarks_type not in self._landmarks:
       config = gnm_landmarks.load_landmarks(landmarks_type)
+      device_kwargs = (
+          {'device': template.device} if enp.lazy.is_torch(template) else {}
+      )
       self._landmarks[landmarks_type] = (
-          self.xnp.asarray(config.indices, dtype=self.xnp.int32),
-          self.xnp.asarray(config.weights, dtype=self.xnp.float32),
+          self.xnp.asarray(
+              config.indices, dtype=self.xnp.int32, **device_kwargs
+          ),
+          self.xnp.asarray(
+              config.weights, dtype=self.xnp.float32, **device_kwargs
+          ),
       )
     indices, weights = self._landmarks[landmarks_type]
+    # Module.to() moves registered buffers, leaving this dictionary untouched.
+    if enp.lazy.is_torch(template) and indices.device != template.device:
+      indices = indices.to(device=template.device)
+      weights = weights.to(device=template.device)
+      self._landmarks[landmarks_type] = (indices, weights)
 
     vertices = self(
         identity=identity,
