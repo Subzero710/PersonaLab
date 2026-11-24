@@ -33,9 +33,9 @@ Run these commands from the repository root on Linux (x86-64):
 ```sh
 mkdir -p datasets models outputs .gnm-cache
 export PERSONALAB_UID=$(id -u) PERSONALAB_GID=$(id -g)
-docker compose build persona_lab
-docker compose run --rm persona_lab python -m persona_lab.gnm_mesh --output outputs/neutral.obj
-docker compose run --rm persona_lab python -m pytest -v tests
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.gnm_mesh --output outputs/neutral.obj
+docker compose run --rm personalab python -m pytest -v tests
 ```
 
 The official GNM model is downloaded by GNM on first use and cached in
@@ -58,8 +58,8 @@ Toolkit installation are required. Build and check the explicitly selected
 CUDA 12.8 PyTorch environment:
 
 ```sh
-docker compose --profile cuda build persona_lab-cuda
-docker compose --profile cuda run --rm persona_lab-cuda python -c 'import torch; print(torch.cuda.get_device_name(0))'
+docker compose --profile cuda build personalab-cuda
+docker compose --profile cuda run --rm personalab-cuda python -c 'import torch; print(torch.cuda.get_device_name(0))'
 ```
 
 The CUDA service refuses to start when PyTorch cannot access CUDA. The existing
@@ -76,9 +76,9 @@ ZIP scans include nested files. Use the CPU service from the repository root
 after building the image.
 
 ```sh
-docker compose run --rm persona_lab python -m persona_lab.dfl_import \
+docker compose run --rm personalab python -m persona_lab.dfl_import \
   --input datasets/studio_light.zip --output outputs/dfl-validation.json
-docker compose run --rm persona_lab python -m persona_lab.dfl_import \
+docker compose run --rm personalab python -m persona_lab.dfl_import \
   --input datasets/aligned --output outputs/dfl-directory-validation.json
 ```
 
@@ -151,7 +151,7 @@ Each `rejections` entry contains a sample ID, relative image reference where
 safe, dimensions where known, field statuses, missing optional fields, and
 one or more `issues` with `code`, `message`, and optional `field`.
 `rejection_counts` counts samples per distinct issue code. The stable codes
-are defined by `personalab.dfl.ErrorCode`. Reports omit source filenames and
+are defined by `persona_lab.dfl.ErrorCode`. Reports omit source filenames and
 pixel, coordinate, and mask values.
 
 ### Format and resource limits
@@ -199,12 +199,12 @@ with `tracemalloc`, and Linux process RSS high-water marks after imports and
 after iteration. The process keeps only the current sample.
 
 ```sh
-docker compose run --rm persona_lab python -m pytest -s -v tests/test_dfl_dataset.py -k streaming_memory
+docker compose run --rm personalab python -m pytest -s -v tests/test_dfl_dataset.py -k streaming_memory
 ```
 
 ## Project GNM landmarks into an aligned crop
 
-`personalab.gnm_geometry.load_sparse_landmarks(model)` loads the installed
+`persona_lab.gnm_geometry.load_sparse_landmarks(model)` loads the installed
 GNM `HEAD_SPARSE_68` resource and checks its arrays against the v3.0 Head
 topology. Each of the 68 definitions holds three vertex indices and three
 finite weights in `[0, 1]`. The absolute sum tolerance is 0.00101 for the
@@ -220,7 +220,7 @@ values for omitted inputs.
 
 ### Anatomical correspondence and fitting masks
 
-`personalab.correspondences.DFL_TO_GNM` records the subject-side anatomy,
+`persona_lab.correspondences.DFL_TO_GNM` records the subject-side anatomy,
 region, GNM index, default eligibility and any limitation for each DFL index.
 The official GNM v3.0 template, its anatomical vertex groups, and its vertex
 mirror table match DeepFaceLab's indexed convention across the following regions.
@@ -297,7 +297,7 @@ requires additional depth information.
 
 ### Cameras and observations
 
-`personalab.camera.project(points, camera)` consumes `(..., N, 3)`
+`persona_lab.camera.project(points, camera)` consumes `(..., N, 3)`
 and returns `(..., N, 2)` pixel centers in input point order. Inputs and
 camera parameters share a CPU or CUDA device and float32 or float64 dtype.
 Their leading dimensions broadcast using PyTorch rules. Each camera batch
@@ -374,7 +374,7 @@ GPU and the existing CUDA Compose service.
 ### Headless landmark diagnostics
 
 ```sh
-docker compose run --rm persona_lab python -m persona_lab.landmark_diagnostics \
+docker compose run --rm personalab python -m persona_lab.landmark_diagnostics \
   --output outputs/landmark-diagnostics
 ```
 

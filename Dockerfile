@@ -30,8 +30,8 @@ RUN python -m pip install --no-cache-dir \
     && rm -rf /tmp/gnm-shape
 
 WORKDIR /app
-COPY persona_lab/ /app/personalab/
+COPY persona_lab/ /app/persona_lab/
 COPY tests/ /app/tests/
 COPY docker/require-cuda.sh /usr/local/bin/require-cuda
 RUN chmod 0755 /usr/local/bin/require-cuda
-CMD ["python", "-m", "personalab.gnm_mesh", "--help"]
+CMD ["python", "-m", "persona_lab.gnm_mesh", "--help"]
