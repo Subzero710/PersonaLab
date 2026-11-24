@@ -25,7 +25,7 @@ COPY docker/constraints.txt /tmp/constraints.txt
 COPY gnm/shape/ /tmp/gnm-shape/
 # A regular wheel installation is required by the landmark resource test.
 RUN python -m pip install --no-cache-dir \
-        --constraint /tmp/constraints.txt '/tmp/gnm-shape[pytorch,jax,dev]' \
+        --constraint /tmp/constraints.txt '/tmp/gnm-shape[pytorch,jax,dev]' Pillow \
     && python -m pip check \
     && rm -rf /tmp/gnm-shape
 
