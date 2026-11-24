@@ -68,6 +68,140 @@ by this container configuration. The image pins PyTorch and the direct
 numerical/test dependencies reported in Issue #1, but does not lock every
 transitive dependency or the base image digest.
 
+## Import DeepFaceLab aligned JPEGs
+
+PersonaLab accepts one `.jpg` or `.jpeg`, a directory of JPEGs, or a `.zip`
+archive containing JPEGs. Extensions are case-insensitive, and directory and
+ZIP scans include nested files. Use the CPU service from the repository root
+after building the image.
+
+```sh
+docker compose run --rm personalab python -m personalab.dfl_import \
+  --input datasets/studio_light.zip --output outputs/dfl-validation.json
+docker compose run --rm personalab python -m personalab.dfl_import \
+  --input datasets/aligned --output outputs/dfl-directory-validation.json
+```
+
+Omit `--output` to write JSON to stdout. A report path must be new and outside
+a directory input. Exit status 0 indicates a successful scan with zero
+rejections, 1 indicates one or more sample rejections, and 2 indicates a
+dataset or CLI error. Dataset failures produce a `dataset_error` object with
+a stable `code` and a `message`. Command and output I/O errors go to stderr.
+
+```python
+from personalab.dfl import DFLFaceSample, iter_dataset, read_jpeg, validate_dataset
+
+sample = read_jpeg("datasets/aligned/0001.jpg")
+original_jpeg = sample.read_image_bytes()
+
+for result in iter_dataset("datasets/studio_light.zip"):
+    if isinstance(result, DFLFaceSample):
+        print(result.sample_id, result.landmarks.shape)
+    else:
+        print(result.sample_id, [issue.code for issue in result.issues])
+
+report = validate_dataset("datasets/aligned").to_dict()
+```
+
+`read_jpeg` raises `SampleError` with a `rejection` for an invalid JPEG.
+`iter_dataset` yields a `DFLFaceSample` or `SampleRejection` for each
+discovered JPEG. Both API entry points raise `DatasetError` for input-level
+failures. Exhaust the iterator or call `close()` if you stop early.
+The iterator releases its files and archive on completion. Samples retain
+metadata and an image reference. `read_image_bytes()` reopens that reference,
+verifies a SHA-256 digest, and returns caller-owned immutable bytes suitable
+for a pixel decoder. It raises `DFLError` with code `dataset_changed` if the
+original bytes are no longer available. Scan-time pixel buffers are released
+after each image. Keep only the samples needed by the consumer.
+
+| Sample field | Python type and convention |
+| --- | --- |
+| `sample_id`, `image_ref` | `str`. The reference is a dataset-relative POSIX path, or the JPEG basename for a single input. The ID uses the reference with a `zip:` prefix for accepted archive members. |
+| `image_size` | `tuple[int, int]` in `(width, height)` order from the JPEG frame header. |
+| `landmarks` | Required `np.ndarray` of shape `(68, 2)`. Original ordered `(x, y)` aligned JPEG pixel coordinates, with origin at the upper left. Finite coordinates outside the frame are accepted. |
+| `face_type`, `source_filename` | `str \| None`. DFL face type and original source filename as metadata. |
+| `source_rect` | `np.ndarray \| None`, shape `(4,)`, ordered left, top, right, bottom in source pixels. |
+| `source_landmarks` | `np.ndarray \| None`, shape `(68, 2)`, in the original source-image pixel coordinate system. |
+| `image_to_face_mat` | `np.ndarray \| None`, shape `(2, 3)`. The stored affine matrix maps source coordinates to the aligned JPEG. |
+| `xseg_mask` | `np.ndarray \| None`, `float32` of shape `(mask_height, mask_width, 1)`. Rows and columns index the mask's native grid over the aligned image. Values are decoded grayscale divided by 255, with zero for background and one for fully selected pixels. |
+| `additional_metadata` | `dict[str, object]` of remaining safely decoded values, including `eyebrows_expand_mod` and `seg_ie_polys` when present. Polygons preserve their stored representation. |
+
+Coordinate and transform arrays are read-only. Stored NumPy arrays keep their
+real numeric dtype and byte order. Python sequences use NumPy dtype inference
+with exact numeric values required. Missing or null optional fields become
+`None` or are absent from `additional_metadata`. Each invalid required or
+available optional field rejects the sample with its own issue. DFL
+`mark_only` files contain an unaligned image and are rejected. XSeg accepts
+compressed grayscale PNG or JPEG in a one-dimensional `uint8` array or a
+two-dimensional single row or column. The mask keeps its resolution even
+when it differs from the JPEG.
+
+### Validation report
+
+`discovered_samples` equals `accepted_samples` plus `rejected_samples`.
+`resolution_distribution` counts readable frame headers by `WIDTHxHEIGHT`.
+`unknown_resolution` accounts for the rest. The `landmarks` and `xseg_masks`
+counts group samples by `valid`, `invalid`, `missing`, and `unknown`. Unknown
+means inspection stopped before field validation. The report counts missing
+optional fields after successful metadata decoding, conflicting APP15
+segments or invalid alignment data under `inconsistent_metadata`, and
+unsupported representations under `unsupported_metadata`.
+
+Each `rejections` entry contains a sample ID, relative image reference where
+safe, dimensions where known, field statuses, missing optional fields, and
+one or more `issues` with `code`, `message`, and optional `field`.
+`rejection_counts` counts samples per distinct issue code. The stable codes
+are defined by `personalab.dfl.ErrorCode`. Reports omit source filenames and
+pixel, coordinate, and mask values.
+
+### Format and resource limits
+
+The decoder reads DFL's raw binary pickle dictionary in JPEG APP15. A
+recognized DFL key identifies a decoded dictionary. Multiple DFL segments
+are an error. Supported binary protocols are 2 through 5, including NumPy
+1.x and 2.x legacy array state, fixed-width numeric and boolean dtypes,
+scalars, and protocol 5 in-band buffers. Legacy NumPy dtype reducers using
+integer flags `(0, 1)` and modern boolean flags `(False, True)` are supported. Plain strings, numbers, bytes,
+booleans, lists, tuples, string-keyed dictionaries, and nulls are supported.
+The decoder resolves known global names to inert symbols and validates each
+state before reconstructing data. It rejects arbitrary globals, constructors,
+object and structured arrays, persistent and extension references, and
+external buffers. Other JPEG frame formats and trailing JPEG data are
+rejected. Pixel checks use Pillow, and JPEG corruption that still decodes
+successfully can remain undetected.
+
+| Scope | Limits |
+| --- | --- |
+| JPEG | 32 MiB, up to 8,192 pixels per axis and 16 Mi pixels in total, 8,192 markers, 128 scans, and 16 APP15 segments. Supported frames are 8-bit sequential and progressive. |
+| APP15 | 65,533 bytes per payload, 16,384 opcodes and expanded values, 4,096 memo slots, nesting up to 32, and up to four NumPy axes. Array buffers are at most 65,533 bytes each and 262,132 bytes cumulatively. Legacy byte reconstructions have their own 262,132-byte budget. |
+| XSeg | Up to 4,096 pixels per axis and 4 Mi pixels in total. PNG support covers streams with only IHDR, IDAT, and IEND chunks. |
+| Directory | Up to 20,000 entries, 64 relative path components, and 1,024 bytes per relative path. Entries are visited in depth-first name order. Symlink directories are skipped and JPEG-named symlinks are rejected. |
+| ZIP | Classic single-volume ZIP, up to 4 GiB minus one byte, an 8 MiB index, 20,000 entries, and 8 GiB of cumulative JPEG expansion. Members use stored or DEFLATE compression, up to 32 MiB compressed and uncompressed and a 200:1 expansion ratio. |
+
+Directory and archive contents are read-only. ZIP members are inspected in
+name order without extracting files. Duplicate names, unsafe paths,
+nonregular members, ZIP64 headers, and encrypted JPEG entries are rejected.
+Unsafe member paths are omitted and identified by central-directory index.
+Limits on the entire dataset or an unreadable directory surface as
+dataset-level errors.
+
+The format references are the upstream DeepFaceLab
+[JPEG writer](https://github.com/iperov/DeepFaceLab/blob/e4b7543ffa1d73b26fce1e31852727f658ba490c/DFLIMG/DFLJPG.py),
+[extractor](https://github.com/iperov/DeepFaceLab/blob/e4b7543ffa1d73b26fce1e31852727f658ba490c/mainscripts/Extractor.py),
+and [polygon format](https://github.com/iperov/DeepFaceLab/blob/e4b7543ffa1d73b26fce1e31852727f658ba490c/core/imagelib/SegIEPolys.py).
+NumPy's [array reducers](https://github.com/numpy/numpy/blob/v2.5.4/numpy/_core/src/multiarray/methods.c)
+and [dtype state](https://github.com/numpy/numpy/blob/v2.5.4/numpy/_core/src/multiarray/descriptor.c)
+describe the supported binary conventions.
+
+To measure streaming memory on 600 synthetic JPEGs with masks per input
+type, run the following test. It measures elapsed time, Python allocations
+with `tracemalloc`, and Linux process RSS high-water marks after imports and
+after iteration. The process keeps only the current sample.
+
+```sh
+docker compose run --rm personalab python -m pytest -s -v tests/test_dfl_dataset.py -k streaming_memory
+```
+
 ## GNM Ecosystem Packages
 
 Here we list all the available GNM packages:

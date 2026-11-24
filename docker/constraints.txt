@@ -12,3 +12,5 @@ pytest==9.2.0
 jax==0.12.1
 jaxlib==0.12.1
 tensorflow==2.21.0
+# Direct dependency of the DeepFaceLab JPEG and XSeg readers.
+pillow==13.0.0
