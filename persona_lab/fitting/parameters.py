@@ -49,6 +49,33 @@ class TensorState:
     cameras: tuple[Camera, ...]
 
 
+# Names of the independent optimizer coordinates, in stable column order.
+PARAMETER_GROUPS = {
+    "identity": "identity", "expression": "expression", "pose": "pose",
+    "root": "pose", "camera_delta": "camera",
+}
+
+
+class InvalidGeometry(ValueError):
+    """A parameter state cannot be projected with its configured geometry."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ParameterValues:
+    identity: Tensor | None
+    expression: Tensor | None
+    pose: Tensor | None
+    root: Tensor | None
+    camera_delta: Tensor | None
+
+    def batch(self, start, stop):
+        return replace(self, **{
+            name: values[start:stop]
+            for name in ("expression", "pose", "root", "camera_delta")
+            if (values := getattr(self, name)) is not None
+        })
+
+
 def validate_model(model):
     if not isinstance(model, BenchmarkModel):
         raise ValueError("Use load_benchmark_model to load the verified GNM v3.0 Head")
@@ -214,11 +241,10 @@ class FittingParameters:
         }
         return {name: tuple(p for p in values if p is not None) for name, values in groups.items()}
 
-    def _camera(self, index):
+    def _camera(self, index, offsets):
         camera = self.initial.cameras[index]
-        if self.camera_delta is None:
+        if offsets is None:
             return camera
-        offsets = self.camera_delta[index]
         if isinstance(camera, WeakPerspectiveCamera):
             return replace(
                 camera, translation=camera.translation + offsets[:2] * self.short_edges[index],
@@ -228,40 +254,53 @@ class FittingParameters:
         depth = initial_z * offsets[2].exp()
         if not torch.isfinite(depth) or depth <= 0:
             identifier = self.observation_ids[index]
-            raise ValueError(f"{identifier} has invalid estimated perspective translation Z")
+            raise InvalidGeometry(f"{identifier} has invalid estimated perspective translation Z")
         translation = torch.cat((initial_xy + offsets[:2] * initial_z,
                                  depth.unsqueeze(0)))
         return replace(camera, translation=translation)
 
-    def state(self, start, stop):
+    def values(self):
+        return ParameterValues(*(getattr(self, name) for name in PARAMETER_GROUPS))
+
+    def state(self, start, stop, values=None):
+        if values is None:
+            values = self.values().batch(start, stop)
         identity = self.initial.identity
-        if self.identity is not None:
-            identity = identity.index_copy(0, self.identity_indices, self.identity)
+        if values.identity is not None:
+            identity = identity.index_copy(0, self.identity_indices, values.identity)
         expression = self.initial.expression[start:stop]
-        if self.expression is not None:
-            expression = expression.index_copy(1, self.expression_indices, self.expression[start:stop])
+        if values.expression is not None:
+            expression = expression.index_copy(1, self.expression_indices, values.expression)
         rotations = self.initial.rotations[start:stop]
-        if self.pose is not None:
-            rotations = rotations.index_copy(1, self.head_indices, self.pose[start:stop, None, :])
-        translation = self.initial.translation[start:stop] if self.root is None else self.root[start:stop]
-        cameras = tuple(self._camera(i) for i in range(start, stop))
+        if values.pose is not None:
+            rotations = rotations.index_copy(1, self.head_indices, values.pose[:, None, :])
+        translation = self.initial.translation[start:stop] if values.root is None else values.root
+        cameras = tuple(
+            self._camera(index, None if values.camera_delta is None else values.camera_delta[row])
+            for row, index in enumerate(range(start, stop))
+        )
         return TensorState(identity, expression, rotations, translation, cameras)
 
-    def penalties(self):
+    def penalty_delta(self, name, value, start=0, stop=None):
+        if name == "pose":
+            return value - self.initial.rotations[start:stop, self.head_index]
+        if name == "root":
+            return value - self.initial.translation[start:stop]
+        return value
+
+    def penalties(self, values=None):
+        values = self.values() if values is None else values
         zero = self.initial.identity.new_zeros(())
-        identity = zero if self.identity is None else self.identity.square().mean()
-        expression = zero if self.expression is None else self.expression.square().mean()
-        pose = zero
-        if self.pose is not None:
-            pose = (self.pose - self.initial.rotations[:, self.head_index]).square().mean()
-        if self.root is not None:
-            pose = pose + (self.root - self.initial.translation).square().mean()
-        camera = zero if self.camera_delta is None else self.camera_delta.square().mean()
-        config = self.config
-        return (
-            identity * config.identity_weight, expression * config.expression_weight,
-            pose * config.pose_weight, camera * config.camera_weight,
-        )
+        terms = {}
+        for group in ("identity", "expression", "pose", "camera"):
+            squares = [
+                self.penalty_delta(name, value).square().mean()
+                for name, parent in PARAMETER_GROUPS.items()
+                if group == parent and (value := getattr(values, name)) is not None
+            ]
+            total = sum(squares[1:], squares[0]) if squares else zero
+            terms[group] = total * getattr(self.config, f"{group}_weight")
+        return tuple(terms.values())
 
 
 def stack_cameras(cameras):

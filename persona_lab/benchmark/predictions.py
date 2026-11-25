@@ -13,7 +13,7 @@ from .dataset import camera_from_record, camera_to_record
 from .storage import publish_directory, read_arrays, read_json, require_keys, validate_arrays, write_json
 
 
-PREDICTION_VERSION = 1
+PREDICTION_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,11 +55,17 @@ def read_predictions(path, dataset):
     """Validate an external prediction directory against the associated benchmark."""
     path = Path(path)
     manifest = read_json(path / "manifest.json")
-    require_keys(manifest, {"schema_version", "dataset_id", "model", "subjects"}, "Prediction manifest")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != PREDICTION_VERSION:
+    version = manifest.get("schema_version")
+    if type(version) is not int or version not in (1, PREDICTION_VERSION):
         raise ValueError("Unsupported prediction schema version")
+    keys = {"schema_version", "dataset_id", "model", "subjects"}
+    if version == PREDICTION_VERSION:
+        keys.add("source_dataset_id")
+    require_keys(manifest, keys, "Prediction manifest")
     if manifest["dataset_id"] != dataset.dataset_id:
         raise ValueError("Predictions are associated with a different benchmark dataset")
+    if version == PREDICTION_VERSION and manifest["source_dataset_id"] != dataset.source_dataset_id:
+        raise ValueError("Predictions are associated with a different source benchmark dataset")
     if manifest["model"] != dataset.model_metadata:
         raise ValueError("Prediction model, topology or parameter ordering differs from the benchmark")
     records = manifest["subjects"]
@@ -122,6 +128,7 @@ def write_predictions(path, dataset, predictions):
     manifest = {
         "schema_version": PREDICTION_VERSION,
         "dataset_id": dataset.dataset_id,
+        "source_dataset_id": dataset.source_dataset_id,
         "model": dataset.model_metadata,
         "subjects": [],
     }

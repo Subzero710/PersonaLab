@@ -9,7 +9,7 @@ import torch
 from ..camera import project
 from ..coordinates import gnm_to_frontal_axes
 from ..gnm_geometry import extract_landmarks
-from .parameters import stack_cameras
+from .parameters import InvalidGeometry, PARAMETER_GROUPS, stack_cameras
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,11 +37,15 @@ class Reprojection:
     observations: tuple[PixelStatistics, ...]
 
 
-def project_batch(model, state, observation_ids):
-    _, landmarks = extract_landmarks(
+def project_batch(model, state, observation_ids, *, check_geometry=False):
+    vertices, landmarks = extract_landmarks(
         model.head, identity=state.identity, expression=state.expression,
         rotations=state.rotations, translation=state.translation,
     )
+    if check_geometry and not torch.isfinite(vertices).all():
+        raise InvalidGeometry("Nonfinite GNM vertex coordinates")
+    if check_geometry and not torch.isfinite(landmarks).all():
+        raise InvalidGeometry("Nonfinite GNM landmark coordinates")
     axes = gnm_to_frontal_axes(landmarks)
     groups = defaultdict(list)
     for index, camera in enumerate(state.cameras):
@@ -53,22 +57,47 @@ def project_batch(model, state, observation_ids):
             projected = project(axes[indices], cameras)
         except ValueError as error:
             identifiers = ", ".join(observation_ids[index] for index in indices)
-            raise ValueError(f"Invalid projection in batch [{identifiers}]: {error}") from error
+            raise InvalidGeometry(f"Invalid projection in batch [{identifiers}]: {error}") from error
         for index, row in zip(indices, projected.unbind(0), strict=True):
             rows[index] = row
     return torch.stack(rows)
 
 
-def landmark_contribution(projected, data, start, stop):
-    """Return the batch's share of the total loss and squared pixel residuals."""
+def _landmark_residuals(projected, data, start, stop):
     indices = data.gnm_indices[start:stop, :, None].expand(-1, -1, 2)
     mapped = projected.gather(1, indices)
     eligible = data.eligible[start:stop, :, None]
     # Zero both operands before subtraction to isolate masked observations.
     residual = mapped.masked_fill(~eligible, 0) - data.pixels[start:stop].masked_fill(~eligible, 0)
-    normalized = residual / data.short_edges[start:stop, None, None]
+    return residual / data.short_edges[start:stop, None, None], residual
+
+
+def landmark_contribution(projected, data, start, stop):
+    """Return the batch's share of the total loss and squared pixel residuals."""
+    normalized, residual = _landmark_residuals(projected, data, start, stop)
     loss = (normalized.square().sum(-1) * data.weights[start:stop]).sum() / data.weight_sum
     return loss, residual.detach().square().sum(-1)
+
+
+def weighted_landmark_residuals(projected, data, start, stop):
+    """Square-root weighting with the full dataset's eligible weight sum."""
+    normalized, _ = _landmark_residuals(projected, data, start, stop)
+    return _weighted(normalized, data, start, stop)
+
+
+def _weighted(normalized, data, start, stop):
+    mask = data.eligible[start:stop]
+    scale = (data.weights[start:stop][mask].double() / data.weight_sum.double()).sqrt()
+    return (normalized[mask].double() * scale[:, None]).flatten()
+
+
+def regularization_residual(parameters, name, value, start=0, stop=None):
+    """Return the residual and diagonal slope for one selected coordinate group."""
+    group = PARAMETER_GROUPS[name]
+    strength = getattr(parameters.config, f"{group}_weight")
+    slope = math.sqrt(strength / getattr(parameters, name).numel())
+    delta = parameters.penalty_delta(name, value, start, stop)
+    return delta.double() * slope, slope
 
 
 def _statistics(squared_pixels, counts):
@@ -92,19 +121,27 @@ def _statistics(squared_pixels, counts):
     return Reprojection(overall, observations)
 
 
-def evaluate_objective(model, data, parameters, active=()):
+def evaluate_objective(model, data, parameters, active=(), *, candidate=None, least_squares=False):
     """Backpropagate each batch, then apply the global regularizers once."""
     batch_size = parameters.config.batch_size
-    landmarks = model.reference.new_zeros(())
+    dtype = torch.float64 if least_squares else model.reference.dtype
+    landmarks = model.reference.new_zeros((), dtype=dtype)
     squared_pixels = []
     with torch.set_grad_enabled(bool(active)):
         for start in range(0, len(data), batch_size):
             stop = min(start + batch_size, len(data))
-            state = parameters.state(start, stop)
+            values = None if candidate is None else candidate.batch(start, stop)
+            state = parameters.state(start, stop, values)
             projected = project_batch(
                 model, state, tuple(obs.observation_id for obs in data.observations[start:stop]),
+                check_geometry=least_squares,
             )
-            loss, distances = landmark_contribution(projected, data, start, stop)
+            if least_squares:
+                normalized, pixel_residual = _landmark_residuals(projected, data, start, stop)
+                loss = _weighted(normalized, data, start, stop).square().sum()
+                distances = pixel_residual.detach().double().square().sum(-1)
+            else:
+                loss, distances = landmark_contribution(projected, data, start, stop)
             if not torch.isfinite(loss) or not torch.isfinite(distances).all():
                 raise FloatingPointError("Nonfinite landmark objective or pixel distances")
             if active:
@@ -118,7 +155,16 @@ def evaluate_objective(model, data, parameters, active=()):
         missing = [name for name, parameter in active if parameter.grad is None]
         if missing:
             raise RuntimeError(f"Missing landmark gradients for {', '.join(missing)}")
-        penalties = parameters.penalties()
+        if least_squares:
+            values = parameters.values() if candidate is None else candidate
+            penalties = dict.fromkeys(("identity", "expression", "pose", "camera"), landmarks.new_zeros(()))
+            for name, group in PARAMETER_GROUPS.items():
+                if (value := getattr(values, name)) is not None:
+                    residual, _ = regularization_residual(parameters, name, value)
+                    penalties[group] = penalties[group] + residual.square().sum()
+            penalties = tuple(penalties.values())
+        else:
+            penalties = parameters.penalties(candidate)
         regularization = sum(penalties)
         total = landmarks + regularization
         if not torch.isfinite(total):

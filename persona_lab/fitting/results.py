@@ -17,11 +17,13 @@ from ..correspondences import DFL_LANDMARK_COUNT
 from .configuration import FitConfig
 from .initialization import InitializationChoice
 from .losses import LossValues, PixelStatistics, Reprojection
+from .monitoring import OptimizationDiagnostics, OptimizationUpdate, Trial
 from .parameters import ParameterSelection, TensorState, copy_camera, resolve_selection, validate_model
 
 
-SCHEMA_VERSION = 1
-STATUSES = ("budget_exhausted", "converged", "stopped", "failed")
+SCHEMA_VERSION = 2
+FAILED_STATUSES = ("failed", "numerical_failure", "no_acceptable_step")
+STATUSES = ("budget_exhausted", "converged", "stopped", *FAILED_STATUSES)
 ARRAY_FIELDS = ("identity", "expression", "rotations", "translation")
 
 
@@ -82,6 +84,7 @@ class FitResult:
     status: str
     reason: str
     runtime: dict
+    optimization: OptimizationDiagnostics | None = None
 
     @property
     def gauge(self):
@@ -102,7 +105,7 @@ class FitResult:
 
     def to_prediction(self, *, initial=False, dtype=None) -> SubjectPrediction:
         """Convert actual parameters to Issue #4's known-camera or complete input."""
-        if self.status == "failed" or self.final is None:
+        if self.status in FAILED_STATUSES or self.final is None:
             raise ValueError("A failed run cannot produce a benchmark prediction")
         state = self.initial if initial else self.final
         dtype = np.dtype(self.dtype if dtype is None else dtype)
@@ -162,6 +165,7 @@ def _metadata(result):
         "status": result.status,
         "reason": result.reason,
         "runtime": result.runtime,
+        "optimization": None if result.optimization is None else asdict(result.optimization),
     }
 
 
@@ -237,6 +241,32 @@ def _decode_cameras(records, ids, dtype, config):
     return tuple(cameras)
 
 
+def _decode_optimization(record, config):
+    if record is None:
+        return None
+    options = dict(_fields(OptimizationDiagnostics, record))
+    for name in ("initial_objective", "final_objective"):
+        value = options[name]
+        if value is not None:
+            options[name] = LossValues(**_fields(LossValues, value))
+    updates = tuple(OptimizationUpdate(**_fields(OptimizationUpdate, item)) for item in options["updates"])
+    trials = tuple(Trial(**_fields(Trial, item)) for item in options["trials"])
+    names = {stage.name for stage in config.stages}
+    for count in ("objective_evaluations", "jacobian_evaluations", "accepted_updates", "rejected_trials"):
+        if type(options[count]) is not int or options[count] < 0:
+            raise ValueError("Invalid optimization evaluation or step count")
+    if (
+        options["accepted_updates"] != len(updates)
+        or options["rejected_trials"] != sum(not trial.accepted for trial in trials)
+        or any(item.stage not in names for item in (*updates, *trials))
+        or any(type(trial.accepted) is not bool for trial in trials)
+        or config.solver == "adam" and (trials or options["jacobian_evaluations"])
+        or config.solver == "levenberg-marquardt" and sum(trial.accepted for trial in trials) != len(updates)
+    ):
+        raise ValueError("Optimization diagnostics disagree with the fitting schedule or solver")
+    return OptimizationDiagnostics(**(options | {"updates": updates, "trials": trials}))
+
+
 def load_result(path, *, model) -> FitResult:
     """Read a saved result using a verified model with the same asset and native ordering."""
     validate_model(model)
@@ -250,13 +280,17 @@ def _load_result(path, model):
     manifest = read_json(path / "result.json")
     # Also rejects finite-looking literals that overflow the JSON decoder's float.
     json_bytes(manifest)
-    require_keys(manifest, {
+    version = manifest.get("schema_version")
+    if type(version) is not int or version not in (1, SCHEMA_VERSION):
+        raise ValueError("Unsupported fitting result schema")
+    keys = {
         "schema_version", "model", "dtype", "device", "config", "selection", "gauge", "observation_ids",
         "initialization", "initial_cameras", "final_cameras", "initial_reprojection",
         "final_reprojection", "history", "stages", "status", "reason", "runtime",
-    }, "Fitting result")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("Unsupported fitting result schema")
+    }
+    if version == SCHEMA_VERSION:
+        keys.add("optimization")
+    require_keys(manifest, keys, "Fitting result")
     if manifest["model"] != model.metadata:
         raise ValueError("Incompatible fitting model asset, topology or parameter ordering")
     if manifest["dtype"] not in ("float32", "float64"):
@@ -275,6 +309,10 @@ def _load_result(path, model):
         raise ValueError("Fitting result requires unique observation IDs")
 
     config = FitConfig.from_dict(manifest["config"])
+    if version == 1 and (config.solver != "adam" or "lm" in manifest["config"]):
+        raise ValueError("Version 1 fitting results require the original Adam configuration")
+    if version == SCHEMA_VERSION and not {"solver", "lm"} <= manifest["config"].keys():
+        raise ValueError("Version 2 fitting results require explicit solver configuration")
     selection = resolve_selection(model, config)
     if json_bytes(asdict(selection)) != json_bytes(manifest["selection"]):
         raise ValueError("Saved native parameter selections disagree with the configuration")
@@ -284,7 +322,7 @@ def _load_result(path, model):
     reason = manifest["reason"]
     if status not in STATUSES or not isinstance(reason, str) or not reason.strip():
         raise ValueError("Fitting result requires a valid termination status and reason")
-    failed = status == "failed"
+    failed = status in FAILED_STATUSES
     if failed != (manifest["final_cameras"] is None) or failed != (manifest["final_reprojection"] is None):
         raise ValueError("Only a completed fitting run may contain final parameters and statistics")
     if not failed and manifest["initial_reprojection"] is None:
@@ -348,6 +386,7 @@ def _load_result(path, model):
         _decode_reprojection(manifest["initial_reprojection"], len(ids)),
         _decode_reprojection(manifest["final_reprojection"], len(ids)),
         tuple(history), stages, status, reason, manifest["runtime"],
+        _decode_optimization(manifest.get("optimization"), config),
     )
     if json_bytes(result.gauge) != json_bytes(manifest["gauge"]):
         raise ValueError("Saved parameter gauge disagrees with the fitting configuration")

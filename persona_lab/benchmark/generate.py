@@ -125,11 +125,13 @@ def _camera(model, config, kind, subject, index):
     )
 
 
-def _generate_subject(model, config, mapping, presets, subject):
+def _generate_subject(model, config, mapping, presets, subject, controlled_identity=None):
     identifier = subject_id(subject)
-    identity = rng(config.seed, "identity", subject).uniform(
-        -config.identity_half_range, config.identity_half_range, size=model.head.identity_dim,
-    ).astype(model.numpy_dtype)
+    identity = controlled_identity
+    if identity is None:
+        identity = rng(config.seed, "identity", subject).uniform(
+            -config.identity_half_range, config.identity_half_range, size=model.head.identity_dim,
+        ).astype(model.numpy_dtype)
     if not np.any(identity):
         raise ValueError(f"Identity sampling produced a neutral coefficient vector for {identifier}")
     neutral = model.neutral(identity)
@@ -186,17 +188,34 @@ def _generate_subject(model, config, mapping, presets, subject):
     return SubjectGroundTruth(identifier, tuple(observations), subject_arrays)
 
 
-def generate_dataset(destination, config, *, model_file=None, correspondences=DFL_TO_GNM):
-    """Generate all subjects and return the validated, published benchmark."""
+def generate_dataset(destination, config, *, model_file=None, correspondences=DFL_TO_GNM,
+                     identity_coefficients=None):
+    """Generate subjects, optionally with a controlled sparse identity for one subject."""
     destination = Path(destination)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Output already exists: {destination}")
     config = resolve_config(**config.metadata())
     dtype, device = torch_options(config.dtype, config.device)
     model = load_benchmark_model(model_file, dtype=dtype, device=device)
+    identity = None
+    provenance = {}
+    if identity_coefficients is not None:
+        from .configuration import finite_number
+
+        names = model.metadata["identity_names"]
+        if (
+            config.subjects != 1 or not isinstance(identity_coefficients, dict)
+            or not identity_coefficients or not identity_coefficients.keys() <= set(names)
+        ):
+            raise ValueError("A controlled synthetic identity requires one subject and named native coefficients")
+        coefficients = {name: finite_number(value, name) for name, value in identity_coefficients.items()}
+        if max(map(abs, coefficients.values())) > config.identity_half_range:
+            raise ValueError("Controlled coefficients must be within the configured identity range")
+        identity = np.asarray([coefficients.get(name, 0.0) for name in names], dtype=model.numpy_dtype)
+        provenance = {"controlled_identity_coefficients": coefficients}
     presets = _preset_vectors(model, config)
     subjects = (
-        _generate_subject(model, config, correspondences, presets, index)
+        _generate_subject(model, config, correspondences, presets, index, identity)
         for index in range(config.subjects)
     )
     return write_dataset(
@@ -217,7 +236,7 @@ def generate_dataset(destination, config, *, model_file=None, correspondences=DF
             "focal_per_short_edge": _FOCAL_PER_SHORT_EDGE,
             "camera_tier_centers": _TIER_CENTERS,
             "camera_tier_half_width": _TIER_HALF_WIDTH,
-        },
+        } | provenance,
     )
 
 

@@ -1,4 +1,4 @@
-"""Staged Adam fitting of one native GNM identity across multiple observations."""
+"""Staged fitting of one native GNM identity across multiple observations."""
 
 from copy import deepcopy
 import math
@@ -10,10 +10,11 @@ import torch
 
 from .configuration import FitConfig
 from .initialization import initialize
-from .losses import evaluate_objective
+from .levenberg_marquardt import fit_stage as fit_lm_stage
+from .monitoring import FitMeasurements, OptimizationUpdate, finite_norm, peak_rss_bytes
 from .observations import prepare_observations
 from .parameters import FitInitialization, FittingParameters, resolve_selection, validate_model
-from .results import FitResult, FitState, Iteration, StageSummary
+from .results import FAILED_STATUSES, FitResult, FitState, Iteration, StageSummary
 
 
 def _gradient_norms(active):
@@ -42,6 +43,58 @@ def _check_divergence(loss, start, factor):
         raise FloatingPointError(f"Objective diverged from {start:.6g} to {loss:.6g}")
 
 
+def _fit_adam_stage(model, data, parameters, stage, names, values, run, record):
+    config = parameters.config
+    groups = parameters.groups()
+    active = tuple((name, p) for name in names for p in groups[name])
+    rates = dict(stage.group_rates)
+    optimizer = torch.optim.Adam([
+        {"params": groups[name], "lr": rates.get(name, stage.learning_rate)}
+        for name in names
+    ])
+    start_loss = values.total
+    best, stale = start_loss, 0
+    status, reason = "budget_exhausted", "iteration budget reached"
+    for step in range(stage.iterations):
+        optimizer.zero_grad(set_to_none=True)
+        values, stats = run.evaluate(model, data, parameters, active)
+        _check_divergence(values.total, start_loss, config.divergence_factor)
+        run.last_objective = values
+        norms = _gradient_norms(active)
+        if step == 0 or len(run.updates) % config.log_every == 0:
+            record(stage.name, step, values, stats, norms)
+
+        if config.gradient_tolerance is not None and math.hypot(*norms.values()) <= config.gradient_tolerance:
+            status, reason = "converged", "gradient tolerance reached"
+            break
+
+        if config.improvement_tolerance is not None and step:
+            if best - values.total > config.improvement_tolerance:
+                best, stale = values.total, 0
+            else:
+                stale += 1
+            if stale >= config.patience:
+                status, reason = "stopped", "objective improvement below tolerance"
+                break
+
+        before = tuple(parameter.detach().clone() for _, parameter in active)
+        optimizer.step()
+        _validate_step(active, optimizer)
+        with torch.no_grad():
+            if parameters.expression is not None and "expression" in names:
+                parameters.expression.clamp_(-config.expression_limit, config.expression_limit)
+            norm = finite_norm(*(
+                parameter.double() - previous.double()
+                for (_, parameter), previous in zip(active, before, strict=True)
+            ))
+        run.updates.append(OptimizationUpdate(stage.name, step + 1, norm))
+
+    values, stats = run.evaluate(model, data, parameters)
+    _check_divergence(values.total, start_loss, config.divergence_factor)
+    run.last_objective = values
+    return values, stats, status, reason
+
+
 def fit_identity(model, observations, config=None, *, initial=None, progress=None) -> FitResult:
     """Fit a single subject using only observations, a verified model and explicit inputs.
 
@@ -55,6 +108,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     if torch.is_inference_mode_enabled():
         raise ValueError("Identity fitting requires PyTorch autograd outside inference mode")
     validate_model(model)
+    use_adam = config.solver == "adam"
+    device = model.reference.device
     started = perf_counter()
     data = prepare_observations(observations, model.reference, config)
     selection = resolve_selection(model, config)
@@ -68,26 +123,28 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     initialization_seconds = perf_counter() - started
 
     history, stages = [], []
-    updates = 0
+    run = FitMeasurements(device)
     initial_stats, final, final_stats = None, None, None
     status, reason = "budget_exhausted", "Iteration budget reached"
     stage_name = "initial evaluation"
+    running_stage = None
 
     def record(stage, stage_iteration, losses, stats, norms):
-        log = Iteration(updates, stage, stage_iteration, losses, stats.overall,
+        log = Iteration(len(run.updates), stage, stage_iteration, losses, stats.overall,
                         norms, perf_counter() - started)
         history.append(log)
         if progress is not None:
             progress(log)
 
     try:
-        values, initial_stats = evaluate_objective(model, data, parameters)
+        values, initial_stats = run.evaluate(model, data, parameters, least_squares=not use_adam)
+        run.initial_objective = run.last_objective = values
         current_stats = initial_stats
         for stage in config.stages:
             stage_name = stage.name
             for name, group in groups.items():
                 for parameter in group:
-                    parameter.requires_grad_(name in stage.groups)
+                    parameter.requires_grad_(use_adam and name in stage.groups)
                     parameter.grad = None
             names = tuple(name for name in stage.groups if groups[name])
             start_loss = values.total
@@ -95,61 +152,41 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
                 stages.append(StageSummary(stage.name, names, 0, "skipped", start_loss, start_loss))
                 continue
 
-            active = tuple((name, p) for name in names for p in groups[name])
-            rates = dict(stage.group_rates)
-            optimizer = torch.optim.Adam([
-                {"params": groups[name], "lr": rates.get(name, stage.learning_rate)}
-                for name in names
-            ])
-            before = updates
-            best, stale = start_loss, 0
-            status, reason = "budget_exhausted", f"{stage.name}: iteration budget reached"
-            for step in range(stage.iterations):
-                optimizer.zero_grad(set_to_none=True)
-                values, stats = evaluate_objective(model, data, parameters, active)
-                _check_divergence(values.total, start_loss, config.divergence_factor)
-                norms = _gradient_norms(active)
-                if step == 0 or updates % config.log_every == 0:
-                    record(stage.name, step, values, stats, norms)
+            before = len(run.updates)
+            running_stage = (stage, names, before, start_loss)
+            if use_adam:
+                values, current_stats, status, reason = _fit_adam_stage(
+                    model, data, parameters, stage, names, values, run, record,
+                )
+            else:
+                values, current_stats, status, reason = fit_lm_stage(
+                    model, data, parameters, stage, names, values, current_stats, run, record,
+                )
+            reason = f"{stage.name}: {reason}"
+            steps = len(run.updates) - before
+            stages.append(StageSummary(stage.name, names, steps, status, start_loss, values.total))
+            running_stage = None
+            record(stage.name, steps, values, current_stats, {})
+            if status in FAILED_STATUSES:
+                break
 
-                if config.gradient_tolerance is not None and (
-                    math.hypot(*norms.values()) <= config.gradient_tolerance
-                ):
-                    status, reason = "converged", f"{stage.name}: gradient tolerance reached"
-                    break
-
-                if config.improvement_tolerance is not None and step:
-                    if best - values.total > config.improvement_tolerance:
-                        best, stale = values.total, 0
-                    else:
-                        stale += 1
-                    if stale >= config.patience:
-                        status, reason = "stopped", f"{stage.name}: objective improvement below tolerance"
-                        break
-
-                optimizer.step()
-                _validate_step(active, optimizer)
-                if parameters.expression is not None and "expression" in names:
-                    with torch.no_grad():
-                        parameters.expression.clamp_(-config.expression_limit, config.expression_limit)
-                updates += 1
-
-            values, current_stats = evaluate_objective(model, data, parameters)
-            _check_divergence(values.total, start_loss, config.divergence_factor)
-            stages.append(StageSummary(stage.name, names, updates - before,
-                                       status, start_loss, values.total))
-            record(stage.name, updates - before, values, current_stats, {})
-
-        with torch.no_grad():
-            final = FitState.from_tensors(parameters.state(0, len(data)))
-        final_stats = current_stats
+        if status not in FAILED_STATUSES:
+            with torch.no_grad():
+                final = FitState.from_tensors(parameters.state(0, len(data)))
+            final_stats = current_stats
     except (FloatingPointError, RuntimeError, ValueError) as error:
-        status, reason = "failed", f"{stage_name}: {error}"
+        status = "failed" if use_adam else "numerical_failure"
+        reason = f"{stage_name}: {error}"
+        if running_stage is not None:
+            stage, names, before, start_loss = running_stage
+            stages.append(StageSummary(
+                stage.name, names, len(run.updates) - before, status, start_loss, run.last_objective.total,
+            ))
 
     elapsed = perf_counter() - started
     return FitResult(
         model=deepcopy(model.metadata), dtype=model.numpy_dtype.name,
-        device=str(model.reference.device), config=config, selection=selection,
+        device=str(device), config=config, selection=selection,
         observation_ids=data.ids, initialization=choices, initial=initial_snapshot,
         final=final, initial_reprojection=initial_stats, final_reprojection=final_stats,
         history=tuple(history), stages=tuple(stages), status=status, reason=reason,
@@ -157,6 +194,14 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             "python": platform.python_version(), "numpy": np.__version__,
             "torch": str(torch.__version__), "initialization_seconds": initialization_seconds,
             "optimization_seconds": elapsed - initialization_seconds, "total_seconds": elapsed,
-            "optimizer_updates": updates, "observations_per_iteration": len(data),
+            "optimizer_updates": len(run.updates), "observations_per_iteration": len(data),
+            "model_loading_seconds": None, "peak_process_rss_bytes": peak_rss_bytes(),
+            "cuda_peak_allocated_bytes": (
+                torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+            ),
+            "objective_seconds": run.seconds["objective"],
+            "jacobian_seconds": run.seconds["jacobian"] if not use_adam else None,
+            "linear_solve_seconds": run.seconds["linear_solve"] if not use_adam else None,
         },
+        optimization=run.diagnostics(),
     )

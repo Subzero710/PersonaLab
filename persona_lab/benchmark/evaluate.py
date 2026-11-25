@@ -201,6 +201,7 @@ def evaluate_predictions(dataset, predictions, *, mode, model_file=None, device=
     profiles = dict.fromkeys(item["noise_profile"] for item in pooled)
     return {
         "schema_version": 1, "dataset_id": dataset.dataset_id, "scenario": dataset.config.scenario,
+        "source_dataset_id": dataset.source_dataset_id, "evaluation_dataset_id": dataset.dataset_id,
         "model_asset_sha256": model.metadata["asset_sha256"],
         "mode": mode, "dtype": dataset.config.dtype, "evaluation_device": str(model.reference.device),
         "omitted_subject_ids": [key for key in all_subjects if key not in selected],

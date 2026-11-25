@@ -218,9 +218,10 @@ class SubjectGroundTruth:
 class BenchmarkDataset:
     """A validated dataset. Fitting only needs fitting_observations()."""
 
-    def __init__(self, manifest, config, triangles, mapping, subjects):
+    def __init__(self, manifest, config, triangles, mapping, subjects, *, source=None):
         self._manifest = manifest
         self._subjects = subjects
+        self._source = source
         self.config = config
         self.triangles = triangles
         self.correspondences = mapping
@@ -228,6 +229,10 @@ class BenchmarkDataset:
     @property
     def dataset_id(self):
         return self._manifest["dataset_id"]
+
+    @property
+    def source_dataset_id(self):
+        return self.dataset_id if self._source is None else self._source.dataset_id
 
     @property
     def subject_ids(self):
@@ -249,16 +254,28 @@ class BenchmarkDataset:
         """Explicit evaluation access to clean coordinates, parameters and corruption."""
         return deepcopy(self._subject(subject))
 
-    def select_observations(self, subject, observation_ids):
-        """Create an in-memory evaluation dataset for one explicit ordered subset."""
-        truth = self._subject(subject)
-        selected = tuple(observation_ids)
+    def _observation_selection(self, subject, observation_ids):
         all_ids = self.observation_ids(subject)
-        if not selected or any(not isinstance(key, str) for key in selected) or (
-            len(set(selected)) != len(selected) or any(key not in all_ids for key in selected)
+        selected = all_ids if observation_ids is None else tuple(observation_ids)
+        known = set(all_ids)
+        if not selected:
+            raise ValueError("Select at least one observation ID")
+        if any(not isinstance(key, str) or key not in known for key in selected) or (
+            len(set(selected)) != len(selected)
         ):
-            raise ValueError("Evaluation subset requires unique known observation IDs")
-        indices = [all_ids.index(key) for key in selected]
+            raise ValueError("Observation selection contains duplicate or unknown identifiers")
+        return all_ids, selected
+
+    def select_observations(self, subject, observation_ids=None):
+        """Keep the current dataset for its full order, otherwise select from its source."""
+        all_ids, selected = self._observation_selection(subject, observation_ids)
+        if selected == all_ids:
+            return self
+        if self._source is not None:
+            return self._source.select_observations(subject, selected)
+        truth = self._subject(subject)
+        positions = {key: index for index, key in enumerate(all_ids)}
+        indices = [positions[key] for key in selected]
         arrays = {
             name: values if name in ("identity", "neutral_vertices") else values[indices]
             for name, values in truth.arrays.items()
@@ -267,9 +284,10 @@ class BenchmarkDataset:
         manifest = self._manifest | {"dataset_id": digest_json({
             "source_dataset": self.dataset_id, "subject": subject, "observation_ids": selected,
         })}
-        return BenchmarkDataset(manifest, self.config, self.triangles, self.correspondences, {
-            subject: SubjectGroundTruth(subject, records, arrays),
-        })
+        return BenchmarkDataset(
+            manifest, self.config, self.triangles, self.correspondences,
+            {subject: SubjectGroundTruth(subject, records, arrays)}, source=self,
+        )
 
     def fitting_observations(
         self, subject, *, observation_ids=None, dtype="float64", device="cpu",
@@ -282,9 +300,7 @@ class BenchmarkDataset:
         dtype, device = torch_options(dtype, device)
         size = ImageSize(*self.config.image_size)
         indices = {item["id"]: index for index, item in enumerate(truth.observations)}
-        selected = tuple(indices) if observation_ids is None else tuple(observation_ids)
-        if len(set(selected)) != len(selected) or any(key not in indices for key in selected):
-            raise ValueError("Observation selection contains duplicate or unknown identifiers")
+        _, selected = self._observation_selection(subject, observation_ids)
         result = []
         for key in selected:
             index = indices[key]

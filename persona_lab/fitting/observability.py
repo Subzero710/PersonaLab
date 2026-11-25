@@ -39,7 +39,7 @@ def _jacobian_blocks(model, data, parameters, index):
             column = gradient if name == "identity" else gradient[index]
             block.append(column.detach().reshape(-1))
     return [
-        (name, torch.stack(block).to(device="cpu", dtype=torch.float64))
+        (name, torch.stack(block).to(dtype=torch.float64))
         for (name, _), block in zip(leaves, rows, strict=True)
     ]
 

@@ -4,12 +4,10 @@ import argparse
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
-import resource
 import sys
 from time import perf_counter
 
 import numpy as np
-import torch
 
 from .benchmark.configuration import torch_options
 from .benchmark.dataset import load_dataset
@@ -18,8 +16,9 @@ from .benchmark.predictions import write_predictions
 from .benchmark.storage import publish_directory, read_json
 from .dfl import DFLFaceSample, iter_dataset
 from .fitting import FitConfig, fit_identity
+from .fitting.configuration import SOLVERS
 from .fitting.diagnostics import write_neutral_mesh, write_overlays
-from .fitting.results import _write_result
+from .fitting.results import FAILED_STATUSES, _write_result
 from .observations import LandmarkObservation
 
 
@@ -38,16 +37,18 @@ def _parser():
     parser.add_argument("--subject", help="explicit benchmark subject ID")
     parser.add_argument("--max-images", type=_positive_int)
     parser.add_argument("--selection", choices=("first", "sample"), default="first")
+    parser.add_argument("--observation-id", action="append", help="ordered benchmark observation ID; repeatable")
     parser.add_argument("--model-version", choices=("v3",), default="v3")
     parser.add_argument("--model-file", type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--config", type=Path, help="JSON FitConfig")
+    parser.add_argument("--solver", choices=SOLVERS, help="fitting solver (default: adam)")
     parser.add_argument("--camera-mode", choices=("known", "estimated"))
     parser.add_argument("--camera", choices=("weak-perspective", "perspective"))
     parser.add_argument("--batch-size", type=_positive_int)
     parser.add_argument("--iterations", type=int, nargs=3, metavar=("A", "B", "C"))
-    parser.add_argument("--learning-rate", type=float, help="override all stage learning rates")
+    parser.add_argument("--learning-rate", type=float, help="override all Adam stage learning rates")
     parser.add_argument("--identity-weight", type=float)
     parser.add_argument("--expression-weight", type=float)
     parser.add_argument("--pose-weight", type=float)
@@ -69,7 +70,7 @@ def _config(args):
         values["camera_mode"] = "estimated"
     for name in (
         "camera_mode", "batch_size", "identity_weight", "expression_weight", "pose_weight",
-        "camera_weight", "train_identity", "train_expression", "seed", "log_every",
+        "camera_weight", "train_identity", "train_expression", "seed", "log_every", "solver",
     ):
         if (value := getattr(args, name)) is not None:
             values[name] = value
@@ -87,6 +88,8 @@ def _config(args):
         stages = tuple(replace(stage, iterations=steps)
                        for stage, steps in zip(stages, args.iterations, strict=True))
     if args.learning_rate is not None:
+        if config.solver != "adam":
+            raise ValueError("--learning-rate requires --solver adam")
         stages = tuple(replace(stage, learning_rate=args.learning_rate, group_rates=())
                        for stage in stages)
     return replace(config, stages=stages)
@@ -132,6 +135,8 @@ def _run(args):
         raise ValueError("--benchmark requires --subject")
     if args.input and (args.subject is not None or args.predictions is not None):
         raise ValueError("--subject and --predictions require --benchmark")
+    if args.observation_id and (not args.benchmark or args.max_images is not None or args.selection != "first"):
+        raise ValueError("--observation-id requires --benchmark without sampling or --max-images")
     for path in (args.output, args.predictions):
         if path is not None and (path.exists() or path.is_symlink()):
             raise FileExistsError(f"Output already exists: {path}")
@@ -149,14 +154,16 @@ def _run(args):
         if model.metadata != dataset.model_metadata:
             raise ValueError("Benchmark and fitting model provenance differ")
         all_ids = dataset.observation_ids(args.subject)
-        ids = _selection(all_ids, args, config.seed)
-        observations = dataset.fitting_observations(
-            args.subject, observation_ids=ids, dtype=dtype, device=model.reference.device,
+        ids = tuple(args.observation_id) if args.observation_id else _selection(all_ids, args, config.seed)
+        evaluation_data = dataset.select_observations(args.subject, ids)
+        observations = evaluation_data.fitting_observations(
+            args.subject, dtype=dtype, device=model.reference.device,
             include_known_cameras=config.camera_mode == "known",
         )
         source_info = {
-            "dataset_id": dataset.dataset_id, "subject": args.subject,
-            "selected": len(ids), "selection": args.selection,
+            "dataset_id": dataset.dataset_id, "source_dataset_id": dataset.source_dataset_id,
+            "evaluation_dataset_id": evaluation_data.dataset_id, "subject": args.subject,
+            "selected": len(ids), "selection": "explicit" if args.observation_id else args.selection,
         }
     else:
         observations, samples, source_info = _real_input(args, config, dtype, model.reference.device)
@@ -170,10 +177,7 @@ def _run(args):
     result = fit_identity(model, observations, config, progress=log)
     runtime = result.runtime | {
         "input": source_info, "model_loading_seconds": load_seconds,
-        "peak_process_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
     }
-    if model.reference.device.type == "cuda":
-        runtime["cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(model.reference.device)
     result = replace(result, runtime=runtime)
     with publish_directory(args.output, completion="result.json") as stage:
         if result.final is not None:
@@ -182,12 +186,11 @@ def _run(args):
             if args.overlays:
                 write_overlays(stage, model, result, observations, args.overlays, samples)
         _write_result(stage, result)
-    if result.status == "failed":
+    if result.status in FAILED_STATUSES:
         print(f"Failed fit: {result.reason}", file=sys.stderr)
         return 1
 
     if args.predictions:
-        evaluation_data = dataset if ids == all_ids else dataset.select_observations(args.subject, ids)
         write_predictions(args.predictions, evaluation_data, {
             args.subject: result.to_prediction(dtype=evaluation_data.config.dtype),
         })

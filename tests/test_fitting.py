@@ -22,8 +22,8 @@ from persona_lab.coordinates import ImageSize, pixels_to_normalized
 from persona_lab.correspondences import CorrespondenceMap, DFL_TO_GNM
 from persona_lab.fit import main
 from persona_lab.fitting import (
-    FitConfig, FitInitialization, ObservationInitialization, Stage, fit_identity, load_result,
-    save_result,
+    FitConfig, FitInitialization, LevenbergMarquardtConfig, ObservationInitialization, Stage,
+    fit_identity, load_result, save_result,
 )
 from persona_lab.fitting.initialization import initialize
 from persona_lab.fitting.losses import evaluate_objective, project_batch
@@ -517,4 +517,332 @@ def test_cuda_official_model_fitting(asset):
         train_head=False, stages=(Stage("id", 2, ("identity",), 0.01),),
     ))
     assert fit.device.startswith("cuda:") and fit.status == "budget_exhausted", fit.reason
+
+
+def _lm_config(**overrides):
+    return _config(**({"solver": "levenberg-marquardt"} | overrides))
+
+
+@pytest.mark.parametrize("mode,kind,root", [
+    ("known", "both", False), ("known", "perspective", True), ("estimated", "perspective", False),
+])
+def test_lm_residuals_match_all_objective_terms_and_view_derivatives(model, mode, kind, root):
+    from persona_lab.fitting.levenberg_marquardt import (
+        StageCoordinates, normal_blocks, observation_jacobian, observation_residual,
+    )
+
+    observations, *_ = _synthesize(model, camera_kind=kind, include_cameras=mode == "known", count=2)
+    first, second = observations
+    validity = first.validity.clone()
+    validity[::3] = False
+    observations = (replace(first, validity=validity), replace(second, weights=second.weights * 2.3))
+    config = _lm_config(
+        camera_mode=mode, camera_model=kind if mode == "estimated" else None, train_root=root,
+        identity_weight=0.03, expression_weight=0.02, pose_weight=0.01, camera_weight=0.04,
+    )
+    data, params, _ = _parameters(model, observations, config)
+    with torch.no_grad():
+        for group in params.groups().values():
+            for parameter in group:
+                parameter.add_(0.03)
+    original, _ = evaluate_objective(model, data, params)
+    least_squares, _ = evaluate_objective(model, data, params, least_squares=True)
+    assert least_squares.total == pytest.approx(original.total, rel=1e-12)
+    for name in ("landmarks", "identity", "expression", "pose", "camera"):
+        assert getattr(least_squares, name) == pytest.approx(getattr(original, name), abs=1e-14)
+
+    layout = StageCoordinates.from_parameters(params, tuple(name for name, group in params.groups().items() if group))
+    base = params.values()
+    position = layout.pack(base, model.reference, len(data))
+    blocks = normal_blocks(model, data, params, layout, base, position)
+    data_curvature, data_gradient = 0.0, 0.0
+    for index in range(len(data)):
+        residual, jacobian = observation_jacobian(model, data, params, layout, base, position, index)
+        point = torch.cat((position.identity, position.local[index]))
+        epsilon = 1e-6
+        with torch.no_grad():
+            numeric = torch.stack([
+                (observation_residual(model, data, params, layout, base, position, index, point + direction)
+                 - observation_residual(model, data, params, layout, base, position, index, point - direction))
+                / (2 * epsilon)
+                for direction in epsilon * torch.eye(point.numel(), dtype=point.dtype)
+            ], dim=1)
+        torch.testing.assert_close(jacobian, numeric, atol=2e-8, rtol=3e-5)
+        torch.testing.assert_close(blocks.coupling[index, 0], jacobian[:, 0] @ jacobian[:, 1:])
+        assert float(jacobian[:, 0].square().sum()) > 0
+        data_curvature += jacobian[:, 0].square().sum()
+        data_gradient += jacobian[:, 0] @ residual
+    torch.testing.assert_close(blocks.identity[0, 0], data_curvature + config.identity_weight)
+    torch.testing.assert_close(
+        blocks.gradient.identity[0], data_gradient + config.identity_weight * position.identity[0],
+    )
+
+
+def test_lm_recovers_controlled_neutral_identity_and_round_trips(model, tmp_path):
+    observations, identity, *_ = _synthesize(model, varied=False, count=3)
+    config = _lm_config(
+        train_head=False, train_expression=(), stages=(Stage("identity", 8, ("identity",), 0.045),),
+    )
+    result = fit_identity(model, observations, config)
+    assert result.final is not None, result.reason
+    np.testing.assert_allclose(result.final.identity, identity.numpy(), atol=1e-5, rtol=0)
+    assert vertex_errors(model.neutral(result.final.identity), model.neutral(identity))["rms_m"] < 1e-7
+    assert result.final_reprojection.overall.rms_px < 1e-4
+    assert result.optimization.initial_objective.total > result.optimization.final_objective.total
+    assert len(result.optimization.updates) == sum(trial.accepted for trial in result.optimization.trials)
+    for start, stop in zip(result.initial.cameras, result.final.cameras, strict=True):
+        assert camera_to_record(start) == camera_to_record(stop)
+    saved = tmp_path / "lm"
+    save_result(saved, result)
+    assert load_result(saved, model=model).optimization == result.optimization
+    repeated = fit_identity(model, observations, config)
+    np.testing.assert_array_equal(repeated.final.identity, result.final.identity)
+    assert repeated.optimization == result.optimization
+
+
+def test_lm_joint_expression_and_pose_recovery(model):
+    observations, _, expressions, rotations, _ = _synthesize(model)
+    config = _lm_config(stages=(
+        Stage("pose", 6, ("pose",), 0.018),
+        Stage("joint", 10, ("identity", "expression", "pose"), 0.022),
+    ))
+    result = fit_identity(model, observations, config)
+    assert result.final is not None, result.reason
+    assert result.final_reprojection.overall.rms_px < result.initial_reprojection.overall.rms_px * 0.1
+    assert np.linalg.norm(result.final.expression - expressions.numpy()) < np.linalg.norm(expressions.numpy())
+    head = model.metadata["joint_names"].index("head")
+    initial_error = rotation_errors_deg(result.initial.rotations[:, head], rotations[:, head].numpy())
+    final_error = rotation_errors_deg(result.final.rotations[:, head], rotations[:, head].numpy())
+    assert np.mean(final_error) < np.mean(initial_error)
+    assert np.unique(result.final.expression, axis=0).shape[0] > 1
+    np.testing.assert_array_equal(result.final.translation, result.initial.translation)
+    np.testing.assert_array_equal(result.final.rotations[:, [0, 2, 3]], result.initial.rotations[:, [0, 2, 3]])
+
+
+@pytest.mark.parametrize("kind", ["weak-perspective", "perspective"])
+def test_lm_estimated_cameras_preserve_gauge(model, kind):
+    observations, *_ = _synthesize(model, camera_kind=kind, include_cameras=False, count=2)
+    config = _lm_config(camera_mode="estimated", camera_model=kind, stages=(
+        Stage("pose_camera", 6, ("pose", "camera"), 0.018),
+        Stage("joint", 8, ("identity", "expression", "pose", "camera"), 0.022),
+    ))
+    result = fit_identity(model, observations, config)
+    assert result.final is not None, result.reason
+    assert result.final_reprojection.overall.rms_px < result.initial_reprojection.overall.rms_px
+    final = result.final.cameras
+    assert not torch.equal(final[0].translation, final[1].translation)
+    for before, after in zip(result.initial.cameras, final, strict=True):
+        assert torch.equal(before.rotation, after.rotation)
+        if isinstance(after, PerspectiveCamera):
+            assert after.translation[2] > 0
+            assert torch.equal(before.focal_length, after.focal_length)
+            assert torch.equal(before.principal_point, after.principal_point)
+        else:
+            assert after.scale > 0
+
+
+@pytest.mark.parametrize("limit", ["transient", "trials", "damping"])
+def test_lm_rejects_invalid_geometry_without_committing_trial(model, monkeypatch, tmp_path, limit):
+    from persona_lab.fitting import monitoring
+    from persona_lab.fitting.parameters import InvalidGeometry
+
+    observations, *_ = _synthesize(model, varied=False, count=1)
+    options = LevenbergMarquardtConfig(
+        max_trials=2, maximum_damping=1e-3 if limit == "damping" else 1e8,
+    )
+    config = _lm_config(lm=options, train_expression=(), train_head=False,
+                        stages=(Stage("identity", 1, ("identity",), 0.045),))
+    calculate = monitoring.evaluate_objective
+    seen = []
+
+    def with_invalid_trial(model, data, parameters, active=(), **kwargs):
+        if kwargs.get("candidate") is not None:
+            seen.append(parameters.identity.detach().clone())
+            assert not torch.equal(parameters.identity, kwargs["candidate"].identity)
+            if limit != "transient" or len(seen) == 1:
+                raise InvalidGeometry("Perspective projection requires positive camera depth")
+        return calculate(model, data, parameters, active, **kwargs)
+
+    monkeypatch.setattr(monitoring, "evaluate_objective", with_invalid_trial)
+    result = fit_identity(model, observations, config)
+    assert all(torch.equal(value, seen[0]) for value in seen)
+    trials = result.optimization.trials
+    assert "invalid_geometry" in trials[0].reason and not trials[0].accepted
+    if limit == "transient":
+        assert result.status == "budget_exhausted", result.reason
+        assert trials[1].accepted and trials[1].damping > trials[0].damping
+        assert result.optimization.accepted_updates == 1
+    else:
+        assert result.status == "no_acceptable_step" and result.final is None
+        assert result.optimization.final_objective == result.optimization.initial_objective
+        assert result.optimization.rejected_trials == (2 if limit == "trials" else 1)
+        path = tmp_path / "rejected"
+        save_result(path, result)
+        with pytest.raises(ValueError, match="failed"):
+            load_result(path, model=model).to_prediction()
+
+
+@pytest.mark.parametrize("failure", ["residual", "Jacobian", "factorization"])
+def test_lm_reports_nonfinite_linearization_or_factorization_failure(model, monkeypatch, failure):
+    from persona_lab.fitting import levenberg_marquardt as lm
+
+    observations, *_ = _synthesize(model, varied=False, count=1)
+    config = _lm_config(train_expression=(), train_head=False)
+    original = lm.weighted_landmark_residuals
+
+    def corrupt(*args):
+        residual = original(*args)
+        if failure == "residual":
+            return residual * float("nan")
+        residual.register_hook(lambda gradient: gradient * float("nan"))
+        return residual
+
+    if failure == "factorization":
+        cholesky = torch.linalg.cholesky_ex
+
+        def failed_factor(*args, **kwargs):
+            factor, info = cholesky(*args, **kwargs)
+            return factor, torch.ones_like(info)
+
+        monkeypatch.setattr(torch.linalg, "cholesky_ex", failed_factor)
+    else:
+        monkeypatch.setattr(lm, "weighted_landmark_residuals", corrupt)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("An LM failure must never start Adam")
+
+    monkeypatch.setattr(torch.optim, "Adam", forbidden)
+    fit = fit_identity(model, observations, config)
+    assert fit.status == "numerical_failure" and fit.final is None
+    assert failure in fit.reason, fit.reason
+
+
+@pytest.mark.parametrize("count,start,end,identity_weight", [
+    (3, 2.11171e-8, 3.85021e-6, 0.0), (1, 5.9825e-8, 7.17356e-6, 1e-6),
+])
+def test_adam_stage_transition_guard_rejects_recorded_loss_jump(
+    model, monkeypatch, count, start, end, identity_weight,
+):
+    from persona_lab.fitting import monitoring, optimizer
+
+    observations, *_ = _synthesize(model, varied=count == 1, count=count)
+    stages = (
+        Stage("identity", 1, ("identity",), 0.045),
+        Stage("joint", 1, ("identity", "expression", "pose"), 0.022, (("pose", 0.005),)),
+    )
+    config = _config(identity_weight=identity_weight, expression_weight=2e-5, stages=stages)
+    calculate = monitoring.evaluate_objective
+    calls = 0
+
+    def recorded_losses(*args, **kwargs):
+        nonlocal calls
+        losses, stats = calculate(*args, **kwargs)
+        calls += 1
+        # Reproduce the observed objective jump at the next Adam stage,
+        # independent of model and backend roundoff in the preceding stages.
+        return replace(losses, total=end if calls == 5 else start), stats
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("An Adam failure must never start LM")
+
+    monkeypatch.setattr(monitoring, "evaluate_objective", recorded_losses)
+    monkeypatch.setattr(optimizer, "fit_lm_stage", forbidden)
+    failed = fit_identity(model, observations, config)
+    assert failed.status == "failed" and failed.final is None
+    assert failed.reason.startswith("joint: Objective diverged")
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_lm_preserves_requested_precision_and_device(asset, dtype, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    model = load_benchmark_model(asset, dtype=dtype, device=device)
+    observations, *_ = _synthesize(model, varied=False, count=1)
+    result = fit_identity(model, observations, _lm_config(
+        train_head=False, train_expression=(), stages=(Stage("identity", 2, ("identity",), 0.045),),
+    ))
+    assert result.final is not None, result.reason
+    assert result.dtype == dtype and result.device.split(":")[0] == device
+    assert result.final.identity.dtype == np.dtype(dtype)
+    assert result.final_reprojection.overall.rms_px < result.initial_reprojection.overall.rms_px
+
+
+def test_explicit_lm_cli_prediction_uses_complete_dataset_id(model, asset, benchmark_path, tmp_path):
+    dataset = load_dataset(benchmark_path)
+    subject, = dataset.subject_ids
+    ids = dataset.observation_ids(subject)
+    output, predictions = tmp_path / "fit-lm", tmp_path / "predictions"
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"train_head": False, "train_expression": [], "identity_weight": 0}))
+    args = [
+        "--benchmark", str(benchmark_path), "--subject", subject,
+        "--config", str(config), "--solver", "levenberg-marquardt",
+        "--iterations", "0", "1", "0", "--train-identity", "head_000",
+        "--output", str(output), "--predictions", str(predictions), "--no-neutral-mesh",
+    ]
+    if asset is not None:
+        args.extend(("--model-file", asset))
+    for key in ids:
+        args.extend(("--observation-id", key))
+    assert main(args) == 0
+    result = load_result(output, model=model)
+    assert result.config.solver == "levenberg-marquardt"
+    assert result.observation_ids == ids
+    assert result.runtime["input"]["evaluation_dataset_id"] == dataset.dataset_id
+    report = evaluate_predictions(
+        dataset.select_observations(subject, ids), predictions, mode="known-camera", model_file=asset,
+    )
+    assert report["scored_observation_count"] == len(ids)
+
+
+def test_original_adam_result_version_one_round_trip(model, tmp_path):
+    observations, *_ = _synthesize(model, varied=False, count=1)
+    result = fit_identity(model, observations, _config(train_head=False, train_expression=()))
+    path = tmp_path / "original-adam"
+    save_result(path, result)
+    manifest_path = path / "result.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = 1
+    manifest.pop("optimization")
+    manifest["config"].pop("solver")
+    manifest["config"].pop("lm")
+    manifest_path.write_text(json.dumps(manifest))
+    restored = load_result(path, model=model)
+    assert restored.config.solver == "adam" and restored.optimization is None
+    np.testing.assert_array_equal(restored.final.identity, result.final.identity)
+
+
+def test_study_pairs_preserve_observation_order_and_comparison_controls(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from persona_lab.benchmark import fitting_study
+
+    generated = {}
+
+    def generate(path, config, **kwargs):
+        assert str(path) not in generated
+        generated[str(path)] = config
+
+    monkeypatch.setattr(fitting_study, "generate_dataset", generate)
+    args = SimpleNamespace(
+        output=tmp_path, device="cpu", dtype="float64", model_file=None,
+        experiments=("E", "F", "H"), seeds=(42, 43), scaling_full=False,
+        adam_iterations=(30, 70, 900), lm_iterations=(10, 12, 30), spectra=False,
+    )
+    jobs = list(fitting_study._jobs(args))
+    adam_cases = [item for item in jobs if item["config"]["solver"] == "adam"]
+    lm_cases = [item for item in jobs if item["config"]["solver"] == "levenberg-marquardt"]
+    assert len(adam_cases) == len(lm_cases) == 2 * 2 * 6 + 4
+    for adam, lm in zip(adam_cases, lm_cases, strict=True):
+        for key in ("dataset", "observations", "seed", "held_out_dataset", "budget"):
+            assert adam[key] == lm[key]
+        for key in ("identity_weight", "expression_weight", "train_identity", "train_expression", "pose_initializer"):
+            assert adam["config"][key] == lm["config"][key]
+        if adam["experiment"] == "E":
+            assert generated[adam["dataset"]].observations_per_subject == 100
+            assert generated[adam["held_out_dataset"]].observations_per_subject == 109
+        else:
+            assert adam["budget"] == "profiling_only"
+            assert [stage["iterations"] for stage in lm["config"]["stages"]] == [1, 1, 1]
+    assert {item["observations"] for item in adam_cases if item["experiment"] == "H"} == {50, 100, 300, 600}
     assert fit.final_reprojection.overall.rms_px < fit.initial_reprojection.overall.rms_px

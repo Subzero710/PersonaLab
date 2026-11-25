@@ -9,6 +9,7 @@ from ..correspondences import DFL_LANDMARK_COUNT
 
 GROUPS = ("identity", "expression", "pose", "camera")
 CAMERA_MODELS = ("weak-perspective", "perspective")
+SOLVERS = ("adam", "levenberg-marquardt")
 
 # These low-order components cover the mouth and eyelid/brow motions
 # independently probed by the existing benchmark, with room for nearby modes.
@@ -39,7 +40,7 @@ def _integer(value, name, minimum):
 
 @dataclass(frozen=True, slots=True)
 class Stage:
-    """One Adam stage. Advance one step per full-dataset gradient."""
+    """One fitting stage. Learning rates apply to Adam."""
 
     name: str
     iterations: int
@@ -86,6 +87,35 @@ def default_stages():
 
 
 @dataclass(frozen=True, slots=True)
+class LevenbergMarquardtConfig:
+    """Damping, scaling, convergence and Jacobian controls shared by all stages."""
+
+    initial_damping: float = 1e-3
+    minimum_damping: float = 1e-8
+    maximum_damping: float = 1e8
+    max_trials: int = 12
+    acceptance_threshold: float = 1e-4
+    diagonal_floor: float = 1e-12
+    scaled_gradient_tolerance: float = 1e-10
+    jacobian_rows: int = 8
+
+    def __post_init__(self):
+        for name in ("max_trials", "jacobian_rows"):
+            _integer(getattr(self, name), name, 1)
+        for name in (
+            "initial_damping", "minimum_damping", "maximum_damping",
+            "acceptance_threshold", "diagonal_floor", "scaled_gradient_tolerance",
+        ):
+            object.__setattr__(self, name, finite_number(getattr(self, name), name))
+        if not 0 < self.minimum_damping <= self.initial_damping <= self.maximum_damping:
+            raise ValueError("LM damping must satisfy 0 < minimum <= initial <= maximum")
+        if not 0 <= self.acceptance_threshold < 1:
+            raise ValueError("LM acceptance_threshold must be in [0, 1)")
+        if not 0 < self.diagonal_floor <= 1 or self.scaled_gradient_tolerance < 0:
+            raise ValueError("LM diagonal_floor must be in (0, 1] and gradient tolerance nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
 class FitConfig:
     """Explicit optimization controls. Empty selections fix the entire group."""
 
@@ -113,8 +143,12 @@ class FitConfig:
     patience: int = 10
     divergence_factor: float = 100.0
     stages: tuple[Stage, ...] = field(default_factory=default_stages)
+    solver: str = "adam"
+    lm: LevenbergMarquardtConfig = field(default_factory=LevenbergMarquardtConfig)
 
     def __post_init__(self):
+        if self.solver not in SOLVERS or not isinstance(self.lm, LevenbergMarquardtConfig):
+            raise ValueError("Select a supported solver and a LevenbergMarquardtConfig")
         if self.camera_mode not in ("known", "estimated"):
             raise ValueError("Camera mode must be known or estimated")
         if self.camera_model is not None and self.camera_model not in CAMERA_MODELS:
@@ -181,6 +215,10 @@ class FitConfig:
                 if any(not isinstance(item, dict) for item in stages):
                     raise ValueError("Each stage configuration must be an object")
                 values["stages"] = tuple(Stage(**item) for item in stages)
+            if "lm" in values:
+                if not isinstance(values["lm"], dict):
+                    raise ValueError("LM configuration must be an object")
+                values["lm"] = LevenbergMarquardtConfig(**values["lm"])
             return cls(**values)
         except TypeError as error:
             raise ValueError(f"Invalid fitting configuration: {error}") from error

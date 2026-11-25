@@ -823,6 +823,94 @@ gradients, invalid projections, and nonfinite parameters or Adam state
 fail explicitly. History contains the last logged valid step. Failed
 results have no final parameters, mesh, overlays, or predictions.
 
+### Levenberg–Marquardt
+
+Select `--solver levenberg-marquardt` or
+`FitConfig(solver="levenberg-marquardt")`. The default is `adam`. A selection
+applies to the entire fitting schedule. Both solvers use the same parameter
+groups, starting values, observation masks, and objective. Adam uses the
+existing learning rates and divergence check. Levenberg–Marquardt (LM) uses a
+stage's groups and accepted-update budget. Stage learning rates are Adam
+settings.
+
+Each eligible landmark contributes two residual coordinates,
+`sqrt(a_ik / Σ a) * (projected_ik - observed_ik) / s_i`. The weighted
+denominator spans the subject. Let `p` be the number of selected identity
+coefficients, `N` the number of observations, and `d` the width of one selected
+local coordinate group. The identity prior contributes
+`sqrt(identity_weight / p) * identity` once. For a local group, the prior
+contributes `sqrt(group_weight / (N * d)) * delta` per view. The head
+rotation and root translation use separate means centered on initialization.
+Expression and normalized camera coordinates are centered on zero.
+Configured groups frozen during a stage still contribute their constant
+penalties. The objective is the sum of squares of these residuals.
+
+At the accepted state, let `A_i` and `B_i` be the derivatives of the view
+residual with respect to shared identity and that view's local coordinates.
+The Gauss–Newton system has one shared block `U`, independent local blocks
+`V_i`, cross blocks `E_i`, and gradient `g = Jᵀr`. The shared block sums
+`A_iᵀA_i` and the single identity prior. Each cross block is `A_iᵀB_i`,
+and each local block is `B_iᵀB_i` plus local prior curvature. LM equilibrates
+columns with inverse square roots of the normal diagonals. Each block uses
+a relative diagonal floor and a positive machine-precision floor. It adds
+`λI` to the shared and local blocks in scaled coordinates.
+
+With `V_i = L_i L_iᵀ` after scaling and damping, the local triangular solves
+form `W_i = L_i⁻¹ E_iᵀ` and `v_i = L_i⁻¹ g_i`. Cholesky solves the
+reduced system
+
+```text
+(U - Σ W_iᵀ W_i) Δa = -g_a + Σ W_iᵀ v_i
+Δb_i = L_i⁻ᵀ (-v_i - W_i Δa)
+```
+
+The algorithm back-substitutes the local updates and maps them to native
+coordinates. It uses a single observation graph and bounded groups of
+reverse-mode derivative rows. A value of `jacobian_rows=1` selects scalar
+reverse-mode derivatives. The retained matrices take
+`O(p² + N(pq + q²))` storage for local width `q`. Trial scoring uses
+`batch_size`. Jacobian blocks are accumulated, scaled, and factored in
+float64 on the requested device. Forward projection and differentiation
+use the model's selected precision. Float32 can limit progress when a
+candidate rounds to the current coordinates. The diagonal ratios of the
+Cholesky factors are conditioning indicators.
+
+Coordinates at an expression bound with an outward descent direction are
+held for the linear solve. The trial then clips expressions and casts to
+the model dtype. For the resulting actual step `δ`, the predicted
+reduction in the undamped objective is `-2 gᵀδ - δᵀ (JᵀJ) δ`.
+The actual reduction is the old objective minus the trial objective. An
+accepted trial has positive actual reduction and meets the configured
+acceptance ratio. Damping is divided by three after an acceptance ratio
+above 0.75 and multiplied by four after a ratio below 0.25 or after a
+rejection, within its bounds. Each stage starts with its configured initial
+damping. Rejected trial coordinates are discarded. Existing camera gauges,
+positive scales and positive perspective landmark depths are checked, as is
+finite trial geometry.
+
+`LevenbergMarquardtConfig` is exported from `persona_lab.fitting` and
+serialized under `FitConfig.lm`. The defaults are listed below.
+
+| Key | Default | Role |
+| --- | ---: | --- |
+| `initial_damping` | `1e-3` | Damping at each stage entry |
+| `minimum_damping` | `1e-8` | Lower damping bound |
+| `maximum_damping` | `1e8` | Upper damping bound |
+| `max_trials` | `12` | Trials per linearization |
+| `acceptance_threshold` | `1e-4` | Minimum actual-to-predicted reduction ratio |
+| `diagonal_floor` | `1e-12` | Relative floor for each block's squared column norms |
+| `scaled_gradient_tolerance` | `1e-10` | Tolerance on the scaled projected objective gradient |
+| `jacobian_rows` | `8` | Output rows per reverse-mode call |
+
+LM also supports the common `gradient_tolerance` in native coordinates
+and `improvement_tolerance` with `patience`. `converged` records a
+gradient tolerance, `stopped` an objective plateau, and `budget_exhausted`
+the accepted-update budget. A failure to obtain an acceptable trial returns
+`no_acceptable_step` with the trial or damping limit in the reason.
+`numerical_failure` reports a bad linearization, failed factorization or
+other numerical error. Both failure statuses return a nonzero CLI exit
+and omit final parameters. Adam retains its `failed` status.
+
 ### CLI and result files
 
 Commands below use the existing Docker service. They require local
@@ -836,7 +924,7 @@ docker compose run --rm personalab python -m persona_lab.fit \
 
 docker compose run --rm personalab python -m persona_lab.fit \
   --benchmark outputs/benchmarks/scenario-C --subject subject_0000 \
-  --camera-mode known --device cpu --batch-size 4 \
+  --solver levenberg-marquardt --camera-mode known --device cpu --batch-size 4 \
   --output outputs/fitting/scenario-C --predictions outputs/predictions/scenario-C
 
 docker compose run --rm personalab python -m persona_lab.benchmark.evaluate \
@@ -852,9 +940,22 @@ defaults, and `--dtype float32` is supported. Request CUDA through
 An unavailable requested device raises an error. Other controls include
 `--batch-size`, `--iterations A B C`, `--learning-rate`, `--log-every`,
 `--seed`, the four penalty weights, and the trainable coefficient lists.
-`--learning-rate` overrides all stage and group rates. `--config` accepts
+`--learning-rate` overrides all Adam stage and group rates. `--config` accepts
 a JSON object with the fields of `FitConfig`. Each stage has `name`,
 `iterations`, `groups`, `learning_rate`, and optional `group_rates` fields.
+
+An LM configuration can set its bounds and trial budget in the same JSON.
+
+```json
+{
+  "solver": "levenberg-marquardt",
+  "lm": {
+    "initial_damping": 0.001,
+    "maximum_damping": 1000000,
+    "max_trials": 12
+  }
+}
+```
 
 The real input uses the stable importer order and records accepted,
 rejected, and selected counts. `--selection sample` selects without
@@ -862,6 +963,19 @@ replacement from accepted observations and preserves their importer order.
 The result directory must be new. `result.json` records the verified model
 and parameter order, selection, camera gauge, observation IDs, cameras,
 configuration, initialization, history, and termination status.
+`result.json` version 2 adds an `optimization` record with objective terms
+at initialization and the last valid state, objective and Jacobian evaluation
+counts, updates and their norms, and LM trials with damping, reductions,
+acceptance ratio, and factor diagnostics. Runtime metadata includes
+initialization, objective, Jacobian and block-solve times, fitting time,
+process RSS and CUDA peak allocated bytes where available. Objective time for
+Adam includes the backwards pass. A Jacobian evaluation is an attempted
+full linearization, including block accumulation. An objective evaluation
+is an attempted full scoring pass. On CUDA these timings synchronize the
+requested device. RSS and CUDA allocated-byte peaks are process high-water
+marks. Model loading is timed by the CLI. It is unavailable to
+`fit_identity` when the caller supplies a loaded model. `load_result` also
+reads version 1 Adam results.
 `parameters.npz` contains the initial and final arrays and loads with
 `allow_pickle=False`. `neutral.obj` uses fitted identity with zero
 expressions, rotations, and translation. `--no-neutral-mesh` disables
@@ -910,8 +1024,16 @@ For a count study generate one Scenario C dataset with 100 observations and
 use ordered prefixes of 1, 5, 10, 25, 50, and 100. In the Python API, pass
 the explicit prefix to `fitting_observations`. Evaluate subsets by creating
 `dataset.select_observations(subject, ids)` with the same IDs and order.
-The evaluator CLI accepts a repeated `--observation-id` with exactly one
-`--subject` for the same subset. Evaluate the initial state using
+Fitting and evaluation accept a repeated `--observation-id` with exactly one
+`--subject` for the same ordered subset. Fitting uses explicit IDs or
+`--max-images` and optional sampling. A complete selection in the subject's
+original order retains the source identifier and available subjects, just as
+an omitted selection does. A subset or reorder has an identifier derived
+from the source, subject, and ordered IDs. Predictions version 2 records
+both `source_dataset_id` and `dataset_id`, the evaluation binding.
+Version 1 predictions are readable when their dataset binding matches the
+current selection. Recreate a legacy full-selection prediction if it was
+written with a separate full-subset identifier. Evaluate the initial state using
 `result.to_prediction(initial=True)`. For several subjects, fit each
 separately and collect the resulting predictions by subject ID.
 
@@ -926,17 +1048,51 @@ nuisance directions. It uses one observation graph at a time.
 Fixed-nuisance rank is a conditional diagnostic. Joint identifiability
 depends on the views, camera gauge, and strength of nuisance compensation.
 
-### Validation status
+### Reproduce the solver comparisons
 
-The official asset checksum, native dimensions and direct basis support
-were inspected. CPU and CUDA fitting, the Docker test suite, numerical
-Jacobian ranks, synthetic recovery experiments, the observation-count
-study and the private DeepFaceLab run remain unverified. The implementation
-records model loading, initialization, optimization, update counts, process
-peak RSS and, on CUDA, peak allocated memory. Identical ordered inputs
-and configuration use deterministic initialization. Numerical equivalence
-across processes, batch sizes, dtypes, devices and software versions
-requires measured tolerances.
+Use a new output directory and the existing pinned GNM asset. The study
+regenerates its synthetic datasets and writes case results and a consolidated
+`report.json`. Each fit runs in its own process for process RSS measurements.
+
+```sh
+docker compose build personalab
+docker compose run --rm -e PERSONALAB_GNM_MODEL_FILE=/app/models/gnm_head.npz \
+  personalab python -m pytest -v tests
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --model-file /app/models/gnm_head.npz --device cpu --dtype float64 \
+  --output outputs/issue5 --experiments A B C D E F G H --seeds 42 43 44 --spectra
+```
+
+Experiments A–C cover controlled sparse identity, neutral views, and variable
+expressions. A runs both a known-pose diagnostic and ordinary unknown-pose
+fitting. B and C include the two Adam stage-transition configurations with
+the original Adam rates. D changes one regularizer at a time in the paired
+comparisons. E uses nested prefixes of each 100-observation dataset and
+reports per-seed scores, distributions, and adjacent geometry changes.
+F adds the same held-out views for every prefix of an identity. It reports
+conditional projection with true nuisance parameters and projection after
+estimating expressions and poses with identity frozen. Cameras are known
+for both held-out diagnostics. G estimates weak-perspective and constrained
+perspective cameras from the observed landmarks. H measures 50, 100, 300,
+and 600 observations. It uses one update per stage for throughput by default.
+Use `--scaling-full` to apply the fitting budgets to H.
+
+The protocol sets Adam budgets to 30/70/900 and divides the original Adam
+joint learning rates by ten for the main comparisons. The default LM
+budgets in the study are 10/12/30. `--adam-iterations` and
+`--lm-iterations` explicitly set other computational budgets. Compare
+elapsed time, evaluations, and reconstructed geometry across budgets.
+`--historical-report` accepts the original `count-study-v2.json` at its
+container path. The report verifies the source identifier and the exact
+observation order before calculating historical score deltas. For a CUDA
+study, use the existing CUDA Compose profile and pass `--device cuda`.
+
+The historical CPU Adam study is the available measured baseline. The
+second-pass implementation requires Docker verification of CPU and CUDA
+fitting, comparative reconstruction, and scalability. Run the private
+DeepFaceLab experiment only after the relevant synthetic validations pass.
+The local fit command can then use an explicitly chosen camera model,
+approximately 50 observations, overlays, and a neutral mesh.
 
 ## GNM Ecosystem Packages
 
