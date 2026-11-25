@@ -7,7 +7,7 @@ import sys
 
 from gnm.shape import gnm_pytorch
 import numpy as np
-from personalab.gnm_mesh import generate_mesh, load_head_model
+from persona_lab.gnm_mesh import generate_mesh, load_head_model
 import pytest
 from scipy.spatial.transform import Rotation
 import torch
@@ -112,7 +112,7 @@ def test_head_joint_rotates_its_vertices_around_the_joint(model, neutral):
 
 
 def _export_from_cli(output, model_file, *parameters):
-    command = [sys.executable, "-m", "personalab.gnm_mesh", "--output", str(output)]
+    command = [sys.executable, "-m", "persona_lab.gnm_mesh", "--output", str(output)]
     if model_file is not None:
         command += ["--model-file", model_file]
     subprocess.run(

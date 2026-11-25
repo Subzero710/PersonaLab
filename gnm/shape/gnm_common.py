@@ -341,12 +341,13 @@ def joint_transforms_world_from_rotation_matrices[ArrayT: Any](
   """
   xnp = enp.get_np_module(joints)
   num_joints = len(joint_parent_indices)
+  device_kwargs = {'device': joints.device} if enp.lazy.is_torch(joints) else {}
 
   # Gather the parent's joints position for each joint.
   # Under JAX/TF/NumPy, we can index with parents.
   # But we must exclude the root (index 0 has parent 0, but is not used).
   parent_indices_except_root = xnp.asarray(
-      joint_parent_indices[1:], dtype=xnp.int32
+      joint_parent_indices[1:], dtype=xnp.int32, **device_kwargs
   )
   joint_parents = take(joints, parent_indices_except_root, axis=-2, xnp=xnp)
 
@@ -369,7 +370,7 @@ def joint_transforms_world_from_rotation_matrices[ArrayT: Any](
   )
   # Set the last element to 1.0.
   bottom_row = bottom_row + xnp.asarray(
-      [0.0, 0.0, 0.0, 1.0], dtype=joints.dtype
+      [0.0, 0.0, 0.0, 1.0], dtype=joints.dtype, **device_kwargs
   )
 
   local_transforms = xnp.concatenate(

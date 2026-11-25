@@ -34,7 +34,7 @@ Run these commands from the repository root on Linux (x86-64):
 mkdir -p datasets models outputs .gnm-cache
 export PERSONALAB_UID=$(id -u) PERSONALAB_GID=$(id -g)
 docker compose build personalab
-docker compose run --rm personalab python -m personalab.gnm_mesh --output outputs/neutral.obj
+docker compose run --rm personalab python -m persona_lab.gnm_mesh --output outputs/neutral.obj
 docker compose run --rm personalab python -m pytest -v tests
 ```
 
@@ -76,9 +76,9 @@ ZIP scans include nested files. Use the CPU service from the repository root
 after building the image.
 
 ```sh
-docker compose run --rm personalab python -m personalab.dfl_import \
+docker compose run --rm personalab python -m persona_lab.dfl_import \
   --input datasets/studio_light.zip --output outputs/dfl-validation.json
-docker compose run --rm personalab python -m personalab.dfl_import \
+docker compose run --rm personalab python -m persona_lab.dfl_import \
   --input datasets/aligned --output outputs/dfl-directory-validation.json
 ```
 
@@ -89,7 +89,7 @@ dataset or CLI error. Dataset failures produce a `dataset_error` object with
 a stable `code` and a `message`. Command and output I/O errors go to stderr.
 
 ```python
-from personalab.dfl import DFLFaceSample, iter_dataset, read_jpeg, validate_dataset
+from persona_lab.dfl import DFLFaceSample, iter_dataset, read_jpeg, validate_dataset
 
 sample = read_jpeg("datasets/aligned/0001.jpg")
 original_jpeg = sample.read_image_bytes()
@@ -151,7 +151,7 @@ Each `rejections` entry contains a sample ID, relative image reference where
 safe, dimensions where known, field statuses, missing optional fields, and
 one or more `issues` with `code`, `message`, and optional `field`.
 `rejection_counts` counts samples per distinct issue code. The stable codes
-are defined by `personalab.dfl.ErrorCode`. Reports omit source filenames and
+are defined by `persona_lab.dfl.ErrorCode`. Reports omit source filenames and
 pixel, coordinate, and mask values.
 
 ### Format and resource limits
@@ -201,6 +201,189 @@ after iteration. The process keeps only the current sample.
 ```sh
 docker compose run --rm personalab python -m pytest -s -v tests/test_dfl_dataset.py -k streaming_memory
 ```
+
+## Project GNM landmarks into an aligned crop
+
+`persona_lab.gnm_geometry.load_sparse_landmarks(model)` loads the installed
+GNM `HEAD_SPARSE_68` resource and checks its arrays against the v3.0 Head
+topology. Each of the 68 definitions holds three vertex indices and three
+finite weights in `[0, 1]`. The absolute sum tolerance is 0.00101 for the
+three-decimal file and float32 rounding. The official weights are used as stored.
+`extract_landmarks()` calls GNM's differentiable `vertices_and_landmarks()`
+and returns vertices `(..., V, 3)` and GNM-ordered points `(..., 68, 3)`.
+The model and input tensors must share a device and a float32 or float64 dtype.
+Expression `(..., E)`, joint rotations `(..., J, 3)` and root translation
+`(..., 3)` share leading dimensions. A single identity `(I,)` expands over
+those dimensions with one gradient back to the shared coefficients. A batched
+identity `(..., I)` must match the other inputs. GNM supplies its native neutral
+values for omitted inputs.
+
+### Anatomical correspondence and fitting masks
+
+`persona_lab.correspondences.DFL_TO_GNM` records the subject-side anatomy,
+region, GNM index, default eligibility and any limitation for each DFL index.
+The official GNM v3.0 template, its anatomical vertex groups, and its vertex
+mirror table match DeepFaceLab's indexed convention across the following regions.
+In a frontal image, the subject's right is image-left.
+
+| DeepFaceLab indices | GNM indices | Anatomy | Enabled by default |
+| --- | --- | --- | --- |
+| 0–16 | 0–16 | Right facial outline through chin to left facial outline | 17 |
+| 17–26 | 17–26 | Right and left eyebrows | 10 |
+| 27–30 | 27–30 | Nasal bridge and tip | 4 |
+| 31–35 | 31–35 | Nasal base and nostril region | 5 |
+| 36–47 | 36–47 | Right and left eye corners and eyelids | 12 |
+| 48–59 | 48–59 | Outer lips | 12 |
+| 60–67 | 60–67 | Inner lips | 8 |
+
+The default map has 68 direct anatomical correspondences and no remapped or
+unsupported rows. All 68 are enabled by default, including the 17 jawline
+and facial outline landmarks (0–16). DeepFaceLab's jaw landmarks are not
+assumed to be geometric silhouette samples. The fixed GNM surface locations
+can exhibit viewpoint-dependent correspondence errors, but such errors have
+not been established for the project's DeepFaceLab observations. The
+`view_dependent` annotation describes this potential limitation and has no
+masking effect. No region is automatically excluded based on viewpoint.
+Use an explicit validity mask, `pose_validity`, subset or zero weights to
+exclude individual unreliable observations in any region. The API applies no
+automatic visibility threshold.
+
+A custom `CorrespondenceMap` can remap indices. An unsupported row keeps
+its original DFL index and carries `gnm_index=None`, an exclusion reason
+and disabled fitting eligibility. `LandmarkObservation.landmark_pairs()`
+selects supported, enabled, valid rows with positive weights and preserves
+their DFL order. Pass a subset of DFL indices, observation validity, pose
+validity, or per-point weights to restrict the result. It returns both index
+arrays, pixel pairs and weights for the objective. The diagnostic API can
+display excluded points without putting them into the residual.
+
+References are DeepFaceLab's [LandmarksProcessor](https://github.com/iperov/DeepFaceLab/blob/e4b7543ffa1d73b26fce1e31852727f658ba490c/facelib/LandmarksProcessor.py),
+the [official landmark resource](gnm/shape/data/landmarks/head_sparse_68.txt),
+and the [GNM v3.0 Head asset](https://huggingface.co/google/gnm-v3/tree/main/v3_0).
+
+### Coordinate conventions
+
+| Space | Axes, units and origin |
+| --- | --- |
+| GNM native template and posed coordinates | Right-handed meters. +X toward the subject's left, +Y toward the top of the head, +Z anterior. Posed coordinates keep the template's scene axes and origin. GNM applies root translation in meters and joint rotations about the bind-pose joints in parent-to-child order. |
+| OpenCV camera | Right-handed. +X image-right, +Y image-down, +Z forward from the optical center. 3D positions and perspective translation share the model's units. |
+| OpenGL camera | Right-handed. +X image-right, +Y image-up, camera looks along −Z. |
+| DFL aligned and original-source pixels | +X right, +Y down, top-left pixel center at `(0, 0)`. Pixel centers lie at integer coordinates. The spaces refer to their respective rasters. Coordinates outside the image remain valid. |
+| Normalized aligned raster | +X right, +Y down, dimensionless. Edges span 0 to 1. From pixel centers use `(u + 0.5) / width` and `(v + 0.5) / height`. Invert with `u = x * width - 0.5`, likewise for `v`. |
+
+`gnm_to_frontal_axes()` multiplies GNM points by `C = diag(1, -1, -1)`
+and keeps the GNM origin. It expresses the geometry in world axes aligned
+with a frontal OpenCV camera. The separate world-to-camera transform is
+`P_cam = R @ P_world + t`. With row-stored point tensors this is
+`points @ R.T + t`. `camera_position(rotation, translation)` returns the
+optical center in world coordinates `-R.T @ t`. GNM joint and camera
+rotations both use axis-angle vectors in radians. Each vector represents one
+right-handed rotation with no Euler order. Use GNM rotations for articulation
+and camera extrinsics for viewpoint. Apply each transform once.
+
+`flip_camera_axes()` switches OpenCV and OpenGL camera point conventions.
+`convert_camera_matrix()` changes only the camera side of a homogeneous
+4×4 transform. For world-to-camera it left-multiplies by
+`diag(1, -1, -1, 1)` as in [GNM's reference](gnm/shape/visualization/camera_conversions.py).
+For camera-to-world it right-multiplies by that matrix. Each conversion
+is its own inverse.
+
+`source_to_aligned()` applies DeepFaceLab's `image_to_face_mat` in its stored
+direction, `pixel_aligned = A @ pixel_source + b`. `aligned_to_source()`
+solves that 2D affine equation in reverse. Missing, invalid and singular
+matrices raise `ValueError`. The affine describes a raster-to-raster crop.
+Camera calibration remains independent of it. Reversing 3D projection
+requires additional depth information.
+
+### Cameras and observations
+
+`persona_lab.camera.project(points, camera)` consumes `(..., N, 3)`
+and returns `(..., N, 2)` pixel centers in input point order. Inputs and
+camera parameters share a CPU or CUDA device and float32 or float64 dtype.
+Their leading dimensions broadcast using PyTorch rules. Each camera batch
+shares one `ImageSize(width, height)`. Changing the raster dimensions
+alone leaves pixel projections unchanged. To resize by a factor of 2 with
+the same edge-normalized framing, double the focal lengths or weak scale
+and apply `(center + 0.5) * 2 - 0.5` to the principal point or weak translation.
+
+- `PerspectiveCamera` takes axis-angle rotation `(..., 3)`, translation
+  `(..., 3)`, focal lengths `(..., 2)` and principal point `(..., 2)`.
+  For `(X, Y, Z) = R @ P_world + t`, the result is
+  `(fx * X/Z + cx, fy * Y/Z + cy)`. The intrinsics have zero skew and no
+  distortion. Nonpositive camera depth, nonfinite coordinates and invalid
+  parameters raise `ValueError`.
+- `WeakPerspectiveCamera` takes axis-angle rotation `(..., 3)`, image
+  translation `(..., 2)` and scalar scale per camera `(...)` in pixels
+  per scene unit. The result is `scale * (R @ P_world)[:2] + translation`.
+  It has one image scale and one image translation. Perspective intrinsics
+  are optional for observations. In future fitting, fix or constrain head
+  pose versus camera rotation, scene placement versus camera translation,
+  and object size versus image scale or camera distance.
+
+`LandmarkObservation.from_dfl(sample)` works with an accepted `DFLFaceSample`.
+It copies aligned pixels, dimensions and optional source/alignment metadata
+in the requested dtype and device, without reopening the JPEG. The default
+observation dtype is float64. XSeg and additional metadata remain in the
+ingested sample. `source_pixels()` inverts the supplied affine. Stored
+source landmarks are also accessible through `alignment.source_landmarks`.
+Landmarks have shape `(68, 2)` in original DFL order, validity is a boolean
+`(68,)` mask, and fitting weights are a nonnegative `(68,)` tensor.
+`known_camera` and `camera_initialization` are separate optional fields.
+Both remain absent for uncalibrated crops unless supplied explicitly.
+
+```python
+from persona_lab.camera import PerspectiveCamera, project
+from persona_lab.coordinates import ImageSize, gnm_to_frontal_axes
+from persona_lab.gnm_geometry import extract_landmarks
+from persona_lab.gnm_mesh import load_head_model
+from persona_lab.observations import LandmarkObservation
+
+model = load_head_model()
+ref = model.template_vertex_positions
+identity = ref.new_zeros(model.identity_dim).requires_grad_()
+_, landmarks = extract_landmarks(model, identity=identity)
+size = ImageSize(512, 384)
+camera = PerspectiveCamera(
+    image_size=size,
+    rotation=ref.new_zeros(3),
+    translation=ref.new_tensor([0, 0.265, 0.65]),
+    focal_length=ref.new_tensor([820, 760]),
+    principal_point=ref.new_tensor([255.5, 191.5]),
+)
+pixels = project(gnm_to_frontal_axes(landmarks), camera)
+# The verified default correspondences use the same ordering.
+observation = LandmarkObservation(
+    observation_id="synthetic-0", image_size=size,
+    landmarks=pixels.detach() + ref.new_tensor([2, -1]), known_camera=camera,
+)
+pairs = observation.landmark_pairs(pixels)
+loss = ((pairs.projected - pairs.observed).square().sum(-1) * pairs.weights).mean()
+loss.backward()
+```
+
+The CPU suite includes independent NumPy and SciPy projection references,
+geometry and affine round trips, and complete reprojection gradients to GNM
+identity, expression, joint pose and camera parameters. The float64 camera
+tests use 1e-11 pixel absolute tolerance for batched synthetic points and
+1e-10 pixels for neutral GNM landmarks. Pose and expression comparisons allow
+7e-4 pixels for the rig geometry. Central finite differences use step 1e-5,
+absolute tolerance 2e-5 and relative tolerance 2e-4. Tests exercise shared
+identity and native landmark caching. The CUDA checks require a compatible
+GPU and the existing CUDA Compose service.
+
+### Headless landmark diagnostics
+
+```sh
+docker compose run --rm personalab python -m persona_lab.landmark_diagnostics \
+  --output outputs/landmark-diagnostics
+```
+
+The command writes frontal, two three-quarter, profile and lower-face
+expression PNGs. The two panels show the projected GNM mesh and official
+indices and the observed DFL indices, residual lines and exclusion indicators.
+The examples use explicitly offset synthetic landmarks. To inspect your own
+observations, call `save_landmark_overlay()` with your aligned pixel projections
+and a `LandmarkObservation`. Pass an aligned Pillow image optionally.
 
 ## GNM Ecosystem Packages
 

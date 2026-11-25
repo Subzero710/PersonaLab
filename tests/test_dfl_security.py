@@ -6,7 +6,7 @@ import struct
 import numpy as np
 import pytest
 
-from personalab.dfl import ErrorCode, SampleError, read_jpeg
+from persona_lab.dfl import ErrorCode, SampleError, read_jpeg
 
 
 _CALLS = []

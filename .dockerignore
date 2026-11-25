@@ -7,8 +7,8 @@
 !gnm/
 !gnm/shape/
 !gnm/shape/**
-!personalab/
-!personalab/**
+!persona_lab/
+!persona_lab/**
 !tests/
 !tests/**
 **/__pycache__/
