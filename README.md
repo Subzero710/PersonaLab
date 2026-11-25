@@ -385,6 +385,320 @@ The examples use explicitly offset synthetic landmarks. To inspect your own
 observations, call `save_landmark_overlay()` with your aligned pixel projections
 and a `LandmarkObservation`. Pass an aligned Pillow image optionally.
 
+## Synthetic identity fitting benchmark
+
+The Issue #4 benchmark generates DFL-ordered 2D landmark observations from known
+GNM identities, expressions, poses, and cameras. It evaluates recovery of identity
+coefficients, the full neutral mesh, and projected landmarks. Generation and
+evaluation operate on numeric arrays and use the existing GNM, correspondence,
+and camera APIs. They require only the public model asset.
+
+### Generate and evaluate with Docker
+
+Run from the repository root with the existing CPU service:
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m pytest -v tests
+
+docker compose run --rm personalab python -m persona_lab.benchmark.generate \
+  --scenario F --subjects 5 --observations-per-subject 50 --seed 42 \
+  --output outputs/benchmarks/synthetic
+
+docker compose run --rm personalab python -m persona_lab.benchmark.evaluate \
+  --ground-truth outputs/benchmarks/synthetic \
+  --predictions outputs/predictions/synthetic \
+  --mode known-camera --output outputs/reports/synthetic
+```
+
+The evaluation command expects external predictions for every subject. Pass
+`--subject subject_0000` to evaluate one subject explicitly. It can be repeated
+for several subjects, and the report lists omitted subject IDs. Generation,
+prediction writing, and evaluation require a fresh output path. Evaluation
+publishes `report.json` and prints a human-readable summary.
+
+Both commands accept `--model-file models/gnm_head.npz`. The file must match
+GNM v3.0 Head from `google/gnm-v3`, revision
+`c01e90d298d82301f9fd18f54806be751775cb7c`, path `v3_0/gnm_head.npz`
+and SHA-256 `61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb`.
+The benchmark verifies the bytes and uses the existing GNM cache directory
+(`$GNM_CACHE_DIR/v3_0/gnm_head.npz`). It downloads the pinned revision on a cache
+miss. An incompatible cached or explicitly selected file fails with a checksum
+error. The asset contains 253 identity coefficients, 383 expression
+coefficients, four joints (`neck`, `head`, `left_eye`, `right_eye`), 17,821
+vertices, and 35,324 triangles. The manifest records ordered model parameter
+names, topology and landmark-resource digests, and coordinate conventions.
+
+The default numerical dtype is `float64` and the default device is `cpu`.
+Generation also accepts `--dtype float32`. For a CUDA host configured as above,
+use `docker compose --profile cuda run --rm personalab-cuda` and pass
+`--device cuda` to the module. An unavailable requested device fails explicitly.
+
+### Scenarios and generation options
+
+| Scenario | Subjects | Observations per subject by default | Expressions and views | Noise profiles |
+| --- | ---: | ---: | --- | --- |
+| A | 1 | 1 | Neutral frontal | Clean |
+| B | 1 | 9 | Neutral, all nine views | Clean |
+| C | 1 | 9 | All seven presets, all nine views | Clean |
+| D | 1 | 9 | Same clean inputs as C | Alternating 0.5 and 2 px Gaussian standard deviations |
+| E | 1 | 9 | Same clean inputs as C | Four missing landmarks and three outliers, with optional region removal |
+| F | 5 by default, at least 2 | 9 | All presets and views for each subject | Cycles clean, small Gaussian, moderate Gaussian, structured, and combined |
+
+Scenario F is the default. Scenario A takes exactly one observation and one
+projection type. B–F require at least nine observations to cover the views.
+A defaults to perspective. B–F alternate perspective and weak perspective
+when `--camera both` is selected. `--camera perspective` and
+`--camera weak-perspective` select one projection throughout. Set the raster
+with `--image-size WIDTH HEIGHT` (default 512 × 512) and the local random seed
+with `--seed` (default 42).
+
+Pass `--config path.json` with a JSON object of generation options. Explicit
+command-line options take precedence. The manifest's resolved `config` object
+can be copied into a JSON file and reused directly. In addition to CLI options,
+the file accepts `expression_strength`, `expressions` (preset order),
+`view_degrees` (signed angles by view name), `distance_m` (positive lower and
+upper bounds), `weak_scale_per_short_edge` (positive lower and upper bounds),
+and `noise`. Supply every required view and expression for the scenario.
+A `noise` override supplies a complete map of the scenario's profile names
+(`clean`, `small`, `moderate`, `structured`, and/or `combined`). Each profile
+object can define `gaussian_px`, `missing`, `outliers`, `outlier_radius_px`,
+and `occlude`, a list of correspondence region names such as `eyebrow` or
+`inner_mouth`. Scenario constraints and insufficient landmark selections report
+explicit errors.
+
+One identity vector is drawn per subject, independently across all native
+identity coefficients, from a uniform distribution on `[-h, h]`. The default
+`h=0.5` covers a modest part of GNM's documented typical coefficient range
+of −3 to +3. Use `--identity-half-range` or the corresponding JSON setting to
+choose a positive half-range up to 3. These are controlled benchmark samples.
+The upstream semantic sampler models demographic and emotion classes. The
+benchmark samples the native identity basis directly and uses explicit
+anatomical probes for its expression directions.
+Realistic geometry for arbitrary vectors is outside this sampling guarantee.
+Neutral vertices use zero expressions, joint rotations, and root translation,
+in native meter units and original vertex order.
+
+The expression controls below use signed native basis components. Probes
+measure movement on the official sparse landmark asset, in GNM's native axes.
+For each subject, generation checks directions at the configured strength
+endpoints with a 10 µm displacement margin. Eye closing yields a reduced
+positive eyelid aperture. Each observation independently draws a multiplier
+uniformly from `expression_strength` (default `[0.8, 1.0]`). GNM documents a
+typical expression coefficient range of −3 to +3. The table describes the
+benchmark's selected directions and magnitudes.
+
+| Preset | Base GNM expression coefficients | Anatomical probe |
+| --- | --- | --- |
+| `neutral` | All zero | Neutral reference |
+| `smile` | `lower_face_region_005=-1.5`, `lower_face_region_004=-0.7` | Both outer lip corners rise relative to the center and get farther apart |
+| `mouth_open` | `lower_face_region_000=-1.5` | Upper-to-lower inner lip gap increases |
+| `raise_brows` | For each of `left_eye_region` and `right_eye_region`, `_000=1`, `_001=-1` | Each brow rises relative to its eye corners |
+| `eyes_close` | For each eye region, `_000=-0.95`, `_001=-0.95` | Both eyelid apertures decrease |
+| `eyes_open` | For each eye region, `_000=0.75`, `_001=0.75` | Both eyelid apertures increase |
+| `smile_raise_brows` | Sum of the smile and brow directions | Lip and brow probes both pass |
+
+This Head asset has no jaw joint. Opening uses its lower-face expression
+basis. Eye joint rotations orient the eyeballs. The eyelid presets use
+the eye-region expression basis.
+
+| View | Native `head` joint axis | Default angle |
+| --- | --- | ---: |
+| `frontal` | — | 0° |
+| `three_quarter_left` / `three_quarter_right` | Y | −35° / +35° |
+| `profile_left` / `profile_right` | Y | −70° / +70° |
+| `pitch_up` / `pitch_down` | X | −18° / +18° |
+| `roll_positive` / `roll_negative` | Z | +15° / −15° |
+
+Left and right view labels denote the direction the nose moves in the image.
+The view schedule cycles through this table. Expressions cycle through their
+own ordered list with a phase advance after each rotation through the views.
+The head joint creates the viewpoint once, with zero camera rotation and zero
+root translation. Both cameras view the frontal OpenCV axes defined above.
+Perspective focal lengths equal 1.4 times the image short edge in pixels.
+The principal point is the raster center, and the camera adds 0.265 m along
+its Y axis to center the face. Camera Z translation is sampled within
+the configured depth interval (default 0.60–0.80 m). Weak-perspective scale
+is the image short edge times a factor sampled in the configured interval
+(default 2.0–2.4). Weak image translation centers the raster with
+an additional Y offset of scale × 0.265 m. Each camera type alternates
+sampling around fractions 0.25 and 0.75 of its interval with uniform
+jitter in `[-0.125, 0.125]`, which guarantees near and far tiers.
+Three-quarter magnitudes are 20–55°, profile magnitudes are 60–<90°, and
+pitch and roll magnitudes are 5–35° when configuring view angles.
+
+### Landmarks, noise, and reproducibility
+
+The benchmark projects GNM's official `HEAD_SPARSE_68` locations and applies
+`DFL_TO_GNM` in DFL index order. The default corresponds to all 68 slots
+including all 17 contour slots, with unit weights. Eligibility requires a
+supported, enabled correspondence and a clean projection within the raster
+edges `[-0.5, width - 0.5)` and `[-0.5, height - 0.5)`. Coordinates remain
+unclamped. Unsupported slots carry a finite zero placeholder and false masks.
+Perspective projection rejects nonpositive depths. All generated observations
+have physical visibility status **not evaluated**. Simulated occlusion is
+recorded separately from frame status and projection support.
+
+Corruption first removes configured anatomical regions and selects additional
+missing slots uniformly without replacement among the remaining eligible
+points. The removed slots retain their clean coordinates under a false
+fitting mask. Independent zero-mean Gaussian samples in pixel units are added
+to valid X and Y coordinates. Then outlier indices are sampled uniformly
+without replacement from the remaining valid points. Each receives an
+additive displacement sampled with uniform angle and uniform radius
+(default 8–18 px), independent of the Gaussian noise. Outliers stay valid,
+including when their corrupted coordinates move outside the raster. The
+combined profile defaults to 2 px Gaussian noise, eyebrow occlusion, four
+randomly missing slots, and three outliers. Missing, occluded, and outlier
+labels are disjoint. Gaussian noise can overlap with outliers. The dataset
+stores both clean and observed coordinates and their final signed offsets.
+These noise levels are controlled perturbations in pixel units.
+
+The generator uses local NumPy PCG64 streams with `SeedSequence` keyed by
+the root seed and `(stream, subject index, observation index)`. Stream IDs
+are recorded in the manifest. Identity, expression, camera, Gaussian,
+missing, outlier selection, and outlier displacement use separate streams.
+Views and region removal follow explicit schedules. Noise changes leave
+the clean parameters and projections paired at the same seed and configuration.
+Stable identifiers use zero-based indices. The dataset ID hashes canonical
+metadata and numeric array digests, independent of the archive container bytes
+and descriptive runtime metadata. The reproducibility target is equal arrays
+with identical settings, model, software, and device. Exact agreement across
+platforms or GPU and CPU and byte-identical NPZ archives are outside that target.
+
+### Dataset, predictions, and fitting API
+
+A dataset directory contains `manifest.json`, `topology.npz`, and one
+`subject_XXXX.npz` per subject. Schema version 1 records the resolved config,
+the asset and parameter basis, the runtime, correspondences, and ordered subject
+and observation records. Each camera is stored in its observation's metadata
+with the raster size, projection type, rotation, and projection-specific
+parameters. IDs have the form `subject_0000/observation_0000`. The completion
+manifest is published after validation. Loading checks the archive shapes,
+dtypes, finiteness, topology, digests, identifiers, cameras, and mask relationships
+through NumPy's non-pickle loading path.
+
+| Archive array | Shape | Type |
+| --- | --- | --- |
+| `triangles` in `topology.npz` | `(35324, 3)` | int32 |
+| `identity` | `(253,)` | Configured float dtype |
+| `neutral_vertices` | `(17821, 3)` | Configured float dtype |
+| `expression` | `(N, 383)` | Configured float dtype |
+| `rotations`, `translation` | `(N, 4, 3)`, `(N, 3)` | Configured float dtype |
+| `clean`, `observed`, `offset_px` | `(N, 68, 2)` | Configured float dtype |
+| `weights` | `(N, 68)` | Configured float dtype |
+| `supported`, `projection_valid`, `in_frame`, `validity` | `(N, 68)` | bool |
+| `missing`, `occluded`, `outliers` | `(N, 68)` | bool |
+
+`load_dataset(path).fitting_observations(subject_id)` returns a tuple of
+`LandmarkObservation` instances with observed pixels, dimensions, weights,
+validity, correspondence map, and `known_camera`. It accepts an explicit
+`observation_ids` subset and `dtype` and `device` arguments. To enumerate IDs,
+use `subject_ids` and `observation_ids(subject_id)`. Evaluation code can
+request the hidden state explicitly through `ground_truth(subject_id)`.
+
+An external producer can write predictions with `write_predictions`.
+For example, this function saves a shared identity obtained from fitting:
+
+```python
+from persona_lab.benchmark.dataset import load_dataset
+from persona_lab.benchmark.predictions import SubjectPrediction, write_predictions
+
+dataset = load_dataset("outputs/benchmarks/synthetic")
+subject = dataset.subject_ids[0]
+observations = dataset.fitting_observations(subject, dtype=dataset.config.dtype)
+cameras = tuple(item.known_camera for item in observations)
+
+def save_estimated_identity(identity):
+    # The caller supplies the optimizer's ordered NumPy vector in the dataset dtype.
+    write_predictions(
+        "outputs/predictions/identity",
+        dataset,
+        {subject: SubjectPrediction(identity=identity)},
+    )
+```
+
+Use `LandmarkObservation.landmark_pairs(projected_gnm)` inside a fitting
+objective to obtain valid pairs. Save each subject's single estimated identity
+after fitting. For observation-specific estimates, populate
+`SubjectPrediction.observations` with `ObservationPrediction` objects keyed
+by the matching observation ID. Pass the dataset and output path to
+`write_predictions`, then evaluate through the CLI:
+
+```sh
+docker compose run --rm personalab python -m persona_lab.benchmark.evaluate \
+  --ground-truth outputs/benchmarks/synthetic \
+  --predictions outputs/predictions/identity \
+  --mode identity-only --subject subject_0000 --output outputs/reports/identity
+```
+
+Prediction schema version 1 is a directory with a `manifest.json` containing
+`schema_version`, `dataset_id`, the full `model` object from the dataset, and
+a `subjects` list. Each subject object has `id`, an `arrays` list of archive
+keys, and an `observations` list of `{"id": "..."}` objects with optional
+`camera` objects. The corresponding `<subject_id>.npz` contains `identity`
+plus any supplied `expression`, `rotations` and `translation` (supplied
+together for pose), or `projected` (`N × 68 × 2` DFL-ordered pixels) in
+the dataset float dtype. Observation arrays follow that prediction manifest's
+row order, and the evaluator associates them by ID. Every supplied observation
+group covers the full selected subject. Camera objects use the same fields as
+the dataset, with matching projection type and dimensions. Foreign, missing,
+duplicate, or incompatible IDs and invalid arrays produce explicit errors.
+
+| Mode | Required predictions | Reprojection and parameter recovery |
+| --- | --- | --- |
+| `identity-only` | Identity | Coefficient and neutral geometry recovery |
+| `conditional` | Identity | Reprojects with the saved nuisance parameters, labeled conditional |
+| `known-camera` | Identity, expression, pose | Reprojects with fixed benchmark cameras and scores predicted expression and pose |
+| `complete` | Identity, expression, pose, camera | Reprojects the supplied parameters and scores each estimated group |
+| `projected` | Identity and external DFL pixels | Scores supplied pixels and any independently supplied expression, pose, or camera groups |
+
+For evaluator checks, `oracle_predictions(dataset, mode="complete")` explicitly
+builds predictions from the saved ground truth. Pass its result to
+`write_predictions` and evaluate that output. The CLI always requires a
+prediction directory.
+
+### Numerical interpretation
+
+The evaluator reports raw absolute coefficient mean, RMS, and maximum. It
+evaluates the neutral identity with zero expression and pose and compares
+corresponding native mesh vertices using their Euclidean distances in meters.
+Mesh reductions are mean, RMS, and maximum. Vertex correspondence uses the
+whole verified topology and its original positions.
+
+Clean- and observed-reference reprojection both use the benchmark fitting mask.
+Eligible distances are Euclidean pixels, with mean, median, RMS, and counts.
+Per-observation reports retain all 68 slots and use JSON `null` for excluded
+slots. Entirely empty masks produce unavailable pixel summaries. A noisy
+oracle can have positive observed-reference error. Subject and scenario
+reprojection aggregates pool individual valid landmark distances, including
+in the noise-profile slices. Coefficient and vertex aggregates pool
+equal-sized vectors and meshes across selected subjects. RMS is calculated
+from squared errors before taking the square root.
+
+Expression recovery uses its own coefficient reductions. Each joint or
+camera rotation error is the shortest relative rotation angle in degrees.
+Root and perspective camera translations use Euclidean meters. Perspective
+focal length and principal point errors are separate absolute pixel
+components. Weak camera image translation is Euclidean pixels and scale
+error is in pixels per meter. Reports label absent groups `not_provided`
+and fixed cameras `fixed_known`.
+
+Float64 tests use exact array equality for serialization and paired sampling,
+1e-10 pixels for the independent neutral pinhole calculation and clean oracle
+reprojection, and 1e-12 m for neutral vertex roundoff. They use the Issue #3
+float64 projection checks and a native-coordinate reference. The expression
+direction checks use the 10 µm margin above to distinguish movement from
+roundoff and small variations in the landmark resource. These tolerances
+cover benchmark arithmetic. Optimization thresholds will be measured in
+Issue #5.
+
+Sparse landmarks can constrain some identity dimensions weakly, especially
+with one frontal view. Changes to expression, pose, and camera can compensate
+for identity errors in the raster. Compare coefficient and geometry recovery
+alongside reprojection. Synthetic recovery establishes correctness under GNM's
+assumptions. Evaluating real photographs requires the separate real-data study.
+
 ## GNM Ecosystem Packages
 
 Here we list all the available GNM packages:
