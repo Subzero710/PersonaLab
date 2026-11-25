@@ -517,6 +517,7 @@ def test_cuda_official_model_fitting(asset):
         train_head=False, stages=(Stage("id", 2, ("identity",), 0.01),),
     ))
     assert fit.device.startswith("cuda:") and fit.status == "budget_exhausted", fit.reason
+    assert fit.final_reprojection.overall.rms_px < fit.initial_reprojection.overall.rms_px
 
 
 def _lm_config(**overrides):
@@ -845,4 +846,96 @@ def test_study_pairs_preserve_observation_order_and_comparison_controls(monkeypa
             assert adam["budget"] == "profiling_only"
             assert [stage["iterations"] for stage in lm["config"]["stages"]] == [1, 1, 1]
     assert {item["observations"] for item in adam_cases if item["experiment"] == "H"} == {50, 100, 300, 600}
-    assert fit.final_reprojection.overall.rms_px < fit.initial_reprojection.overall.rms_px
+
+
+@pytest.mark.parametrize("changes,shared_root,mismatches", [
+    ({}, True, []),
+    ({"focal_length": (768.0, 768.0)}, True, ["focal_length"]),
+    ({"principal_point": (254.5, 255.5)}, True, ["principal_point"]),
+    ({"rotation": (0.0, 0.1, 0.0)}, True, ["rotation"]),
+    ({}, False, ["root_translation"]),
+])
+def test_study_perspective_translation_requires_a_matching_gauge(changes, shared_root, mismatches):
+    from persona_lab.benchmark.evaluate import _camera_errors
+
+    def tensor(values):
+        return torch.tensor(values, dtype=torch.float64)
+
+    truth = PerspectiveCamera(
+        ImageSize(512, 512), tensor((0, 0, 0)), tensor((0, 0.265, 0.7)),
+        tensor((716.8, 716.8)), tensor((255.5, 255.5)),
+    )
+    fitted = replace(
+        truth, translation=tensor((0, 0.265, 0.75)),
+        **{name: tensor(value) for name, value in changes.items()},
+    )
+    score = _camera_errors(fitted, truth, shared_root=shared_root)
+    assert score["translation_comparability"] == {
+        "status": "not_comparable" if mismatches else "comparable",
+        "mismatched_fields": mismatches,
+    }
+    assert score["fixed_parameters"] == ("rotation", "focal_length", "principal_point")
+    if mismatches:
+        assert score["status"] == "partially_evaluated"
+        assert score["translation_l2_m"] is None
+    else:
+        assert score["status"] == "evaluated"
+        assert score["translation_l2_m"] == pytest.approx(0.05)
+    assert _camera_errors(fitted, truth)["translation_l2_m"] == pytest.approx(0.05)
+
+
+def test_study_scores_blind_perspective_fit_with_different_focal_length(asset, monkeypatch, tmp_path):
+    from dataclasses import asdict
+    from persona_lab.benchmark import fitting_study
+    from persona_lab.benchmark.metrics import reprojection_errors
+
+    source = tmp_path / "perspective"
+    dataset = generate_dataset(source, resolve_config("C", camera="perspective"), model_file=asset)
+    config = _config(
+        camera_mode="estimated", camera_model="perspective", train_head=False,
+        train_identity=(), train_expression=(), gradient_tolerance=1e6,
+        stages=(Stage("camera", 1, ("camera",), 0.001),),
+    )
+    fits = []
+
+    def fit_blind(model, observations, config, *, initial):
+        assert initial is None and config.perspective_focal_per_short_edge == 1.5
+        observation, = observations
+        assert observation.known_camera is None and observation.camera_initialization is None
+        result = fit_identity(model, observations, config, initial=initial)
+        fits.append((model, result))
+        return result
+
+    monkeypatch.setattr(fitting_study, "fit_identity", fit_blind)
+    report = fitting_study._run_job({
+        "config": asdict(config), "dataset": str(source), "observations": 1, "model_file": asset,
+        "dtype": "float64", "device": "cpu", "known_pose_diagnostic": False,
+        "case": "G-perspective-adam", "experiment": "G", "seed": 42, "budget": "fit",
+        "spectra": False, "held_out_dataset": None,
+    })
+    assert report["status"] == "converged", report["reason"]
+    assert report["camera_comparison"] == {
+        "comparable_translation_observations": 0, "non_comparable_translation_observations": 1,
+    }
+    final = report["final"]
+    assert np.isfinite(final["neutral_geometry"]["rms_m"])
+    training = final["training_reprojection_and_nuisance_recovery"]
+    observation, = training["observations"]
+    camera = observation["camera_recovery"]
+    assert camera["translation_comparability"]["mismatched_fields"] == ["focal_length"]
+    assert camera["translation_l2_m"] is None
+    assert camera["rotation_deg"] == pytest.approx(0)
+    assert camera["principal_point_abs_px"] == [0.0, 0.0]
+
+    (model, fit), = fits
+    fitted = fit.final
+    fitted_camera, = fitted.cameras
+    edge = min(fitted_camera.image_size.width, fitted_camera.image_size.height)
+    assert fitted_camera.focal_length.tolist() == [1.5 * edge] * 2
+    assert camera["focal_length_abs_px"] == pytest.approx([0.1 * edge] * 2)
+    points = model.landmarks(fitted.identity, fitted.expression[0], fitted.rotations[0], fitted.translation[0])
+    pixels = project_dfl(points, fitted_camera, dataset.correspondences).cpu().numpy()
+    subject, = dataset.subject_ids
+    arrays = dataset.ground_truth(subject).arrays
+    expected = reprojection_errors(pixels, arrays["clean"][0], arrays["validity"][0])
+    assert training["aggregate"]["clean"]["rms_px"] == pytest.approx(expected["rms_px"])

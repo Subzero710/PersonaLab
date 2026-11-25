@@ -1073,8 +1073,18 @@ F adds the same held-out views for every prefix of an identity. It reports
 conditional projection with true nuisance parameters and projection after
 estimating expressions and poses with identity frozen. Cameras are known
 for both held-out diagnostics. G estimates weak-perspective and constrained
-perspective cameras from the observed landmarks. H measures 50, 100, 300,
-and 600 observations. It uses one update per stage for throughput by default.
+perspective cameras from the observed landmarks. The perspective fit uses
+its configured focal length (1.5 times the short edge by default). The
+synthetic cameras use 1.4 times the short edge. G scores neutral geometry
+and reprojects with the fitted cameras. Camera rotation and perspective
+intrinsic differences are reported as fixed-parameter diagnostics. Direct
+camera translation error requires matching rotation and root translation,
+plus matching focal length and principal point for perspective. Other
+observations have a null translation error and list the mismatched
+fields in `translation_comparability`.
+
+H measures 50, 100, 300, and 600 observations. It uses one update per stage
+for throughput by default.
 Use `--scaling-full` to apply the fitting budgets to H.
 
 The protocol sets Adam budgets to 30/70/900 and divides the original Adam

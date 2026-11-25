@@ -15,7 +15,7 @@ from ..fitting import FitConfig, FitInitialization, ObservationInitialization, S
 from ..fitting.configuration import SOLVERS
 from ..fitting.observability import identity_observability
 from .configuration import resolve_config
-from .dataset import camera_to_record, load_dataset
+from .dataset import load_dataset
 from .evaluate import _pool_reprojection, _score_observation
 from .generate import generate_dataset
 from .metrics import coefficient_errors, vertex_errors
@@ -67,22 +67,13 @@ def _scoring_geometry(model, state, truth, selection, names):
 
 def _score_observations(model, dataset, truth, prediction, mode):
     observations = [
-        _score_observation(model, dataset, truth, index, prediction.identity, prediction, mode)
+        _score_observation(
+            model, dataset, truth, index, prediction.identity, prediction, mode,
+            compare_camera_gauges=mode == "complete",
+        )
         for index in range(len(truth.observations))
     ]
     return {"aggregate": _pool_reprojection(observations), "observations": observations}
-
-
-def _comparable_camera_gauges(dataset, truth, fit):
-    if fit.config.train_root or np.any(fit.final.translation):
-        raise ValueError("Camera comparison requires a shared fixed zero root translation")
-    fields = ("type", "rotation", "image_size")
-    for record, camera in zip(truth.observations, fit.final.cameras, strict=True):
-        estimate = camera_to_record(camera)
-        exact_fields = fields + (("focal_length", "principal_point") if estimate["type"] == "perspective" else ())
-        if any(estimate[name] != record["camera"][name] for name in exact_fields):
-            raise ValueError(f"Camera gauges differ for benchmark case {dataset.dataset_id}")
-    return "common native coordinates, zero root translation, fixed rotation and perspective intrinsics"
 
 
 def _held_out(model, job, config, fit, training_truth):
@@ -165,17 +156,25 @@ def _run_job(job):
     }
     if fit.final is not None:
         estimated = config.camera_mode == "estimated"
-        if estimated:
-            record["camera_comparison"] = _comparable_camera_gauges(dataset, truth, fit)
         score_final = _scoring_geometry(model, fit.final, truth, fit.selection, model.metadata["identity_names"])
         fixed_names = set(fit.selection.fixed_identity)
         fixed = [name in fixed_names for name in model.metadata["identity_names"]]
         score_final["fixed_identity_preserved"] = bool(
             np.array_equal(fit.initial.identity[fixed], fit.final.identity[fixed]),
         )
-        score_final["training_reprojection_and_nuisance_recovery"] = _score_observations(
+        training = _score_observations(
             model, dataset, truth, fit.to_prediction(), "complete" if estimated else "known-camera",
         )
+        score_final["training_reprojection_and_nuisance_recovery"] = training
+        if estimated:
+            comparable = sum(
+                item["camera_recovery"]["translation_comparability"]["status"] == "comparable"
+                for item in training["observations"]
+            )
+            record["camera_comparison"] = {
+                "comparable_translation_observations": comparable,
+                "non_comparable_translation_observations": len(training["observations"]) - comparable,
+            }
         record["final"] = score_final
     if job["spectra"] and fit.selection.identity:
         spectrum = identity_observability(model, observations, config, initial=initial)

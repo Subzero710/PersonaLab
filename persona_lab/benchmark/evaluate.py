@@ -43,7 +43,7 @@ def _validate_mode(prediction, mode, subject):
                 raise ValueError(f"Externally projected landmarks require projected mode: {key}")
 
 
-def _camera_errors(estimate, truth):
+def _camera_errors(estimate, truth, *, shared_root=None):
     a, b = camera_to_record(estimate), camera_to_record(truth)
     if a["type"] != b["type"] or a["image_size"] != b["image_size"]:
         raise ValueError("Camera predictions must share model and raster size")
@@ -51,15 +51,30 @@ def _camera_errors(estimate, truth):
         "status": "evaluated", "model": a["type"],
         "rotation_deg": float(rotation_errors_deg(a["rotation"], b["rotation"])),
     }
-    if isinstance(truth, PerspectiveCamera):
+    perspective = isinstance(truth, PerspectiveCamera)
+    mismatches = []
+    if shared_root is not None:
+        fixed = ("rotation", "focal_length", "principal_point") if perspective else ("rotation",)
+        mismatches = [name for name in fixed if a[name] != b[name]]
+        if not shared_root:
+            mismatches.append("root_translation")
+        error["fixed_parameters"] = fixed
+        error["translation_comparability"] = {
+            "status": "not_comparable" if mismatches else "comparable",
+            "mismatched_fields": mismatches,
+        }
+        if mismatches:
+            error["status"] = "partially_evaluated"
+    translation = None if mismatches else translation_error(a["translation"], b["translation"])
+    if perspective:
         error.update(
-            translation_l2_m=translation_error(a["translation"], b["translation"]),
+            translation_l2_m=translation,
             focal_length_abs_px=np.abs(np.array(a["focal_length"]) - b["focal_length"]).tolist(),
             principal_point_abs_px=np.abs(np.array(a["principal_point"]) - b["principal_point"]).tolist(),
         )
     else:
         error.update(
-            image_translation_l2_px=translation_error(a["translation"], b["translation"]),
+            image_translation_l2_px=translation,
             scale_abs_px_per_m=abs(a["scale"] - b["scale"]),
         )
     return error
@@ -76,7 +91,7 @@ def _pose_errors(item, truth, index, joint_names):
     }
 
 
-def _score_observation(model, dataset, truth, index, identity, prediction, mode):
+def _score_observation(model, dataset, truth, index, identity, prediction, mode, *, compare_camera_gauges=False):
     item = truth.observations[index]
     key = item["id"]
     arrays = truth.arrays
@@ -95,7 +110,10 @@ def _score_observation(model, dataset, truth, index, identity, prediction, mode)
         camera = fixed_camera
         if estimate.camera is not None:
             camera = camera_from_record(camera_to_record(estimate.camera), dtype=dtype, device=device)
-            camera_recovery = _camera_errors(camera, fixed_camera)
+            shared_root = (
+                np.array_equal(translation, arrays["translation"][index]) if compare_camera_gauges else None
+            )
+            camera_recovery = _camera_errors(camera, fixed_camera, shared_root=shared_root)
         elif mode == "known-camera":
             camera_recovery = {"status": "fixed_known"}
     if mode == "projected":
