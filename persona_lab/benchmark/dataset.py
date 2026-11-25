@@ -249,8 +249,35 @@ class BenchmarkDataset:
         """Explicit evaluation access to clean coordinates, parameters and corruption."""
         return deepcopy(self._subject(subject))
 
-    def fitting_observations(self, subject, *, observation_ids=None, dtype="float64", device="cpu"):
-        """Return DFL-ordered observations with known cameras, masks and weights."""
+    def select_observations(self, subject, observation_ids):
+        """Create an in-memory evaluation dataset for one explicit ordered subset."""
+        truth = self._subject(subject)
+        selected = tuple(observation_ids)
+        all_ids = self.observation_ids(subject)
+        if not selected or any(not isinstance(key, str) for key in selected) or (
+            len(set(selected)) != len(selected) or any(key not in all_ids for key in selected)
+        ):
+            raise ValueError("Evaluation subset requires unique known observation IDs")
+        indices = [all_ids.index(key) for key in selected]
+        arrays = {
+            name: values if name in ("identity", "neutral_vertices") else values[indices]
+            for name, values in truth.arrays.items()
+        }
+        records = tuple(truth.observations[index] for index in indices)
+        manifest = self._manifest | {"dataset_id": digest_json({
+            "source_dataset": self.dataset_id, "subject": subject, "observation_ids": selected,
+        })}
+        return BenchmarkDataset(manifest, self.config, self.triangles, self.correspondences, {
+            subject: SubjectGroundTruth(subject, records, arrays),
+        })
+
+    def fitting_observations(
+        self, subject, *, observation_ids=None, dtype="float64", device="cpu",
+        include_known_cameras=True,
+    ):
+        """Return observed DFL landmarks, masks, weights, and explicitly requested cameras."""
+        if type(include_known_cameras) is not bool:
+            raise ValueError("include_known_cameras must be a boolean")
         truth = self._subject(subject)
         dtype, device = torch_options(dtype, device)
         size = ImageSize(*self.config.image_size)
@@ -261,9 +288,11 @@ class BenchmarkDataset:
         result = []
         for key in selected:
             index = indices[key]
-            camera = camera_from_record(
-                truth.observations[index]["camera"], dtype=dtype, device=device, image_size=size,
-            )
+            camera = None
+            if include_known_cameras:
+                camera = camera_from_record(
+                    truth.observations[index]["camera"], dtype=dtype, device=device, image_size=size,
+                )
             result.append(LandmarkObservation(
                 observation_id=key, image_size=size, correspondences=self.correspondences,
                 landmarks=torch.tensor(truth.arrays["observed"][index], dtype=dtype, device=device),

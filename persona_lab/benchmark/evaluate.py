@@ -226,12 +226,18 @@ def main(argv: Sequence[str] | None = None):
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--model-file", type=Path)
     parser.add_argument("--subject", action="append", help="evaluate only selected subject IDs; repeatable")
+    parser.add_argument("--observation-id", action="append",
+                        help="evaluate an ordered subset of one subject; repeatable")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
     try:
         if args.output.exists() or args.output.is_symlink():
             raise FileExistsError(f"Output already exists: {args.output}")
         dataset = load_dataset(args.ground_truth)
+        if args.observation_id:
+            if args.subject is None or len(args.subject) != 1:
+                raise ValueError("--observation-id requires exactly one --subject")
+            dataset = dataset.select_observations(args.subject[0], args.observation_id)
         report = evaluate_predictions(
             dataset, args.predictions, mode=args.mode,
             model_file=args.model_file, device=args.device, subject_ids=args.subject,

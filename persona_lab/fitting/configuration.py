@@ -1,0 +1,186 @@
+"""Configuration for one shared-identity fitting session."""
+
+from dataclasses import dataclass, field
+from collections.abc import Mapping
+
+from ..benchmark.configuration import finite_number
+from ..correspondences import DFL_LANDMARK_COUNT
+
+
+GROUPS = ("identity", "expression", "pose", "camera")
+CAMERA_MODELS = ("weak-perspective", "perspective")
+
+# These low-order components cover the mouth and eyelid/brow motions
+# independently probed by the existing benchmark, with room for nearby modes.
+DEFAULT_EXPRESSION = (
+    *(f"lower_face_region_{i:03d}" for i in range(12)),
+    *(f"left_eye_region_{i:03d}" for i in range(6)),
+    *(f"right_eye_region_{i:03d}" for i in range(6)),
+)
+
+
+def _sequence(value, name):
+    if not isinstance(value, (tuple, list)):
+        raise ValueError(f"{name} requires a list or tuple")
+    return tuple(value)
+
+
+def _names(value, name):
+    items = _sequence(value, name)
+    if any(not isinstance(item, str) or not item for item in items) or len(set(items)) != len(items):
+        raise ValueError(f"{name} requires unique nonempty names")
+    return items
+
+
+def _integer(value, name, minimum):
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer of at least {minimum}")
+
+
+@dataclass(frozen=True, slots=True)
+class Stage:
+    """One Adam stage. Advance one step per full-dataset gradient."""
+
+    name: str
+    iterations: int
+    groups: tuple[str, ...]
+    learning_rate: float
+    group_rates: tuple[tuple[str, float], ...] = ()
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Stage name must be nonempty")
+        _integer(self.iterations, "Stage iterations", 0)
+        groups = _names(self.groups, "Stage groups")
+        if not groups or not set(groups) <= set(GROUPS):
+            raise ValueError(f"Stage groups must select from {', '.join(GROUPS)}")
+        object.__setattr__(self, "groups", groups)
+        if finite_number(self.learning_rate, "Learning rate") <= 0:
+            raise ValueError("Learning rate must be positive")
+        pairs = (
+            self.group_rates.items() if isinstance(self.group_rates, Mapping)
+            else _sequence(self.group_rates, "Group rates")
+        )
+        rates = []
+        seen = set()
+        for pair in pairs:
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise ValueError("Group rates must associate a group with a learning rate")
+            name, rate = pair
+            rate = finite_number(rate, "Group learning rate")
+            if name not in groups or name in seen or rate <= 0:
+                raise ValueError("Group learning rates require unique stage groups and positive rates")
+            rates.append((name, rate))
+            seen.add(name)
+        object.__setattr__(self, "group_rates", tuple(rates))
+
+
+def default_stages():
+    return (
+        Stage("pose_camera", 30, ("pose", "camera"), 0.018),
+        Stage("identity", 70, ("identity", "pose", "camera"), 0.045,
+              (("pose", 0.008), ("camera", 0.006))),
+        Stage("joint", 100, GROUPS, 0.022,
+              (("pose", 0.005), ("camera", 0.004))),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FitConfig:
+    """Explicit optimization controls. Empty selections fix the entire group."""
+
+    camera_mode: str = "known"
+    camera_model: str | None = None
+    train_identity: tuple[str, ...] = ("head",)
+    fixed_identity: tuple[str, ...] = ()
+    train_expression: tuple[str, ...] = DEFAULT_EXPRESSION
+    fixed_expression: tuple[str, ...] = ()
+    train_head: bool = True
+    train_root: bool = False
+    landmark_subset: tuple[int, ...] | None = None
+    expression_limit: float = 3.0
+    identity_weight: float = 1e-6
+    expression_weight: float = 2e-5
+    pose_weight: float = 0.0
+    camera_weight: float = 0.0
+    perspective_focal_per_short_edge: float = 1.5
+    pose_initializer: str = "grid"
+    batch_size: int = 4
+    seed: int = 0
+    log_every: int = 10
+    improvement_tolerance: float | None = None
+    gradient_tolerance: float | None = None
+    patience: int = 10
+    divergence_factor: float = 100.0
+    stages: tuple[Stage, ...] = field(default_factory=default_stages)
+
+    def __post_init__(self):
+        if self.camera_mode not in ("known", "estimated"):
+            raise ValueError("Camera mode must be known or estimated")
+        if self.camera_model is not None and self.camera_model not in CAMERA_MODELS:
+            raise ValueError("Camera model must be weak-perspective or perspective")
+        if self.camera_mode == "known" and self.camera_model is not None:
+            raise ValueError("Known-camera mode uses the camera type of each observation")
+        if self.pose_initializer not in ("grid", "neutral"):
+            raise ValueError("Pose initializer must be grid or neutral")
+        for name in ("train_head", "train_root"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        if self.train_root and self.camera_mode != "known":
+            raise ValueError("Trainable root translation requires fixed perspective cameras")
+
+        for name in ("train_identity", "fixed_identity", "train_expression", "fixed_expression"):
+            object.__setattr__(self, name, _names(getattr(self, name), name))
+        if self.landmark_subset is not None:
+            subset = _sequence(self.landmark_subset, "Landmark subset")
+            if any(type(i) is not int or not 0 <= i < DFL_LANDMARK_COUNT for i in subset):
+                raise ValueError("Landmark subset indices must be integers in [0, 67]")
+            if not subset or len(set(subset)) != len(subset):
+                raise ValueError("Landmark subset must contain at least one index without duplicates")
+            object.__setattr__(self, "landmark_subset", subset)
+
+        for name in ("batch_size", "log_every", "patience"):
+            _integer(getattr(self, name), name, 1)
+        _integer(self.seed, "Seed", 0)
+        if self.seed >= 2**64:
+            raise ValueError("Seed must be smaller than 2**64")
+        for name in ("identity_weight", "expression_weight", "pose_weight", "camera_weight",
+                     "improvement_tolerance", "gradient_tolerance"):
+            value = getattr(self, name)
+            if name.endswith("_tolerance") and value is None:
+                continue
+            if finite_number(value, name) < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        for name in ("expression_limit", "perspective_focal_per_short_edge"):
+            if finite_number(getattr(self, name), name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if finite_number(self.divergence_factor, "Divergence factor") <= 1:
+            raise ValueError("Divergence factor must be greater than one")
+
+        stages = _sequence(self.stages, "Stages")
+        if (
+            not stages or any(not isinstance(stage, Stage) for stage in stages)
+            or not any(stage.iterations for stage in stages)
+            or len({stage.name for stage in stages}) != len(stages)
+        ):
+            raise ValueError("Stages require unique names and a positive iteration budget")
+        object.__setattr__(self, "stages", stages)
+
+    @classmethod
+    def from_dict(cls, options):
+        """Parse the same configuration recorded in the result manifest."""
+        if not isinstance(options, dict):
+            raise ValueError("Fitting configuration must be a JSON object")
+        values = dict(options)
+        try:
+            unknown = values.keys() - cls.__dataclass_fields__.keys()
+            if unknown:
+                raise ValueError(f"Unknown fitting options: {', '.join(sorted(unknown))}")
+            if "stages" in values:
+                stages = _sequence(values["stages"], "Stages")
+                if any(not isinstance(item, dict) for item in stages):
+                    raise ValueError("Each stage configuration must be an object")
+                values["stages"] = tuple(Stage(**item) for item in stages)
+            return cls(**values)
+        except TypeError as error:
+            raise ValueError(f"Invalid fitting configuration: {error}") from error

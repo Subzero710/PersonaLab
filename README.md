@@ -699,6 +699,245 @@ for identity errors in the raster. Compare coefficient and geometry recovery
 alongside reprojection. Synthetic recovery establishes correctness under GNM's
 assumptions. Evaluating real photographs requires the separate real-data study.
 
+## Fit one identity from multiple observations
+
+The fitting API accepts `LandmarkObservation` objects from the DeepFaceLab
+importer or the Issue #4 benchmark. Each fit uses one verified GNM v3.0 Head
+model and one shared vector of 253 identity coefficients. Each observation
+has a 383-coefficient expression, four native axis-angle joint rotations,
+a root translation in meters, and its own camera. The model's buffers and
+the supplied landmark data stay fixed. Joint rotations follow GNM's
+`neck`, `head`, `left_eye`, `right_eye` order in radians.
+
+### Parameter selection and camera gauges
+
+The default identity selection is the 170-component `head` region. The
+pinned asset has nonzero head basis entries at the 186 positively weighted
+vertices of the official sparse landmarks. The `eyes` and `teeth` vertex
+bases are zero at those vertices. The teeth joint basis still affects the
+neck and head pivots, so pose can introduce indirect effects. Direct vertex
+support gives evidence of sensitivity and leaves independent recovery open.
+
+The default expression selection uses the first 12 `lower_face_region`
+coefficients and the first six coefficients in each `left_eye_region` and
+`right_eye_region`. The benchmark's anatomical probes exercise mouth,
+eyelid, and brow movements within these regions. Tongue and pupil
+expression bases have zero direct support at the sparse vertices. The
+initial subset limits how much each observation can explain with its own
+expression. Its size and regularization are configurable. The selected
+expression values are projected to the configured operating interval after
+each Adam update. The default interval is ±3, the typical range documented
+by GNM. It is an optimizer policy.
+
+Select native names such as `head_000` or regions such as `head` in
+`train_identity` and `train_expression`. The `fixed_identity` and
+`fixed_expression` lists remove explicitly fixed names or regions from
+those selections. The parameter arrays saved with a result contain every
+native coefficient. Only selected coordinates are stored in trainable
+tensors. The same representation preserves externally supplied fixed values
+when stages change. The default starting identity and expressions are the
+mean identity and neutral expressions, both represented by zero.
+
+| Camera mode | Optimized camera values | Fixed camera values | GNM degrees of freedom |
+| --- | --- | --- | --- |
+| Known, either projection | None | All supplied camera tensors | Head rotation, plus optional root translation with fixed perspective cameras |
+| Estimated weak perspective | Pixel XY offset and log scale ratio | Initial camera rotation | Head rotation with fixed root translation |
+| Estimated perspective | Metric XY offset and log distance ratio | Initial rotation, focal length and principal point | Head rotation with fixed root translation |
+
+The neck and eyes keep their initial rotations. Estimated weak perspective
+has no depth parameter. Estimated perspective uses the raster center as the
+principal point and a focal length of 1.5 times the shorter raster edge
+by default. This defines an artificial gauge for aligned crops. An explicit
+initial camera can set these fixed quantities. For estimated cameras the
+weak-perspective pixel offsets are scaled by the shorter edge and the
+perspective XY offsets by the initial Z. A positive initial scale or Z
+multiplied by the exponential of its corresponding change remains
+positive. Projection checks all 68 official landmark depths. Invalid
+depths terminate the fit. Focal length, depth, physical head size and
+orientation do not have independent calibration in this problem.
+
+### Initialization, objective, and optimization
+
+Initialization tests a deterministic set of 45 head rotations at yaw
+0°, ±40°, and ±75°, pitch 0° and ±25°, and roll 0° and ±20°. GNM
+receives the resulting axis-angle vectors from SciPy's extrinsic
+`yxz` conversion. Known or explicitly initialized cameras are used directly
+to score candidates. With an uncalibrated weak-perspective camera, weighted
+centroids and least-squares scale place each candidate in the image.
+Perspective initialization uses that scale at the weighted depth centroid
+and solves XY translation with the existing pinhole projector. The candidate
+with the lowest eligible weighted residual is selected from the candidates
+with valid camera geometry. The result records the strategy, selected index
+and admissible candidate count. `pose_initializer="neutral"` starts from
+the native zero pose. Passing explicit rotations overrides pose search for
+that observation. The fitting loop uses no randomness. The seed controls
+CLI sampling when `--selection sample` is used.
+
+For image \(i\) let \(s_i=\min(w_i,h_i)\) be its shorter raster edge and
+\(a_{ik}\) be the eligible landmark weight. The landmark term pools all
+eligible weights across the subject.
+
+```text
+L_landmark = Σ a_ik || (projected_ik - observed_ik) / s_i ||² / Σ a_ik
+L_total = L_landmark + L_identity + L_expression + L_pose + L_camera
+```
+
+All 68 supported correspondences, including the 17 contour landmarks, have
+unit weight and are enabled by default. An observation's mask and weights,
+disabled or unsupported correspondences, and an explicit subset determine
+eligibility. An observation with zero eligible pairs is rejected with its ID.
+Logging reports independent unweighted Euclidean mean and RMS in pixels.
+
+Identity regularization is the mean square of the selected native identity
+coefficients. Expression regularization is the mean square of the selected
+native expression coefficients over observations. Both are zero-centered
+penalties in the model's native scaling. Pose penalties, when enabled,
+measure squared changes from the initial head rotation and root translation.
+The camera penalty is the mean square of optimized camera coordinates in
+their normalized parameterization. The default strengths for identity,
+expression, pose and camera are `1e-6`, `2e-5`, `0` and `0`.
+The expression penalty and restricted subset are intended to limit
+identity-expression compensation. Benchmark evaluation can measure that trade-off.
+
+| Stage | Updates | Available groups | Default learning rates |
+| --- | ---: | --- | --- |
+| Pose and camera | 30 | Pose, camera | 0.018 |
+| Identity | 70 | Identity, pose, camera | Identity 0.045, pose 0.008, camera 0.006 |
+| Joint | 100 | Identity, expression, pose, camera | Identity and expression 0.022, pose 0.005, camera 0.004 |
+
+The stage budgets and rates are initial implementation settings. A JSON
+`FitConfig` can override the order, groups, step counts, and per-group rates.
+An Adam optimizer starts fresh for each stage and receives only the enabled
+groups. A global iteration accumulates normalized batch gradients and
+applies the subject's regularizers once before the Adam step. The default
+batch size is four. Only a batch of GNM graphs is live at a time. The
+fitting loop records losses, eligible counts, pixel errors, gradient norms,
+and elapsed time.
+
+The result distinguishes gradient-tolerance convergence, an improvement
+plateau after configured patience, an exhausted iteration budget, and
+failure. Tolerance-based stopping is opt-in. The default divergence check
+fails a stage if its objective exceeds 100 times the stage-entry loss,
+with a floor of `1e-12` on the reference loss. Missing or nonfinite
+gradients, invalid projections, and nonfinite parameters or Adam state
+fail explicitly. History contains the last logged valid step. Failed
+results have no final parameters, mesh, overlays, or predictions.
+
+### CLI and result files
+
+Commands below use the existing Docker service. They require local
+validation before using the fitting pipeline on private images.
+
+```sh
+docker compose run --rm personalab python -m persona_lab.fit \
+  --input datasets/light.zip --camera weak-perspective --max-images 50 \
+  --selection first --device cpu --batch-size 4 --overlays 6 \
+  --output outputs/fitting/first_identity
+
+docker compose run --rm personalab python -m persona_lab.fit \
+  --benchmark outputs/benchmarks/scenario-C --subject subject_0000 \
+  --camera-mode known --device cpu --batch-size 4 \
+  --output outputs/fitting/scenario-C --predictions outputs/predictions/scenario-C
+
+docker compose run --rm personalab python -m persona_lab.benchmark.evaluate \
+  --ground-truth outputs/benchmarks/scenario-C --predictions outputs/predictions/scenario-C \
+  --mode known-camera --subject subject_0000 --output outputs/reports/fitted-scenario-C
+```
+
+Use `--model-file models/gnm_head.npz` to provide the exact pinned asset or
+omit the flag to use the verified model cache. `--model-version v3`
+selects GNM v3.0 Head. `--device cpu` and `--dtype float64` are the
+defaults, and `--dtype float32` is supported. Request CUDA through
+`docker compose --profile cuda run --rm personalab-cuda` with `--device cuda`.
+An unavailable requested device raises an error. Other controls include
+`--batch-size`, `--iterations A B C`, `--learning-rate`, `--log-every`,
+`--seed`, the four penalty weights, and the trainable coefficient lists.
+`--learning-rate` overrides all stage and group rates. `--config` accepts
+a JSON object with the fields of `FitConfig`. Each stage has `name`,
+`iterations`, `groups`, `learning_rate`, and optional `group_rates` fields.
+
+The real input uses the stable importer order and records accepted,
+rejected, and selected counts. `--selection sample` selects without
+replacement from accepted observations and preserves their importer order.
+The result directory must be new. `result.json` records the verified model
+and parameter order, selection, camera gauge, observation IDs, cameras,
+configuration, initialization, history, and termination status.
+`parameters.npz` contains the initial and final arrays and loads with
+`allow_pickle=False`. `neutral.obj` uses fitted identity with zero
+expressions, rotations, and translation. `--no-neutral-mesh` disables
+that diagnostic. `--overlays N` writes initial and final pairs for the
+highest-RMS observation and a sample spaced across fitted head yaw. The
+overlays use the existing GNM wireframe and landmark diagnostic. Keep real
+results and overlays in the local outputs directory.
+
+### Python API and benchmark use
+
+```python
+from persona_lab.benchmark.dataset import load_dataset
+from persona_lab.benchmark.model import load_benchmark_model
+from persona_lab.benchmark.predictions import write_predictions
+from persona_lab.fitting import FitConfig, fit_identity, save_result
+
+model = load_benchmark_model(dtype="float64", device="cpu")
+dataset = load_dataset("outputs/benchmarks/scenario-C")
+subject = dataset.subject_ids[0]
+observations = dataset.fitting_observations(subject)
+result = fit_identity(model, observations, FitConfig())
+save_result("outputs/fitting/from_api", result)
+if result.final is not None:
+    write_predictions("outputs/predictions/from_api", dataset, {
+        subject: result.to_prediction(dtype=dataset.config.dtype),
+    })
+```
+
+For explicit inputs, pass a `FitInitialization` with a native identity
+tensor and `ObservationInitialization` records keyed by observation ID.
+The optional observation camera seed is `LandmarkObservation.camera_initialization`.
+`load_result(path, model=model)` checks archive shapes, dtype, camera
+fields, fixed coordinates, and the model asset and native ordering.
+
+For the neutral multiview experiment generate benchmark Scenario B and
+pass an empty `--train-expression` list. Scenario C covers multiple
+expressions and unknown poses with known cameras. Generate separate
+Scenario C datasets with `--camera weak-perspective` and `--camera perspective`
+for estimated-camera experiments. Fit with `--camera-mode estimated --camera`
+and the corresponding model. Estimated-camera input is built with
+`include_known_cameras=False`. It contains observed landmarks and fitting
+metadata. Independent evaluation uses `complete` mode for estimated cameras
+and `known-camera` mode for fixed cameras.
+
+For a count study generate one Scenario C dataset with 100 observations and
+use ordered prefixes of 1, 5, 10, 25, 50, and 100. In the Python API, pass
+the explicit prefix to `fitting_observations`. Evaluate subsets by creating
+`dataset.select_observations(subject, ids)` with the same IDs and order.
+The evaluator CLI accepts a repeated `--observation-id` with exactly one
+`--subject` for the same subset. Evaluate the initial state using
+`result.to_prediction(initial=True)`. For several subjects, fit each
+separately and collect the resulting predictions by subject ID.
+
+Compare coefficient and neutral mesh errors against the mean-identity
+baseline. A reprojection improvement can coincide with a worse neutral
+mesh. Report full and selected coefficient errors and native neutral
+geometry before and after fitting. The `identity_observability` function
+in `persona_lab.fitting.observability` computes local weighted 2D
+Jacobian column norms and singular spectra with fixed nuisance parameters,
+after removing expression directions, and after removing all active
+nuisance directions. It uses one observation graph at a time.
+Fixed-nuisance rank is a conditional diagnostic. Joint identifiability
+depends on the views, camera gauge, and strength of nuisance compensation.
+
+### Validation status
+
+The official asset checksum, native dimensions and direct basis support
+were inspected. CPU and CUDA fitting, the Docker test suite, numerical
+Jacobian ranks, synthetic recovery experiments, the observation-count
+study and the private DeepFaceLab run remain unverified. The implementation
+records model loading, initialization, optimization, update counts, process
+peak RSS and, on CUDA, peak allocated memory. Identical ordered inputs
+and configuration use deterministic initialization. Numerical equivalence
+across processes, batch sizes, dtypes, devices and software versions
+requires measured tolerances.
+
 ## GNM Ecosystem Packages
 
 Here we list all the available GNM packages:
