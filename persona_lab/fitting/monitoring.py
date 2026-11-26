@@ -1,7 +1,7 @@
 """Objective, step and timing diagnostics shared by the fitting solvers."""
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
 import sys
 from time import perf_counter
@@ -17,6 +17,7 @@ class OptimizationUpdate:
     stage_iteration: int
     parameter_update_norm: float
     scaled_parameter_update_norm: float | None = None
+    focal_factors: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,7 @@ class Trial:
     acceptance_ratio: float | None
     conditioning: dict[str, float | None]
     scaled_parameter_update_norm: float | None = None
+    focal_step_norms: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,8 @@ class Linearization:
     active_expression_bounds: int
     minimum_damping_probe_native_norm: float | None
     minimum_damping_probe_scaled_norm: float | None
+    focal_gradient_norms: dict[str, float] | None = None
+    minimum_damping_probe_focal_norms: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,20 @@ class OptimizationDiagnostics:
     updates: tuple[OptimizationUpdate, ...]
     trials: tuple[Trial, ...]
     linearizations: tuple[Linearization, ...] = ()
+
+
+def optimization_record(diagnostics):
+    """Serialize focal diagnostics when applicable, preserving fixed-focal records."""
+    record = asdict(diagnostics)
+    for section, names in (
+        ("updates", ("focal_factors",)), ("trials", ("focal_step_norms",)),
+        ("linearizations", ("focal_gradient_norms", "minimum_damping_probe_focal_norms")),
+    ):
+        for item in record[section]:
+            for name in names:
+                if item[name] is None:
+                    del item[name]
+    return record
 
 
 def finite_norm(*values):

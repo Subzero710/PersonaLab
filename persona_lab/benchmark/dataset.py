@@ -177,6 +177,10 @@ def _validate_subject(record, arrays, config, mapping):
         camera = camera_from_record(item["camera"], dtype=dtype, device=device, image_size=size)
         if isinstance(camera, PerspectiveCamera) != (kind == "perspective"):
             raise ValueError("Observation camera model does not match the configured schedule")
+        if config.perspective_focal_factors is not None:
+            expected = config.perspective_focal_factors[index] * min(size.width, size.height)
+            if not torch.equal(camera.focal_length, camera.focal_length.new_full((2,), expected)):
+                raise ValueError(f"Observation focal length does not match the schedule for {item['id']}")
         slot = {field: array[index] for field, array in arrays.items()
                 if field not in ("identity", "neutral_vertices")}
         calculated_frame = in_frame(
@@ -342,6 +346,10 @@ def _read_dataset(path, manifest):
     config = resolve_config(**manifest["config"])
     if digest_json(config.metadata()) != digest_json(manifest["config"]):
         raise ValueError("Dataset must preserve the fully resolved generation configuration")
+    if config.perspective_focal_factors is not None and (
+        manifest["generator"].get("focal_per_short_edge_schedule") != list(config.perspective_focal_factors)
+    ):
+        raise ValueError("Dataset focal schedule differs from its generation provenance")
     model = manifest["model"]
     _validate_model(model)
     fixed_identity = []

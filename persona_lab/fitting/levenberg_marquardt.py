@@ -7,7 +7,7 @@ import torch
 
 from .losses import project_landmarks, regularization_residual, weighted_landmark_residuals
 from .monitoring import Linearization, OptimizationUpdate, Trial, finite_norm
-from .parameters import InvalidGeometry, PARAMETER_GROUPS
+from .parameters import FOCAL_PARAMETERS, InvalidGeometry, PARAMETER_GROUPS, SHARED_PARAMETERS
 from .schur import BlockVector, NormalBlocks, column_scales, damped_schur_step
 
 
@@ -16,19 +16,24 @@ class StageCoordinates:
     identity: bool
     names: tuple[str, ...]
     widths: tuple[int, ...]
+    shared_focal: bool = False
 
     @classmethod
     def from_parameters(cls, parameters, groups):
         names = tuple(
             name for name, group in PARAMETER_GROUPS.items()
-            if name != "identity" and group in groups and getattr(parameters, name) is not None
+            if name not in SHARED_PARAMETERS and group in groups and getattr(parameters, name) is not None
         )
         return cls(
-            "identity" in groups, names, tuple(getattr(parameters, name).shape[1] for name in names),
+            "identity" in groups and parameters.identity is not None,
+            names, tuple(getattr(parameters, name).shape[1] for name in names),
+            "camera" in groups and parameters.shared_log_focal is not None,
         )
 
     def pack(self, values, reference, count):
         identity = values.identity.detach() if self.identity else reference.new_empty(0)
+        if self.shared_focal:
+            identity = torch.cat((identity, values.shared_log_focal.detach()))
         local = (
             torch.cat([getattr(values, name).detach() for name in self.names], dim=1)
             if self.names else reference.new_empty((count, 0))
@@ -37,9 +42,14 @@ class StageCoordinates:
 
     def unpack(self, values, point):
         changes = {name: point.local[:, columns] for name, columns in self.columns()}
-        if self.identity:
-            changes["identity"] = point.identity
+        changes.update((name, point.identity[columns]) for name, columns in self.shared_columns())
         return replace(values, **changes)
+
+    def shared_columns(self):
+        if self.identity:
+            yield "identity", slice(None, -1 if self.shared_focal else None)
+        if self.shared_focal:
+            yield "shared_log_focal", slice(-1, None)
 
     def columns(self):
         start = 0
@@ -51,9 +61,14 @@ class StageCoordinates:
     def expression_slice(self):
         return next((columns for name, columns in self.columns() if name == "expression"), None)
 
+    def focal_coordinates(self, vector):
+        if self.shared_focal:
+            return vector.identity[-1:]
+        return next((vector.local[:, columns] for name, columns in self.columns() if name == "local_log_focal"), None)
+
     def commit(self, parameters, point):
-        if self.identity:
-            parameters.identity.copy_(point.identity)
+        for name, columns in self.shared_columns():
+            getattr(parameters, name).copy_(point.identity[columns])
         for name, columns in self.columns():
             getattr(parameters, name).copy_(point.local[:, columns])
 
@@ -83,7 +98,7 @@ def observation_jacobian(data, parameters, layout, base, position, index):
             jacobian[start] = gradient
             continue
         # Differentiate a bounded group of output rows against just this view's
-        # local coordinates and the shared identity.
+        # local coordinates and the shared coordinates.
         seeds = residual.new_zeros((stop - start, count))
         seeds[:, start:stop].diagonal().fill_(1)
         gradient, = torch.autograd.grad(
@@ -120,10 +135,10 @@ def normal_blocks(model, data, parameters, layout, base, position):
 
     # A selected prior is linear in its raw optimizer coordinates. Work on
     # its diagonal directly, with the same full-group denominators as Adam.
-    if p:
-        prior, slope = regularization_residual(parameters, "identity", position.identity)
-        identity.diagonal().add_(slope ** 2)
-        gradient_a.add_(prior * slope)
+    for name, columns in layout.shared_columns():
+        prior, slope = regularization_residual(parameters, name, position.identity[columns])
+        identity.diagonal()[columns].add_(slope ** 2)
+        gradient_a[columns].add_(prior * slope)
     for name, columns in layout.columns():
         prior, slope = regularization_residual(parameters, name, position.local[:, columns])
         local.diagonal(dim1=-2, dim2=-1)[:, columns].add_(slope ** 2)
@@ -143,10 +158,13 @@ def bound_mask(position, gradient, expression_slice, limit):
 
 
 def gradient_norms(layout, gradient, fixed_local):
-    norms = {"identity": finite_norm(2 * gradient.identity)} if layout.identity else {}
+    norms = {
+        ("focal" if name in FOCAL_PARAMETERS else name): finite_norm(2 * gradient.identity[columns])
+        for name, columns in layout.shared_columns()
+    }
     local = 2 * gradient.local.masked_fill(fixed_local, 0)
     for name, columns in layout.columns():
-        group = PARAMETER_GROUPS[name]
+        group = "focal" if name in FOCAL_PARAMETERS else PARAMETER_GROUPS[name]
         norms[group] = math.hypot(norms.get(group, 0.0), finite_norm(local[:, columns]))
     if not all(math.isfinite(value) for value in norms.values()):
         raise FloatingPointError("Nonfinite projected gradient norm")
@@ -175,6 +193,26 @@ def _step_norms(effective, scales):
         finite_norm(effective.identity, effective.local),
         finite_norm(effective.identity / scales.identity, effective.local / scales.local),
     )
+
+
+def _focal_norms(layout, vector, scales, *, gradient=False):
+    values = layout.focal_coordinates(vector)
+    if values is None:
+        return None
+    scale = layout.focal_coordinates(scales)
+    if gradient:
+        values = 2 * values
+    scaled = values * scale if gradient else values / scale
+    return {"native": finite_norm(values), "scaled": finite_norm(scaled)}
+
+
+def _trial_focal_displacement(layout, position, step, scales):
+    current = layout.focal_coordinates(position)
+    if current is None:
+        return None
+    proposed = (current.double() + layout.focal_coordinates(step)).to(current.dtype)
+    update = proposed.double() - current.double()
+    return {"native": finite_norm(update), "scaled": finite_norm(update / layout.focal_coordinates(scales))}
 
 
 def _trial_step(model, data, parameters, base, position, layout, system, scales, step,
@@ -234,6 +272,7 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
             config.gradient_tolerance is None or projected_norm <= config.gradient_tolerance
         )
         probe_norms = (None, None)
+        focal_probe = None
         step_tolerances = (options.native_step_tolerance, options.scaled_step_tolerance)
         check_step = any(tolerance is not None for tolerance in step_tolerances)
         if gradient_ready and check_step:
@@ -242,10 +281,13 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
             with measurements.time("linear_solve"):
                 probe, _ = damped_schur_step(system, scales, options.minimum_damping, fixed_local)
             point = _candidate(position, probe, expression_slice, config.expression_limit)
-            probe_norms = _step_norms(_effective_step(position, point), scales)
+            effective = _effective_step(position, point)
+            probe_norms = _step_norms(effective, scales)
+            focal_probe = _focal_norms(layout, effective, scales)
         measurements.linearizations.append(Linearization(
             stage.name, index, values.total, damping, projected_norm, scaled_norm,
             int(fixed_local.sum()), *probe_norms,
+            _focal_norms(layout, gradient, scales, gradient=True), focal_probe,
         ))
         if index == 0 or len(measurements.updates) % config.log_every == 0:
             record(stage.name, index, values, stats, norms)
@@ -275,16 +317,17 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
                 expression_slice, values.total, measurements,
             )
             native_step, scaled_step, predicted, actual, ratio = reductions
+            focal = _trial_focal_displacement(layout, position, step, scales) if native_step is not None else None
             measurements.trials.append(Trial(
                 stage.name, index, trial, damping, candidate is not None, reason, scaled_norm,
-                native_step, predicted, actual, ratio, condition, scaled_step,
+                native_step, predicted, actual, ratio, condition, scaled_step, focal,
             ))
             if candidate is not None:
                 position, values, stats = candidate
                 layout.commit(parameters, position)
                 measurements.last_objective = values
                 measurements.updates.append(OptimizationUpdate(
-                    stage.name, index + 1, native_step, scaled_step,
+                    stage.name, index + 1, native_step, scaled_step, parameters.focal_factors(),
                 ))
                 if ratio > 0.75:
                     damping = max(options.minimum_damping, damping / 3)

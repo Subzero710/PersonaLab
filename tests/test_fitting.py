@@ -1129,3 +1129,192 @@ def test_study_scores_blind_perspective_fit_with_different_focal_length(asset, m
     arrays = dataset.ground_truth(subject).arrays
     expected = reprojection_errors(pixels, arrays["clean"][0], arrays["validity"][0])
     assert training["aggregate"]["clean"]["rms_px"] == pytest.approx(expected["rms_px"])
+
+
+@pytest.mark.parametrize("mode", ("shared", "per-observation"))
+def test_focal_coordinates_and_schur_match_dense_reference(model, mode):
+    from persona_lab.fitting.levenberg_marquardt import (
+        StageCoordinates, normal_blocks, observation_jacobian, observation_residual,
+    )
+    from persona_lab.fitting.parameters import InvalidGeometry
+    from persona_lab.fitting.schur import column_scales, damped_schur_step
+
+    observations, *_ = _synthesize(model, camera_kind="perspective", include_cameras=False, count=2)
+    config = _lm_config(camera_mode="estimated", camera_model="perspective", focal_mode=mode,
+                        initial_focal_factor=1.2)
+    data, parameters, _ = _parameters(model, observations, config)
+    layout = StageCoordinates.from_parameters(parameters, config.stages[-1].groups)
+    log_focal = parameters.shared_log_focal if mode == "shared" else parameters.local_log_focal[:, 0]
+    assert torch.count_nonzero(log_focal) == 0
+    assert parameters.focal_factors() == pytest.approx([1.2, 1.2])
+    with torch.no_grad():
+        log_focal[0] = np.log(1.3)
+    factors = [1.56, 1.56 if mode == "shared" else 1.2]
+    state = parameters.state(0, len(data))
+    for observation, camera, original, factor in zip(observations, state.cameras, parameters.initial.cameras,
+                                                       factors, strict=True):
+        edge = min(observation.image_size.width, observation.image_size.height)
+        assert camera.focal_length.tolist() == pytest.approx([edge * factor] * 2)
+        assert torch.equal(camera.principal_point, original.principal_point)
+        assert torch.equal(camera.rotation, original.rotation)
+        assert torch.equal(camera.translation, original.translation)
+    with torch.no_grad():
+        for invalid in (-1000, 1000):
+            log_focal[0] = invalid
+            with pytest.raises(InvalidGeometry, match="focal length"):
+                parameters.state(0, len(data))
+        log_focal[0] = np.log(1.3)
+
+    base = parameters.values()
+    position = layout.pack(base, model.reference, len(data))
+    p, q = position.identity.numel(), position.local.shape[1]
+    assert p == (2 if mode == "shared" else 1)
+    assert ("local_log_focal" in layout.names) == (mode == "per-observation")
+    focal_column = p - 1 if mode == "shared" else p + q - 1
+    dense, residuals = [], []
+    for i in range(len(data)):
+        residual, jacobian = observation_jacobian(data, parameters, layout, base, position, i)
+        point = torch.cat((position.identity, position.local[i]))
+        offset = torch.zeros_like(point)
+        offset[focal_column] = 1e-6
+        forward = observation_residual(data, parameters, layout, base, position, i, point + offset)
+        backward = observation_residual(data, parameters, layout, base, position, i, point - offset)
+        torch.testing.assert_close(jacobian[:, focal_column], (forward - backward) / 2e-6,
+                                   rtol=1e-6, atol=1e-10)
+        assert jacobian[:, focal_column].norm() > 0
+        block = jacobian.new_zeros((len(residual), p + len(data) * q))
+        block[:, :p] = jacobian[:, :p]
+        block[:, p + i * q:p + (i + 1) * q] = jacobian[:, p:]
+        dense.append(block)
+        residuals.append(residual)
+    jacobian, residual = torch.cat(dense), torch.cat(residuals)
+    loss, _ = evaluate_objective(model, data, parameters, least_squares=True)
+    assert loss.total == pytest.approx(float(residual.square().sum()), abs=1e-14)
+    system = normal_blocks(model, data, parameters, layout, base, position)
+    scales = column_scales(system, config.lm.diagonal_floor)
+    damping = 0.01
+    step, _ = damped_schur_step(system, scales, damping, torch.zeros_like(position.local, dtype=torch.bool))
+    scale = torch.cat((scales.identity, scales.local.flatten()))
+    scaled = jacobian * scale
+    expected = scale * torch.linalg.solve(scaled.T @ scaled + damping * torch.eye(len(scale), dtype=scale.dtype),
+                                          -scaled.T @ residual)
+    actual = torch.cat((step.identity, step.local.flatten()))
+    torch.testing.assert_close(actual, expected, rtol=1e-9, atol=1e-10)
+    assert system.predicted_reduction(step) == pytest.approx(
+        float(residual.square().sum() - (residual + jacobian @ actual).square().sum()), abs=1e-14,
+    )
+
+
+@pytest.mark.parametrize("mode", ("shared", "per-observation"))
+def test_focal_result_and_observability_round_trip(model, mode, tmp_path):
+    observations, *_ = _synthesize(model, camera_kind="perspective", include_cameras=False, count=2)
+    config = _lm_config(camera_mode="estimated", camera_model="perspective", focal_mode=mode, initial_focal_factor=1.2)
+    assert FitConfig.from_dict(config.to_dict()) == config
+    fit = fit_identity(model, observations, config)
+    assert fit.final is not None, fit.reason
+    assert fit.optimization.linearizations[0].focal_gradient_norms["scaled"] > 0
+    trial = next(item for item in fit.optimization.trials if item.accepted)
+    assert trial.focal_step_norms["native"] > 0 and trial.focal_step_norms["scaled"] > 0
+    assert len(fit.optimization.updates[0].focal_factors) == len(observations)
+    destination = tmp_path / mode
+    save_result(destination, fit)
+    restored = load_result(destination, model=model)
+    assert restored.config == config and restored.optimization == fit.optimization
+    assert [camera_to_record(camera) for camera in restored.final.cameras] == [
+        camera_to_record(camera) for camera in fit.final.cameras
+    ]
+    for at in ("initial", "final"):
+        spectrum = identity_observability(model, observations, config, fit=fit, at=at)
+        focal_count = 1 if mode == "shared" else len(observations)
+        assert spectrum["joint_identity_and_focal"]["matrix_dimensions"][1] == 1 + focal_count
+        assert spectrum["conditional_focal"]["matrix_dimensions"][1] == focal_count
+        assert len(spectrum["fixed_nuisance_focal_column_l2"]) == focal_count
+        assert len(spectrum["conditional_focal"]["weakest_direction"]["compensating_log_depth_by_observation"]) == 2
+        assert spectrum["focal_prior_jtj_diagonal"] == 0
+
+
+@pytest.mark.parametrize("overrides", (
+    {"camera_model": "weak-perspective"}, {"camera_mode": "known", "camera_model": None},
+    {"solver": "adam"}, {"initial_focal_factor": None}, {"initial_focal_factor": 0},
+    {"initial_focal_factor": float("inf")}, {"focal_mode": "automatic"},
+))
+def test_focal_modes_reject_incompatible_configuration(overrides):
+    options = dict(camera_mode="estimated", camera_model="perspective", focal_mode="shared", initial_focal_factor=1.5)
+    with pytest.raises(ValueError):
+        FitConfig(**(options | overrides))
+    assert FitConfig.from_dict({}).focal_mode == "fixed"
+
+
+@pytest.mark.parametrize("factor", (1e-100, 1e100))
+def test_initial_focal_factor_requires_representable_pixels(factor):
+    from persona_lab.fitting.initialization import _initial_focal
+
+    config = _lm_config(camera_mode="estimated", camera_model="perspective",
+                        focal_mode="shared", initial_focal_factor=factor)
+    with pytest.raises(ValueError, match="fitting dtype"):
+        _initial_focal(torch.zeros((), dtype=torch.float32), ImageSize(512, 512), config)
+
+
+def test_trainable_focal_seed_keeps_the_other_camera_coordinates(model):
+    observations, _, _, _, cameras = _synthesize(model, camera_kind="perspective", include_cameras=False, count=1)
+    camera = cameras[0]
+    seed = replace(camera, focal_length=model.tensor((444.0, 666.0)),
+                   principal_point=model.tensor((231.0, 262.0)), rotation=model.tensor((0.0, 0.02, 0.0)))
+    observations = (replace(observations[0], camera_initialization=seed),)
+    config = _lm_config(camera_mode="estimated", camera_model="perspective", train_identity=(),
+                        focal_mode="shared", initial_focal_factor=1.2)
+    _, parameters, _ = _parameters(model, observations, config)
+    initial, = parameters.initial.cameras
+    assert initial.focal_length.tolist() == pytest.approx([512 * 1.2] * 2)
+    for name in ("rotation", "translation", "principal_point"):
+        assert torch.equal(getattr(initial, name), getattr(seed, name))
+    fit = fit_identity(model, observations, config)
+    assert fit.final is not None, fit.reason
+
+
+@pytest.mark.parametrize("mode", ("shared", "per-observation"))
+def test_focal_observability_exposes_depth_null_direction(model, mode, monkeypatch):
+    from persona_lab.fitting import observability
+
+    observations, *_ = _synthesize(model, camera_kind="perspective", include_cameras=False, count=2)
+    config = _lm_config(
+        camera_mode="estimated", camera_model="perspective", focal_mode=mode, initial_focal_factor=1.5,
+        train_expression=(), train_head=False,
+    )
+
+    def focal_depth_ambiguity(data, parameters, layout, base, position, index):
+        p, q = position.identity.numel(), position.local.shape[1]
+        jacobian = model.reference.new_zeros((4, p + q))
+        jacobian[0, 0] = 1
+        jacobian[1, p + dict(layout.columns())["camera_delta"].start + 2] = 1
+        jacobian[1, p - 1 if layout.shared_focal else p + q - 1] = 1
+        return jacobian.new_zeros(4), jacobian
+
+    monkeypatch.setattr(observability, "observation_jacobian", focal_depth_ambiguity)
+    report = identity_observability(model, observations, config)
+    focal_count = 1 if mode == "shared" else len(observations)
+    joint = report["joint_identity_and_focal"]
+    assert joint["rank"] == 1 and joint["nullity"] == focal_count
+    assert joint["condition_number"] is None and joint["effective_condition_number"] == 1
+    conditional = report["conditional_focal"]
+    assert conditional["rank"] == 0 and conditional["nullity"] == focal_count
+    assert conditional["minimum_singular_value"] == conditional["maximum_singular_value"] == 0
+    weak = conditional["weakest_direction"]
+    assert weak["identity_l2"] == 0
+    assert np.linalg.norm(weak["compensating_log_depth_by_observation"]) > 0
+
+
+@pytest.mark.parametrize("mode", ("shared", "per-observation"))
+def test_focal_gradient_and_minimum_damping_probe_contribute_to_convergence(model, mode):
+    observations, *_ = _synthesize(model, camera_kind="perspective", include_cameras=False, count=2)
+    config = _lm_config(
+        camera_mode="estimated", camera_model="perspective", focal_mode=mode, initial_focal_factor=1.2,
+        lm=LevenbergMarquardtConfig(scaled_gradient_tolerance=1, native_step_tolerance=1e-20,
+                                   scaled_step_tolerance=1e-20),
+    )
+    fit = fit_identity(model, observations, config)
+    info = fit.optimization.linearizations[0]
+    assert info.focal_gradient_norms["native"] > 0 and info.focal_gradient_norms["scaled"] > 0
+    assert info.minimum_damping_probe_focal_norms["native"] > config.lm.native_step_tolerance
+    assert info.minimum_damping_probe_focal_norms["scaled"] > config.lm.scaled_step_tolerance
+    assert fit.status != "converged"

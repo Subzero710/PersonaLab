@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from itertools import product
+import math
 
 from scipy.spatial.transform import Rotation
 import torch
@@ -41,6 +42,19 @@ def _candidates(model, identity, expression, rotations, translation, grid, batch
     return rotations, torch.cat(landmarks)
 
 
+def _initial_focal(reference, image_size, config):
+    edge = min(image_size.width, image_size.height)
+    if config.focal_mode == "fixed":
+        return reference.new_full((2,), edge * config.perspective_focal_per_short_edge)
+    pixels = edge * config.initial_focal_factor
+    if not math.isfinite(pixels) or pixels > torch.finfo(reference.dtype).max:
+        raise ValueError("Configured initial focal length is outside the finite range of the fitting dtype")
+    focal = reference.new_full((2,), pixels)
+    if focal[0] <= 0:
+        raise ValueError("Configured initial focal length must be positive in the fitting dtype")
+    return focal
+
+
 def _uncalibrated_cameras(axes, targets, weights, gnm_indices, image_size, kind, config):
     """Fit a camera for each viable pose using weighted landmark centroids."""
     zero = axes.new_zeros(3)
@@ -63,8 +77,7 @@ def _uncalibrated_cameras(axes, targets, weights, gnm_indices, image_size, kind,
             translation=observed_center - scale[:, None] * projected_center[indices],
         )
 
-    edge = min(image_size.width, image_size.height)
-    focal = axes.new_full((2,), edge * config.perspective_focal_per_short_edge)
+    focal = _initial_focal(axes, image_size, config)
     center = axes.new_tensor(((image_size.width - 1) / 2, (image_size.height - 1) / 2))
     centroid_z = (weights * axes[indices][:, gnm_indices, 2]).sum(-1)
     depth = focal[0] / scale - centroid_z
@@ -137,6 +150,8 @@ def initialize(model, data, config, initial):
     default_candidates = None
     for index, obs in enumerate(data.observations):
         kind, camera = observation_camera(obs, config)
+        if camera is not None and config.focal_mode != "fixed":
+            camera = replace(camera, focal_length=_initial_focal(ref, obs.image_size, config))
         item = initial.observations.get(obs.observation_id, base)
         label = f"{obs.observation_id} initial"
         expression = native_tensor(item.expression, (head.expression_dim,), ref, f"{label} expression")

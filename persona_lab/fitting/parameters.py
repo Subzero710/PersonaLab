@@ -54,8 +54,10 @@ class TensorState:
 # Names of the independent optimizer coordinates, in stable column order.
 PARAMETER_GROUPS = {
     "identity": "identity", "expression": "expression", "pose": "pose",
-    "root": "pose", "camera_delta": "camera",
+    "root": "pose", "camera_delta": "camera", "shared_log_focal": "camera", "local_log_focal": "camera",
 }
+FOCAL_PARAMETERS = ("shared_log_focal", "local_log_focal")
+SHARED_PARAMETERS = ("identity", "shared_log_focal")
 
 
 class InvalidGeometry(ValueError):
@@ -69,12 +71,14 @@ class ParameterValues:
     pose: Tensor | None
     root: Tensor | None
     camera_delta: Tensor | None
+    shared_log_focal: Tensor | None = None
+    local_log_focal: Tensor | None = None
 
     def batch(self, start, stop):
         return replace(self, **{
             name: values[start:stop]
-            for name in ("expression", "pose", "root", "camera_delta")
-            if (values := getattr(self, name)) is not None
+            for name in PARAMETER_GROUPS
+            if name not in SHARED_PARAMETERS and (values := getattr(self, name)) is not None
         })
 
 
@@ -235,6 +239,13 @@ class FittingParameters:
             nn.Parameter(reference.new_zeros((len(observations), 3)))
             if config.camera_mode == "estimated" else None
         )
+        self.shared_log_focal = (
+            nn.Parameter(reference.new_zeros(1)) if config.focal_mode == "shared" else None
+        )
+        self.local_log_focal = (
+            nn.Parameter(reference.new_zeros((len(observations), 1)))
+            if config.focal_mode == "per-observation" else None
+        )
         self._head = head
 
     @cached_property
@@ -248,11 +259,11 @@ class FittingParameters:
     def groups(self):
         groups = {
             "identity": (self.identity,), "expression": (self.expression,),
-            "pose": (self.pose, self.root), "camera": (self.camera_delta,),
+            "pose": (self.pose, self.root), "camera": (self.camera_delta, self.shared_log_focal, self.local_log_focal),
         }
         return {name: tuple(p for p in values if p is not None) for name, values in groups.items()}
 
-    def _camera(self, index, offsets):
+    def _camera(self, index, offsets, log_focal):
         camera = self.initial.cameras[index]
         if offsets is None:
             return camera
@@ -268,7 +279,12 @@ class FittingParameters:
             raise InvalidGeometry(f"{identifier} has invalid estimated perspective translation Z")
         translation = torch.cat((initial_xy + offsets[:2] * initial_z,
                                  depth.unsqueeze(0)))
-        return replace(camera, translation=translation)
+        if log_focal is None:
+            return replace(camera, translation=translation)
+        focal = camera.focal_length * log_focal.exp()
+        if not torch.isfinite(focal).all() or (focal <= 0).any():
+            raise InvalidGeometry(f"{self.observation_ids[index]} has invalid estimated perspective focal length")
+        return replace(camera, translation=translation, focal_length=focal)
 
     def values(self):
         return ParameterValues(*(getattr(self, name) for name in PARAMETER_GROUPS))
@@ -287,10 +303,21 @@ class FittingParameters:
             rotations = rotations.index_copy(1, self.head_indices, values.pose[:, None, :])
         translation = self.initial.translation[start:stop] if values.root is None else values.root
         cameras = tuple(
-            self._camera(index, None if values.camera_delta is None else values.camera_delta[row])
+            self._camera(
+                index, None if values.camera_delta is None else values.camera_delta[row],
+                values.shared_log_focal if values.local_log_focal is None else values.local_log_focal[row],
+            )
             for row, index in enumerate(range(start, stop))
         )
         return TensorState(identity, expression, rotations, translation, cameras)
+
+    def focal_factors(self):
+        """Normalized focal lengths at a committed state, in observation order."""
+        log_focal = self.shared_log_focal if self.local_log_focal is None else self.local_log_focal[:, 0]
+        if log_focal is None:
+            return None
+        initial = torch.stack([camera.focal_length[0] for camera in self.initial.cameras])
+        return tuple(((initial * log_focal.exp()).double() / self.short_edges).tolist())
 
     def penalty_delta(self, name, value, start=0, stop=None):
         if name == "pose":
@@ -311,7 +338,7 @@ class FittingParameters:
             squares = [
                 self.penalty_delta(name, value).square().mean()
                 for name, parent in PARAMETER_GROUPS.items()
-                if group == parent and (value := getattr(values, name)) is not None
+                if group == parent and name not in FOCAL_PARAMETERS and (value := getattr(values, name)) is not None
             ]
             total = sum(squares[1:], squares[0]) if squares else zero
             terms[group] = total * strength

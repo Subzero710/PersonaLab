@@ -16,7 +16,7 @@ from .benchmark.predictions import write_predictions
 from .benchmark.storage import publish_directory, read_json
 from .dfl import DFLFaceSample, iter_dataset
 from .fitting import FitConfig, fit_identity
-from .fitting.configuration import SOLVERS
+from .fitting.configuration import FOCAL_MODES, SOLVERS
 from .fitting.diagnostics import write_neutral_mesh, write_overlays
 from .fitting.results import FAILED_STATUSES, _write_result
 from .observations import LandmarkObservation
@@ -46,6 +46,8 @@ def _parser():
     parser.add_argument("--solver", choices=SOLVERS, help="fitting solver (default: Levenberg–Marquardt)")
     parser.add_argument("--camera-mode", choices=("known", "estimated"))
     parser.add_argument("--camera", choices=("weak-perspective", "perspective"))
+    parser.add_argument("--focal-mode", choices=FOCAL_MODES)
+    parser.add_argument("--initial-focal-factor", type=float, help="initial perspective focal length per short edge")
     parser.add_argument("--batch-size", type=_positive_int)
     parser.add_argument("--iterations", type=int, nargs=3, metavar=("A", "B", "C"))
     parser.add_argument("--learning-rate", type=float, help="override all Adam stage learning rates")
@@ -71,6 +73,7 @@ def _config(args):
     for name in (
         "camera_mode", "batch_size", "identity_weight", "expression_weight", "pose_weight",
         "camera_weight", "train_identity", "train_expression", "seed", "log_every", "solver",
+        "focal_mode", "initial_focal_factor",
     ):
         if (value := getattr(args, name)) is not None:
             values[name] = value

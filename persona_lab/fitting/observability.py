@@ -10,7 +10,7 @@ from .initialization import initialize
 from .levenberg_marquardt import StageCoordinates, observation_jacobian
 from .observations import prepare_observations
 from .parameters import (
-    FitInitialization, FittingParameters, TensorState, copy_camera, resolve_selection, validate_model,
+    PARAMETER_GROUPS, FitInitialization, FittingParameters, TensorState, copy_camera, resolve_selection, validate_model,
 )
 from .results import ARRAY_FIELDS, FitResult
 
@@ -38,6 +38,138 @@ def _spectrum(matrix, values, threshold):
         "implicit_zero_singular_values": width - values.numel(),
         "singular_values": values.tolist() + [0.0] * (width - values.numel()),
         "column_l2": torch.linalg.vector_norm(matrix, dim=0).tolist(),
+    }
+
+
+def _compress(previous, rows):
+    return torch.linalg.qr(torch.cat((previous, rows), dim=0), mode="r").R
+
+
+def _describe(matrix, rows, threshold, rtol):
+    values = torch.linalg.svdvals(matrix)
+    record = _spectrum(matrix, values, threshold)
+    record["parameter_count"] = record.pop("identity_parameter_count")
+    return record | {
+        "matrix_dimensions": [rows, matrix.shape[1]], "compressed_dimensions": list(matrix.shape),
+        "absolute_threshold": threshold, "nuisance_relative_threshold": rtol,
+        "minimum_singular_value": record["singular_values"][-1],
+        "maximum_singular_value": record["singular_values"][0],
+    }
+
+
+def _project_with_depth(columns, nuisance, depth_column, rtol):
+    u, singular, vh = torch.linalg.svd(nuisance, full_matrices=False)
+    keep = singular > singular[0] * rtol
+    basis = u[:, keep]
+    coefficients = basis.mT @ columns
+    depth = -(vh[keep, depth_column] / singular[keep]) @ coefficients
+    return columns - basis @ coefficients, depth
+
+
+def _direction(identity, focal, depth, names, singular):
+    count = min(5, len(names))
+    indices = torch.topk(identity.abs(), count).indices.tolist()
+    return {
+        "singular_value": singular, "identity_l2": float(torch.linalg.vector_norm(identity)),
+        "largest_identity_loadings": {names[index]: float(identity[index]) for index in indices},
+        "log_focal_loadings": focal.tolist(), "compensating_log_depth_by_observation": depth.tolist(),
+    }
+
+
+def _focal_observability(data, parameters, layout, base, position, width, rtol, atol):
+    names = parameters.selection.identity
+    empty = position.identity.new_empty((0, width), dtype=torch.float64)
+    identity_blocks = dict.fromkeys((
+        "fixed_nuisance", "after_expression", "after_expression_and_pose", "after_all_nuisance",
+    ), empty)
+    joint = empty.new_empty((0, width + 1))
+    expression = layout.expression_slice()
+    locals_ = dict(layout.columns())
+    pose = locals_.get("pose")
+    depth_column = locals_["camera_delta"].start + 2
+    depth_rows, distinct_focals, raw_focal_norms = [], [], []
+    rows = 0
+    for index in range(len(data)):
+        _, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
+        identity = jacobian[:, :width]
+        rows += len(jacobian)
+        if layout.shared_focal:
+            focal, local = jacobian[:, width:width + 1], jacobian[:, width + 1:]
+            other = local
+        else:
+            local = jacobian[:, width:]
+            # Local focal is the final column, after camera translation.
+            focal, other = local[:, -1:], local[:, :-1]
+        raw_focal_norms.append(float(torch.linalg.vector_norm(focal)))
+        expression_columns = local[:, expression] if expression is not None else local[:, :0]
+        pose_columns = local[:, pose] if pose is not None else local[:, :0]
+        blocks = {
+            "fixed_nuisance": identity,
+            "after_expression": _remove_nuisance(identity, expression_columns, rtol),
+            "after_expression_and_pose": _remove_nuisance(
+                identity, torch.cat((expression_columns, pose_columns), dim=1), rtol,
+            ),
+        }
+        adjusted, depth = _project_with_depth(torch.cat((identity, focal), dim=1), other, depth_column, rtol)
+        depth_rows.append(depth)
+        if layout.shared_focal:
+            joint = _compress(joint, adjusted)
+        else:
+            blocks["after_all_nuisance"] = _remove_nuisance(identity, local, rtol)
+            # Put the focal column first to leave exactly one focal-bearing row
+            # per view. Compress the remaining identity-only rows as they arrive.
+            reduced = torch.linalg.qr(torch.cat((adjusted[:, -1:], adjusted[:, :-1]), dim=1), mode="r").R
+            distinct_focals.append(reduced[0])
+            joint = _compress(joint, reduced[1:, 1:]) if index else reduced[1:, 1:]
+        for name, block in blocks.items():
+            identity_blocks[name] = _compress(identity_blocks[name], block)
+
+    depths = torch.stack(depth_rows)
+    if layout.shared_focal:
+        identity_blocks["after_all_nuisance"] = _remove_nuisance(joint[:, :width], joint[:, width:], rtol)
+    else:
+        focal_rows = torch.stack(distinct_focals)
+        focal_count = len(data)
+        joint = torch.cat((
+            torch.cat((joint, joint.new_zeros((len(joint), focal_count))), dim=1),
+            torch.cat((focal_rows[:, 1:], focal_rows[:, 0].diag()), dim=1),
+        ))
+
+    threshold = max(atol, rtol * float(torch.linalg.svdvals(identity_blocks["fixed_nuisance"])[0]))
+    conditional = _remove_nuisance(joint[:, width:], joint[:, :width], rtol)
+    joint_record = _describe(joint, rows, threshold, rtol)
+    conditional_record = _describe(conditional, rows, threshold, rtol)
+    _, _, vh = torch.linalg.svd(joint, full_matrices=True)
+
+    def describe_direction(direction, singular):
+        identity, focal = direction[:width], direction[width:]
+        depth = depths[:, :width] @ identity + depths[:, width] * focal
+        return _direction(identity, focal, depth, names, singular)
+
+    joint_record["weakest_directions"] = [
+        describe_direction(vh[index], joint_record["singular_values"][index])
+        for index in range(len(vh) - 1, max(-1, len(vh) - 4), -1)
+    ]
+    _, _, focal_vh = torch.linalg.svd(conditional, full_matrices=True)
+    focal_direction = focal_vh[-1]
+    identity_direction = -torch.linalg.pinv(joint[:, :width], rtol=rtol) @ (joint[:, width:] @ focal_direction)
+    conditional_record["weakest_direction"] = describe_direction(
+        torch.cat((identity_direction, focal_direction)), conditional_record["minimum_singular_value"],
+    )
+    focal_names = ["shared_log_focal"] if layout.shared_focal else list(data.ids)
+    local_priors = {}
+    for name, _ in layout.columns():
+        if name == "local_log_focal":
+            continue
+        weight = getattr(parameters.config, f"{PARAMETER_GROUPS[name]}_weight")
+        local_priors[name] = weight / getattr(parameters, name).numel()
+    return {
+        "absolute_threshold": threshold,
+        **{name: _describe(matrix, rows, threshold, rtol) for name, matrix in identity_blocks.items()},
+        "joint_identity_and_focal": joint_record, "conditional_focal": conditional_record,
+        "focal_coordinate_names": focal_names,
+        "fixed_nuisance_focal_column_l2": [math.hypot(*raw_focal_norms)] if layout.shared_focal else raw_focal_norms,
+        "local_prior_jtj_diagonal": local_priors, "focal_prior_jtj_diagonal": 0.0,
     }
 
 
@@ -92,6 +224,12 @@ def identity_observability(model, observations, config, *, initial=None, fit=Non
     layout = StageCoordinates.from_parameters(parameters, GROUPS)
     base = parameters.values()
     position = layout.pack(base, model.reference, len(data))
+    if config.focal_mode != "fixed":
+        return {
+            "state": at, "observation_ids": list(data.ids), "identity_names": list(selection.identity),
+            "identity_parameter_count": width, "relative_tolerance": rtol, "absolute_tolerance": atol,
+            "identity_prior_jtj_diagonal": config.identity_weight / width, "focal_mode": config.focal_mode,
+        } | _focal_observability(data, parameters, layout, base, position, width, rtol, atol)
     expression_slice = layout.expression_slice()
 
     names = ("fixed_nuisance", "after_expression", "after_all_nuisance")

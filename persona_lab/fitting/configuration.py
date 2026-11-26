@@ -1,6 +1,6 @@
 """Configuration for one shared-identity fitting session."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from collections.abc import Mapping
 
 from ..benchmark.configuration import finite_number
@@ -9,6 +9,7 @@ from ..correspondences import DFL_LANDMARK_COUNT
 
 GROUPS = ("identity", "expression", "pose", "camera")
 CAMERA_MODELS = ("weak-perspective", "perspective")
+FOCAL_MODES = ("fixed", "shared", "per-observation")
 SOLVERS = ("adam", "levenberg-marquardt")
 DEFAULT_SOLVER = "levenberg-marquardt"
 
@@ -155,6 +156,8 @@ class FitConfig:
     stages: tuple[Stage, ...] = field(default_factory=default_stages)
     solver: str = DEFAULT_SOLVER
     lm: LevenbergMarquardtConfig = field(default_factory=LevenbergMarquardtConfig)
+    focal_mode: str = "fixed"
+    initial_focal_factor: float | None = None
 
     def __post_init__(self):
         if self.solver not in SOLVERS or not isinstance(self.lm, LevenbergMarquardtConfig):
@@ -165,6 +168,20 @@ class FitConfig:
             raise ValueError("Camera model must be weak-perspective or perspective")
         if self.camera_mode == "known" and self.camera_model is not None:
             raise ValueError("Known-camera mode uses the camera type of each observation")
+        if self.focal_mode not in FOCAL_MODES:
+            raise ValueError(f"Focal mode must be one of {', '.join(FOCAL_MODES)}")
+        if self.focal_mode == "fixed":
+            if self.initial_focal_factor is not None:
+                raise ValueError("initial_focal_factor requires trainable focal length")
+        else:
+            if (self.camera_mode, self.camera_model, self.solver) != (
+                "estimated", "perspective", "levenberg-marquardt",
+            ):
+                raise ValueError("Trainable focal length requires estimated perspective cameras and LM")
+            factor = finite_number(self.initial_focal_factor, "Explicit initial focal factor")
+            if factor <= 0:
+                raise ValueError("Initial focal factor must be positive")
+            object.__setattr__(self, "initial_focal_factor", factor)
         if self.pose_initializer not in ("grid", "neutral"):
             raise ValueError("Pose initializer must be grid or neutral")
         for name in ("train_head", "train_root"):
@@ -209,6 +226,13 @@ class FitConfig:
         ):
             raise ValueError("Stages require unique names and a positive iteration budget")
         object.__setattr__(self, "stages", stages)
+
+    def to_dict(self):
+        """Keep the established fixed-focal configuration representation."""
+        options = asdict(self)
+        if self.focal_mode == "fixed":
+            del options["focal_mode"], options["initial_focal_factor"]
+        return options
 
     @classmethod
     def from_dict(cls, options):

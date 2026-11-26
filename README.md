@@ -1338,3 +1338,121 @@ and how we handle external contributions.
 ## License
 This project is licensed under the Apache License, Version 2.0. See the
 [LICENSE](LICENSE) file for details.
+
+#### Joint identity and focal length estimation
+
+`focal-estimation` is an opt-in CPU float64 corrected-identity study. It uses
+Scenario C, the official GNM v3.0 Head asset and seeds 42, 43 and 44. Each
+dataset has nine clean observations and head-only ground truth. The model and
+scoring retain all 253 identity and 383 expression coefficients, all 68 sparse
+landmarks, the existing correspondence mapping and the 17,821-vertex neutral
+mesh. The fits train 170 head identity and 24 expression coefficients. The 83
+remaining identity coefficients are fixed. The recovery claims apply to this
+head-only ground truth.
+
+| Condition | Reference intrinsics | Fitting camera | Initial normalized focal factor |
+| --- | --- | --- | ---: |
+| A1 | Uniform 1.4 | Fixed focal calibrated control | 1.4 |
+| A2 | Uniform 1.4 | Fixed focal incorrect control | 1.5 |
+| A3 | Uniform 1.4 | Shared focal | 1.5 |
+| A4 | Uniform 1.4 | Per-observation focal | 1.5 |
+| A5 | Uniform 1.4 | Shared focal | 1.0 |
+| A6 | Uniform 1.4 | Shared focal | 2.0 |
+| A7 | Uniform 1.4 | Per-observation focal | 1.0 |
+| A8 | Uniform 1.4 | Per-observation focal | 2.0 |
+| B1 | Heterogeneous | Fixed focal | 1.5 |
+| B2 | Heterogeneous | Shared focal | 1.5 |
+| B3 | Heterogeneous | Per-observation focal | 1.5 |
+| B4 | Heterogeneous | Known-camera control | Supplied cameras |
+
+The B schedule is `[1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 1.1, 1.5, 1.9]`
+in observation order. B2 tests the compatibility of a shared parameter with
+heterogeneous data. For each seed and experiment, the conditions share the
+same dataset and ordered observations. Each case uses ordinary deterministic
+initialization and one joint LM stage. A1 receives reference focal length in
+its configuration, B4 receives the known cameras, and all other fits receive
+landmarks and their explicit fitting settings.
+
+**Fitting configuration.** The default `focal_mode` is `fixed`, which uses
+`perspective_focal_per_short_edge` for the existing uncalibrated perspective
+initializer and preserves supplied known cameras. Select `shared` or
+`per-observation` with `camera_mode="estimated"`,
+`camera_model="perspective"`, the LM solver and a positive
+`initial_focal_factor`. The same controls are available in the fit CLI as
+`--focal-mode` and `--initial-focal-factor`. An explicit perspective camera
+seed supplies rotation, principal point and translation. Its focal length
+is initialized from fitting configuration in trainable focal modes.
+
+For a raster short edge $s_i$, initial focal factor $k_0$ and log
+coordinate $\delta_i$, both focal axes are $f_i=s_i k_0\exp(\delta_i)$.
+The coordinate starts at zero. Shared mode uses one $\delta$ across the
+dataset, and per-observation mode gives each view its own $\delta_i$.
+Cropping and resizing each image independently
+can change its effective normalized focal factor even when the physical
+camera is the same. Existing log-depth and lateral translation coordinates,
+camera rotation, principal point, root gauge and expression bounds still
+apply. The focal coordinate has zero prior curvature. The original
+`camera_weight` applies to the existing camera offset coordinates.
+Invalid trial intrinsics follow the LM invalid-geometry rejection path.
+
+**Schur system.** Let $A_i$ and $B_i$ be the Jacobians of the normalized,
+weighted residual for view $i$ with respect to shared and local coordinates.
+The shared block contains identity and the shared log focal when active.
+The independent blocks contain expression, pose and translation, plus a log
+focal in per-observation mode. The unscaled data curvature blocks are
+$H_{gg}=\sum_i A_i^\mathsf{T} A_i$,
+$H_{gi}=A_i^\mathsf{T}B_i$, and $H_{ii}=B_i^\mathsf{T}B_i$.
+For a projected pixel $u$ and principal point $c$, the isotropic log-focal
+derivative is $u-c$. The log-depth derivative is $-(u-c)t_z/Z$ for
+translation depth $t_z$ and projected landmark depth $Z$. Their near
+collinearity at similar landmark depths motivates the joint diagnostics.
+The solver accumulates the corresponding $J^\mathsf{T}r$ blocks and applies
+the existing priors, equilibration, active bounds and damping. In the resulting
+scaled system the shared solve eliminates the local blocks through
+$H_{gg}-\sum_i H_{gi}H_{ii}^{-1}H_{ig}$ with right-hand side
+$-g_g+\sum_i H_{gi}H_{ii}^{-1}g_i$. Back-substitution gives the view
+updates. The objective reduction and strict gradient and minimum-damping
+displacement checks include the active focal coordinates. Fit result schema 4
+records their mode and accepted focal trajectory. Fixed-focal results retain
+their established on-disk format.
+
+**Observability.** The spectra use the data Jacobian with the fitting residual
+weights. Local singular vectors above the recorded relative threshold define
+the nuisance projections. The rank threshold uses the largest singular value
+of the fixed-nuisance identity Jacobian. The joint shared-focal diagnostic
+streams reduced QR across views. The independent-focal diagnostic compresses
+each view to identity-only rows plus one row carrying its focal coordinate.
+The identity-only reductions keep a fixed-width factor. A complete
+independent-focal spectrum uses a compressed matrix of at most
+$(p+n)\times(p+n)$ for $p$ identity coefficients and $n$ views.
+The weak directions include the corresponding least-squares local log-depth
+compensation. Local rank measures sensitivity near the evaluated snapshot.
+Absolute calibration and uniqueness remain separate scientific questions.
+
+**Running the study.** Put the pinned model asset at
+`.gnm-cache/v3_0/gnm_head.npz` and use a fresh output directory.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-estimation \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --focal-study-budget 100 --spectra \
+  --output outputs/identity-study-v5.2
+```
+
+The command writes all 36 cases to `outputs/identity-study-v5.2/report.json`
+and linked case rows, matched comparisons and counts to `summary.json`.
+The budget is explicit and accepts 1 through 100 joint updates. Use
+`--v51-report outputs/identity-study-v5.1/report.json` to compare the A1
+and A2 controls with V5.1 B2 and C2 when both dataset identifiers, observation
+order, model asset, generation settings and fit settings match. The study
+keeps the strict LM stopping criteria and original exact-recovery targets.
+The focal experiment additionally uses a maximum relative error of
+`1e-5` as its recovery target. Reported comparable camera translation errors
+require matching raster, rotation, principal point and root frame, with
+matching fixed focal lengths or trainable focal lengths within the experimental
+relative tolerance. Fitted and reference depths are recorded with the gauge
+status. Solver failures give a nonzero command exit status, including in
+intentionally incompatible conditions. Reports preserve each case and its
+termination reason.

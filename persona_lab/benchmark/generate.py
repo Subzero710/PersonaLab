@@ -111,10 +111,12 @@ def _camera(model, config, kind, subject, index):
     if kind == "perspective":
         low, high = config.distance_m
         depth = low + (high - low) * fraction
+        schedule = config.perspective_focal_factors
+        factor = _FOCAL_PER_SHORT_EDGE if schedule is None else schedule[index]
         return PerspectiveCamera(
             image_size=size, rotation=rotation,
             translation=model.tensor([0, _CAMERA_Y_M, depth]),
-            focal_length=model.tensor([_FOCAL_PER_SHORT_EDGE * short_edge] * 2),
+            focal_length=model.tensor([factor * short_edge] * 2),
             principal_point=model.tensor(center),
         )
     low, high = config.weak_scale_per_short_edge
@@ -250,10 +252,12 @@ def generate_dataset(destination, config, *, model_file=None, correspondences=DF
             "view_joint": "head",
             "view_axis": {name: VIEW_AXES[name][0] for name in config.view_degrees},
             "camera_center_y_m": _CAMERA_Y_M,
-            "focal_per_short_edge": _FOCAL_PER_SHORT_EDGE,
             "camera_tier_centers": _TIER_CENTERS,
             "camera_tier_half_width": _TIER_HALF_WIDTH,
-        } | provenance,
+        } | (
+            {"focal_per_short_edge": _FOCAL_PER_SHORT_EDGE} if config.perspective_focal_factors is None
+            else {"focal_per_short_edge_schedule": config.perspective_focal_factors}
+        ) | provenance,
     )
 
 

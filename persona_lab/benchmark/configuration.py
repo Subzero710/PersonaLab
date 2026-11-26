@@ -132,11 +132,12 @@ class GenerationConfig:
     device: str
     identity_selection: str | None = None
     gaussian_noise_px: float | None = None
+    perspective_focal_factors: tuple[float, ...] | None = None
 
     def metadata(self):
         metadata = asdict(self)
         # Omission denotes the original full-native protocol and retains its dataset ID.
-        for name in ("identity_selection", "gaussian_noise_px"):
+        for name in ("identity_selection", "gaussian_noise_px", "perspective_focal_factors"):
             if metadata[name] is None:
                 del metadata[name]
         return metadata
@@ -239,6 +240,7 @@ def resolve_config(scenario="F", **overrides):
         "identity_half_range": 0.5,
         "identity_selection": None,
         "gaussian_noise_px": None,
+        "perspective_focal_factors": None,
         "expression_strength": (0.8, 1.0),
         "expressions": required_expressions,
         "view_degrees": {
@@ -274,6 +276,14 @@ def resolve_config(scenario="F", **overrides):
         single_view and camera == "both"
     ):
         raise ValueError("Select perspective, weak-perspective, or both for a multi-view scenario")
+    if "perspective_focal_factors" in overrides:
+        schedule = values["perspective_focal_factors"]
+        if camera != "perspective" or not isinstance(schedule, (list, tuple)) or len(schedule) != observations:
+            raise ValueError("A focal schedule requires one factor per observation and perspective cameras")
+        factors = tuple(finite_number(factor, "Perspective focal factor") for factor in schedule)
+        if any(factor <= 0 for factor in factors):
+            raise ValueError("Perspective focal factors must be positive")
+        values["perspective_focal_factors"] = factors
     if not isinstance(values["image_size"], (tuple, list)) or len(values["image_size"]) != 2:
         raise ValueError("Image size requires [width, height]")
     ImageSize(*values["image_size"])

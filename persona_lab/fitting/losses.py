@@ -9,7 +9,7 @@ import torch
 from ..camera import project
 from ..coordinates import gnm_to_frontal_axes
 from ..gnm_geometry import extract_landmarks
-from .parameters import InvalidGeometry, PARAMETER_GROUPS, stack_cameras
+from .parameters import FOCAL_PARAMETERS, InvalidGeometry, PARAMETER_GROUPS, stack_cameras
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +98,7 @@ def _weighted(normalized, data, start, stop):
 def regularization_residual(parameters, name, value, start=0, stop=None):
     """Return the residual and diagonal slope for one selected coordinate group."""
     group = PARAMETER_GROUPS[name]
-    strength = getattr(parameters.config, f"{group}_weight")
+    strength = 0.0 if name in FOCAL_PARAMETERS else getattr(parameters.config, f"{group}_weight")
     if strength == 0:
         return torch.zeros_like(value, dtype=torch.float64), 0.0
     slope = math.sqrt(strength / getattr(parameters, name).numel())

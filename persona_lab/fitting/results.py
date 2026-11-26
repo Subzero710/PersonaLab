@@ -17,11 +17,11 @@ from ..correspondences import DFL_LANDMARK_COUNT
 from .configuration import FitConfig
 from .initialization import InitializationChoice
 from .losses import LossValues, PixelStatistics, Reprojection
-from .monitoring import Linearization, OptimizationDiagnostics, OptimizationUpdate, Trial
+from .monitoring import Linearization, OptimizationDiagnostics, OptimizationUpdate, Trial, optimization_record
 from .parameters import ParameterSelection, TensorState, copy_camera, resolve_selection, validate_model
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FAILED_STATUSES = ("failed", "numerical_failure", "no_acceptable_step")
 STATUSES = ("budget_exhausted", "converged", "stopped", *FAILED_STATUSES)
 ARRAY_FIELDS = ("identity", "expression", "rotations", "translation")
@@ -100,7 +100,11 @@ class FitResult:
             },
             "perspective": {
                 "translation": "estimated_metric_xy_and_positive_log_z" if estimated else "fixed",
-                "focal_length": "fixed", "principal_point": "fixed",
+                "focal_length": {
+                    "fixed": "fixed", "shared": "estimated_shared_positive_log_ratio",
+                    "per-observation": "estimated_per_observation_positive_log_ratio",
+                }[self.config.focal_mode],
+                "principal_point": "fixed",
             },
         }
 
@@ -148,11 +152,11 @@ def _camera_records(state, ids):
 
 def _metadata(result):
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": 3 if result.config.focal_mode == "fixed" else SCHEMA_VERSION,
         "model": deepcopy(result.model),
         "dtype": result.dtype,
         "device": result.device,
-        "config": asdict(result.config),
+        "config": result.config.to_dict(),
         "selection": asdict(result.selection),
         "gauge": result.gauge,
         "observation_ids": result.observation_ids,
@@ -166,7 +170,7 @@ def _metadata(result):
         "status": result.status,
         "reason": result.reason,
         "runtime": result.runtime,
-        "optimization": None if result.optimization is None else asdict(result.optimization),
+        "optimization": None if result.optimization is None else optimization_record(result.optimization),
     }
 
 
@@ -191,10 +195,11 @@ def save_result(path, result: FitResult):
         _write_result(stage, result)
 
 
-def _fields(cls, value, *, legacy=False):
+def _fields(cls, value, *, legacy=False, optional=()):
     declared = fields(cls)
-    if legacy and isinstance(value, dict):
-        defaults = {field.name: field.default for field in declared if field.default is not MISSING}
+    if (legacy or optional) and isinstance(value, dict):
+        defaults = {field.name: field.default for field in declared
+                    if field.default is not MISSING and (legacy or field.name in optional)}
         value = defaults | value
     require_keys(value, {field.name for field in declared}, cls.__name__)
     return value
@@ -246,7 +251,21 @@ def _decode_cameras(records, ids, dtype, config):
     return tuple(cameras)
 
 
-def _decode_optimization(record, config, *, legacy):
+def _validate_focal_cameras(cameras, config, dtype, *, initial):
+    if any(not torch.equal(camera.focal_length[0], camera.focal_length[1]) for camera in cameras):
+        raise ValueError("Estimated focal lengths must be isotropic")
+    factors = torch.stack([
+        camera.focal_length[0].double() / min(camera.image_size.width, camera.image_size.height)
+        for camera in cameras
+    ])
+    if initial or config.focal_mode == "shared":
+        expected = config.initial_focal_factor if initial else factors[0]
+        if not torch.allclose(factors, torch.as_tensor(expected, dtype=factors.dtype).expand_as(factors),
+                              rtol=8 * torch.finfo(dtype).eps, atol=0):
+            raise ValueError("Saved normalized focal lengths disagree with the fitting configuration")
+
+
+def _decode_optimization(record, config, count, *, legacy):
     if record is None:
         return None
     options = dict(_fields(OptimizationDiagnostics, record, legacy=legacy))
@@ -254,13 +273,25 @@ def _decode_optimization(record, config, *, legacy):
         value = options[name]
         if value is not None:
             options[name] = LossValues(**_fields(LossValues, value))
-    updates = tuple(
-        OptimizationUpdate(**_fields(OptimizationUpdate, item, legacy=legacy))
-        for item in options["updates"]
-    )
-    trials = tuple(Trial(**_fields(Trial, item, legacy=legacy)) for item in options["trials"])
+    updates = []
+    for item in options["updates"]:
+        entry = dict(_fields(OptimizationUpdate, item, legacy=legacy, optional=("focal_factors",)))
+        factors = entry["focal_factors"]
+        if config.focal_mode != "fixed":
+            if not isinstance(factors, list) or len(factors) != count or any(
+                type(factor) not in (int, float) or factor <= 0 for factor in factors
+            ):
+                raise ValueError("Focal trajectory must contain one positive factor per observation")
+            entry["focal_factors"] = tuple(factors)
+        elif factors is not None:
+            raise ValueError("Fixed-focal optimization cannot contain a focal trajectory")
+        updates.append(OptimizationUpdate(**entry))
+    trials = tuple(Trial(**_fields(Trial, item, legacy=legacy, optional=("focal_step_norms",)))
+                   for item in options["trials"])
     linearizations = tuple(
-        Linearization(**_fields(Linearization, item)) for item in options["linearizations"]
+        Linearization(**_fields(Linearization, item, optional=(
+            "focal_gradient_norms", "minimum_damping_probe_focal_norms",
+        ))) for item in options["linearizations"]
     )
     names = {stage.name for stage in config.stages}
     for count in ("objective_evaluations", "jacobian_evaluations", "accepted_updates", "rejected_trials"):
@@ -277,7 +308,7 @@ def _decode_optimization(record, config, *, legacy):
     ):
         raise ValueError("Optimization diagnostics disagree with the fitting schedule or solver")
     return OptimizationDiagnostics(**(options | {
-        "updates": updates, "trials": trials, "linearizations": linearizations,
+        "updates": tuple(updates), "trials": trials, "linearizations": linearizations,
     }))
 
 
@@ -295,7 +326,7 @@ def _load_result(path, model):
     # Also rejects finite-looking literals that overflow the JSON decoder's float.
     json_bytes(manifest)
     version = manifest.get("schema_version")
-    if type(version) is not int or version not in (1, 2, SCHEMA_VERSION):
+    if type(version) is not int or version not in (1, 2, 3, SCHEMA_VERSION):
         raise ValueError("Unsupported fitting result schema")
     keys = {
         "schema_version", "model", "dtype", "device", "config", "selection", "gauge", "observation_ids",
@@ -326,6 +357,8 @@ def _load_result(path, model):
     if version == 1 and isinstance(options, dict):
         options = {"solver": "adam"} | options
     config = FitConfig.from_dict(options)
+    if version < 4 and config.focal_mode != "fixed":
+        raise ValueError("Trainable focal length requires fitting result schema 4")
     if version == 1 and (config.solver != "adam" or "lm" in manifest["config"]):
         raise ValueError("Version 1 fitting results require the original Adam configuration")
     if version >= 2 and not {"solver", "lm"} <= manifest["config"].keys():
@@ -352,6 +385,8 @@ def _load_result(path, model):
     states = {}
     for prefix in prefixes:
         cameras = _decode_cameras(manifest[f"{prefix}_cameras"], ids, torch_dtype, config)
+        if config.focal_mode != "fixed":
+            _validate_focal_cameras(cameras, config, torch_dtype, initial=prefix == "initial")
         states[prefix] = FitState(*(arrays[f"{prefix}_{name}"] for name in ARRAY_FIELDS), cameras)
     if not failed:
         initial, final = states["initial"], states["final"]
@@ -363,7 +398,7 @@ def _load_result(path, model):
             if not torch.equal(start.rotation, stop.rotation):
                 raise ValueError("Fixed camera rotation changed")
             if isinstance(start, PerspectiveCamera) and (
-                not torch.equal(start.focal_length, stop.focal_length)
+                (config.focal_mode == "fixed" and not torch.equal(start.focal_length, stop.focal_length))
                 or not torch.equal(start.principal_point, stop.principal_point)
             ):
                 raise ValueError("Fixed camera intrinsics changed")
@@ -405,7 +440,7 @@ def _load_result(path, model):
         _decode_reprojection(manifest["initial_reprojection"], len(ids)),
         _decode_reprojection(manifest["final_reprojection"], len(ids)),
         tuple(history), stages, status, reason, manifest["runtime"],
-        _decode_optimization(manifest.get("optimization"), config, legacy=version < 3),
+        _decode_optimization(manifest.get("optimization"), config, len(ids), legacy=version < 3),
     )
     if json_bytes(result.gauge) != json_bytes(manifest["gauge"]):
         raise ValueError("Saved parameter gauge disagrees with the fitting configuration")

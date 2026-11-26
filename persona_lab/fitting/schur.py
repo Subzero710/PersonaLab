@@ -1,4 +1,4 @@
-"""Damped Gauss–Newton steps for shared identity and independent nuisance blocks."""
+"""Damped Gauss–Newton steps for shared and independent local blocks."""
 
 from dataclasses import dataclass
 import math
@@ -9,6 +9,7 @@ from torch import Tensor
 
 @dataclass(frozen=True, slots=True)
 class BlockVector:
+    # The historical identity field stores the entire shared block.
     identity: Tensor
     local: Tensor
 
