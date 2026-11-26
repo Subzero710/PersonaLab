@@ -18,7 +18,7 @@ from ..fitting.configuration import SOLVERS, LevenbergMarquardtConfig
 from ..fitting.monitoring import optimization_record, peak_rss_bytes
 from ..fitting.observability import identity_observability
 from ..fitting.results import FAILED_STATUSES
-from . import camera_calibration, focal_estimation
+from . import camera_calibration, focal_convergence, focal_estimation
 from .configuration import resolve_config
 from .dataset import camera_from_record, camera_to_record, load_dataset
 from .evaluate import _pool_expression, _pool_reprojection, _score_observation
@@ -32,7 +32,7 @@ from .metrics import (
     METRIC_UNITS, fixed_coefficient_error, grouped_coefficient_errors, neutral_geometry_errors,
 )
 from .model import load_benchmark_model
-from .predictions import SubjectPrediction
+from .predictions import ObservationPrediction, SubjectPrediction
 from .storage import json_bytes, read_json, write_json
 
 
@@ -40,6 +40,7 @@ COUNTS = (1, 5, 10, 25, 50, 100)
 IDENTITY_STUDIES = ("exact", "convergence", "count", "held-out", "robustness")
 CALIBRATION_STUDY = camera_calibration.STUDY
 FOCAL_STUDY = focal_estimation.STUDY
+CONVERGENCE_STUDY = focal_convergence.STUDY
 STRICT_LM = LevenbergMarquardtConfig(
     scaled_gradient_tolerance=1e-12, minimum_damping=1e-12,
     native_step_tolerance=1e-6, scaled_step_tolerance=1e-10,
@@ -198,13 +199,83 @@ def _held_out(model, job, config, fit, training_truth):
     }
 
 
+def _calibration_diagnostics(record, model, dataset, truth, observations, fit, spectra):
+    """Score the frozen-nuisance calibration and the complete fit in their own states."""
+    calibration = next((stage for stage in fit.stage_diagnostics if stage.name == "pose_camera"), None)
+    after = calibration.after.state if calibration is not None else None
+    initial_cameras = [camera_to_record(camera) for camera in fit.initial.cameras]
+    states = {}
+    for name, state in (("initial", fit.initial), ("post_calibration", after), ("final", fit.final)):
+        if state is None:
+            states[name] = {"status": "unavailable", "reason": fit.reason}
+            continue
+        if name == "final":
+            training = record["final"]["training_reprojection_and_nuisance_recovery"]
+            identity = record["final"]["identity"]
+            cameras = record["camera_recovery"]
+        else:
+            prediction = SubjectPrediction(state.identity, {
+                key: ObservationPrediction(
+                    expression=state.expression[i], rotations=state.rotations[i],
+                    translation=state.translation[i], camera=state.cameras[i],
+                ) for i, key in enumerate(fit.observation_ids)
+            })
+            training = _score_observations(
+                model, dataset, truth, prediction, "complete", trainable_expression=fit.selection.expression,
+            )
+            identity = grouped_coefficient_errors(
+                state.identity, truth.arrays["identity"], model.metadata["identity_names"],
+                trainable=fit.selection.identity, regions=gnm_utils.identity_regions_indices(model.head),
+            )
+            cameras = [
+                focal_estimation._camera_row(
+                    item, initial_cameras[i], camera_to_record(state.cameras[i]),
+                    fit.config.focal_mode, state.translation[i], truth.arrays["translation"][i],
+                ) for i, item in enumerate(truth.observations)
+            ]
+        head_angles = [item["pose_recovery"]["joint_rotation_deg"]["head"] for item in training["observations"]]
+        states[name] = {
+            "status": "evaluated",
+            "identity": identity, "expression": training["expression"], "reprojection": training["aggregate"],
+            "head_pose_rms_deg": float(np.sqrt(np.mean(np.square(head_angles)))),
+            "head_pose_by_observation_deg": dict(zip(fit.observation_ids, head_angles, strict=True)),
+            "camera_recovery": focal_convergence.camera_diagnostics(cameras),
+            "cameras": cameras,
+        }
+    record["calibration_diagnostics"] = {
+        "status": "evaluated" if after is not None else "unavailable",
+        "calibration_active_groups": ["pose", "camera"],
+        "joint_active_groups": fit.config.stages[-1].groups,
+        "identity_frozen": bool(np.array_equal(fit.initial.identity, after.identity)) if after is not None else None,
+        "expression_frozen": bool(np.array_equal(fit.initial.expression, after.expression)) if after is not None else None,
+        "states": states,
+    }
+    if not spectra:
+        return
+    record["post_calibration_identity_observability"] = None
+    if after is None:
+        diagnostic = {"status": "unavailable", "reason": fit.reason}
+    else:
+        try:
+            record["post_calibration_identity_observability"] = identity_observability(
+                model, observations, fit.config, fit=fit, at="pose_camera",
+            )
+        except (ArithmeticError, RuntimeError, ValueError) as error:
+            diagnostic = {"status": "failed", "reason": str(error)}
+        else:
+            diagnostic = {"status": "evaluated", "reason": None}
+    record["observability_status"]["post_calibration"] = diagnostic
+
+
 def _run_job(job):
     case_started = perf_counter()
     config = FitConfig.from_dict(job["config"])
     calibration = CALIBRATION_STUDY in job
     camera_study = CALIBRATION_STUDY if calibration else CAMERA_STUDY
     camera_case = job.get(camera_study)
-    focal_case = job.get(FOCAL_STUDY)
+    convergence_case = job.get(CONVERGENCE_STUDY)
+    focal_study = CONVERGENCE_STUDY if convergence_case else FOCAL_STUDY
+    focal_case = job.get(focal_study)
     if calibration and (config.camera_mode != "estimated" or job["known_pose_diagnostic"]):
         raise ValueError("Camera calibration requires blind initialization and estimated cameras")
     parent = load_dataset(job["dataset"])
@@ -218,7 +289,7 @@ def _run_job(job):
         "observation_ids": ids,
     }
     if (calibration or focal_case) and json_bytes(provenance) != json_bytes(job["expected_dataset"]):
-        label = FOCAL_STUDY if focal_case else "Camera calibration"
+        label = focal_study if focal_case else "Camera calibration"
         raise ValueError(f"{label} dataset or observation order differs from the generated source: {provenance}")
     started = perf_counter()
     model = load_benchmark_model(job["model_file"], dtype=job["dtype"], device=job["device"])
@@ -238,7 +309,8 @@ def _run_job(job):
             key: ObservationInitialization(rotations=model.tensor(rotation))
             for key, rotation in zip(ids, diagnostic.arrays["rotations"], strict=True)
         })
-    fit = fit_identity(model, observations, config, initial=initial)
+    fit_options = {"trace_stages": True} if convergence_case else {}
+    fit = fit_identity(model, observations, config, initial=initial, **fit_options)
     truth = dataset.ground_truth(subject)
     groups = _active_groups(config)
     train_identity = fit.selection.identity if "identity" in groups else ()
@@ -321,8 +393,19 @@ def _run_job(job):
         record["observability_status"] = spectra_status
         record["optimization"]["final_gradient"] = final_gradient(model, observations, fit, config.stages[-1].groups)
         record["history"] = [asdict(item) for item in fit.history]
-        focal_estimation.add_diagnostics(record, focal_case, truth, fit, _judge_targets(record["final"]))
-        focal_estimation.complete_record(record)
+        focal_estimation.add_diagnostics(
+            record, focal_case, truth, fit, _judge_targets(record["final"]), study=focal_study,
+        )
+        focal_estimation.complete_record(record, study=focal_study)
+    if convergence_case:
+        focal_convergence.add_diagnostics(record, fit)
+        if convergence_case["strategy"] == "P100":
+            diagnostic_started = perf_counter()
+            try:
+                _calibration_diagnostics(record, model, dataset, truth, observations, fit, job["spectra"])
+            except (ArithmeticError, RuntimeError, ValueError) as error:
+                record["calibration_diagnostics"] = {"status": "failed", "reason": str(error)}
+            record["runtime"]["calibration_diagnostics_seconds"] = perf_counter() - diagnostic_started
     if job["held_out_dataset"] is not None:
         record["held_out"] = _held_out(model, job, config, fit, truth)
     if "identity_studies" in job:
@@ -424,7 +507,7 @@ def _corrected_jobs(args):
             )
             dataset = generate_dataset(path, config, model_file=args.model_file)
             sources[key] = str(path)
-            if selected & {CALIBRATION_STUDY, FOCAL_STUDY}:
+            if selected & {CALIBRATION_STUDY, FOCAL_STUDY, CONVERGENCE_STUDY}:
                 subject, = dataset.subject_ids
                 dataset_provenance[str(path)] = {
                     "source_dataset_id": dataset.source_dataset_id, "evaluation_dataset_id": dataset.dataset_id,
@@ -434,14 +517,16 @@ def _corrected_jobs(args):
 
     def job(name, studies, dataset, seed, count, *, strict=True, held_out=False,
             identity_weight=0.0, expression_weight=0.0, camera_mode="known", camera_model=None,
-            joint_budget=None, focal_factor=None, focal_mode="fixed"):
-        budget = args.lm_iterations if joint_budget is None else (0, 0, joint_budget)
+            joint_budget=None, focal_factor=None, focal_mode="fixed", stage_budgets=None):
+        if joint_budget is not None:
+            stage_budgets = (0, 0, joint_budget)
+        budget = args.lm_iterations if stage_budgets is None else stage_budgets
         overrides = {
             "camera_mode": camera_mode, "camera_model": camera_model, "train_identity": ("head",),
             "identity_weight": identity_weight, "expression_weight": expression_weight,
             "lm": STRICT_LM if strict else LevenbergMarquardtConfig(),
         }
-        if joint_budget is not None:
+        if stage_budgets is not None:
             overrides.update(pose_weight=0.0, camera_weight=0.0)
         if focal_mode != "fixed":
             overrides.update(focal_mode=focal_mode, initial_focal_factor=focal_factor)
@@ -508,17 +593,24 @@ def _corrected_jobs(args):
                 camera_mode=case["camera_mode"], camera_model=camera,
                 joint_budget=case["joint_lm_budget"], focal_factor=case["focal_factor"],
             ) | {CALIBRATION_STUDY: case, "expected_dataset": dataset_provenance[path]}
-    if FOCAL_STUDY in selected:
-        for case in focal_estimation.case_matrix(args.seeds, args.focal_study_budget):
+    for study in (FOCAL_STUDY, CONVERGENCE_STUDY):
+        if study not in selected:
+            continue
+        cases = focal_estimation.case_matrix(args.seeds, args.focal_study_budget) if study == FOCAL_STUDY else (
+            focal_convergence.case_matrix(args.seeds, args.focal_strategies)
+        )
+        for case in cases:
             condition, seed, mode = case["condition"], case["seed"], case["camera_mode"]
             schedule = focal_estimation.HETEROGENEOUS_FACTORS if case["experiment"] == "B" else None
             path = source("C", seed, 9, camera="perspective", focal_schedule=schedule)
+            strategy = case.get("strategy")
+            case_name = f"{study}-{condition}-{seed}" + (f"-{strategy}" if strategy is not None else "")
             yield job(
-                f"{FOCAL_STUDY}-{condition}-{seed}", [FOCAL_STUDY], path, seed, 9,
+                case_name, [study], path, seed, 9,
                 camera_mode=mode, camera_model="perspective" if mode == "estimated" else None,
-                joint_budget=case["joint_lm_budget"], focal_factor=case["configured_initial_focal_factor"],
-                focal_mode=case["focal_mode"],
-            ) | {FOCAL_STUDY: case, "expected_dataset": dataset_provenance[path]}
+                joint_budget=case.get("joint_lm_budget"), focal_factor=case["configured_initial_focal_factor"],
+                focal_mode=case["focal_mode"], stage_budgets=focal_convergence.STRATEGIES.get(strategy),
+            ) | {study: case, "expected_dataset": dataset_provenance[path]}
 
 
 def _jobs(args):
@@ -701,8 +793,9 @@ def main(argv=None):
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--protocol", choices=("historical", "corrected-identity"), default="historical")
     parser.add_argument("--experiments", choices=tuple("ABCDEFGH"), nargs="+")
-    parser.add_argument("--identity-studies", choices=IDENTITY_STUDIES + (CAMERA_STUDY, CALIBRATION_STUDY, FOCAL_STUDY),
-                        nargs="+")
+    parser.add_argument("--identity-studies", choices=IDENTITY_STUDIES + (
+        CAMERA_STUDY, CALIBRATION_STUDY, FOCAL_STUDY, CONVERGENCE_STUDY,
+    ), nargs="+")
     parser.add_argument("--noise-levels", type=float, nargs="+", metavar="PX")
     parser.add_argument("--identity-weights", type=float, nargs="+")
     parser.add_argument("--expression-weights", type=float, nargs="+")
@@ -714,6 +807,9 @@ def main(argv=None):
     parser.add_argument("--focal-study-budget", type=int, metavar="JOINT",
                         help="explicit accepted joint LM update budget for focal-estimation (1–100)")
     parser.add_argument("--v51-report", type=Path, help="V5.1 camera-calibration report for matched focal controls")
+    parser.add_argument("--focal-strategies", nargs="+", choices=tuple(focal_convergence.STRATEGIES),
+                        help="explicit schedules for focal-convergence (default: all three)")
+    parser.add_argument("--v52-report", type=Path, help="archived V5.2 focal-estimation report for matched J100 comparisons")
     parser.add_argument("--scaling-full", action="store_true")
     parser.add_argument("--spectra", action="store_true",
                         help="initial spectra for A–C or both states in corrected studies")
@@ -731,6 +827,21 @@ def main(argv=None):
     corrected = args.protocol == "corrected-identity"
     calibration = CALIBRATION_STUDY in (args.identity_studies or ())
     focal = FOCAL_STUDY in (args.identity_studies or ())
+    convergence = CONVERGENCE_STUDY in (args.identity_studies or ())
+    if (args.focal_strategies is not None or args.v52_report is not None) and not (corrected and convergence):
+        parser.error("--focal-strategies and --v52-report require the corrected-identity focal-convergence study")
+    if corrected and convergence:
+        if args.identity_studies != [CONVERGENCE_STUDY]:
+            parser.error("select focal-convergence as the only identity study")
+        if args.lm_iterations is not None:
+            parser.error("focal-convergence uses the budgets defined by its explicit strategies")
+        if args.device != "cpu" or set(args.seeds) != set(focal_estimation.SEEDS):
+            parser.error("focal-convergence requires CPU and seeds 42 43 44")
+        args.focal_strategies = args.focal_strategies or tuple(focal_convergence.STRATEGIES)
+        if len(set(args.focal_strategies)) != len(args.focal_strategies):
+            parser.error("select each focal-convergence strategy once")
+        if args.v52_report is not None and "J100" not in args.focal_strategies:
+            parser.error("--v52-report requires the J100 strategy")
     if (args.focal_study_budget is not None or args.v51_report is not None) and not (corrected and focal):
         parser.error("--focal-study-budget and --v51-report require the corrected-identity focal-estimation study")
     if corrected and focal:
@@ -808,6 +919,17 @@ def main(argv=None):
             v51.get("cases"), list
         ):
             parser.error("--v51-report requires a detailed V5.1 camera-calibration report")
+    v52 = None
+    if args.v52_report is not None:
+        v52 = read_json(args.v52_report)
+        if (not isinstance(v52, dict) or v52.get("requested_identity_studies") != [FOCAL_STUDY]
+                or v52.get("focal_study_budget") != 100 or not isinstance(v52.get("cases"), list)
+                or not all(isinstance(case, dict) and isinstance(case.get(FOCAL_STUDY), dict)
+                           and {"seed", "condition"} <= case[FOCAL_STUDY].keys() for case in v52["cases"])):
+            parser.error("--v52-report requires a detailed V5.2 focal-estimation report with a 100-update budget")
+        keys = [(case[FOCAL_STUDY]["seed"], case[FOCAL_STUDY]["condition"]) for case in v52["cases"]]
+        if len(keys) != len(set(keys)):
+            parser.error("--v52-report contains duplicate V5.2 cases")
     args.output.mkdir(parents=True, exist_ok=False)
     jobs_path = args.output / "cases"
     jobs_path.mkdir()
@@ -829,6 +951,12 @@ def main(argv=None):
         report.update(adam_iterations=None, lm_iterations=None, camera_study_budgets=args.camera_study_budgets)
     if focal:
         report.update(adam_iterations=None, lm_iterations=None, focal_study_budget=args.focal_study_budget)
+    if convergence:
+        report.update(
+            adam_iterations=None, lm_iterations=None, focal_strategies=args.focal_strategies,
+            strategy_schedules={key: dict(zip(focal_convergence.STAGE_NAMES, budget, strict=True))
+                                for key, budget in focal_convergence.STRATEGIES.items()},
+        )
     report_path = args.output / "report.json"
     summary_path = args.output / "summary.json"
     failed = False
@@ -837,14 +965,15 @@ def main(argv=None):
         job["result"] = str(jobs_path / (job["case"] + ".result.json"))
         write_json(path, job)
         print(f"Running {job['case']}", flush=True)
-        worker_options = {"stderr": subprocess.PIPE, "text": True} if calibration or focal else {}
+        worker_options = {"stderr": subprocess.PIPE, "text": True} if calibration or focal or convergence else {}
         process = subprocess.run([sys.executable, "-m", __spec__.name, "--worker", str(path)],
                                  check=False, **worker_options)
         if process.returncode:
             failed = True
             result = {"case": job["case"], "experiment": job["experiment"], "status": "worker_failed",
                       "return_code": process.returncode}
-            if FOCAL_STUDY in job:
+            if focal or convergence:
+                study = CONVERGENCE_STUDY if convergence else FOCAL_STUDY
                 reason = f"Fitting worker exited with status {process.returncode}"
                 if process.stderr.strip():
                     reason = f"{reason}: {process.stderr.strip().splitlines()[-1]}"
@@ -853,7 +982,7 @@ def main(argv=None):
                               reference_targets=_judge_targets(None), worker_stderr=process.stderr,
                               observability_status={at: {"status": "unavailable", "reason": reason}
                                                     for at in ("initial", "final")} if args.spectra else {})
-                result[FOCAL_STUDY] = job[FOCAL_STUDY]
+                result[study] = job[study]
             if CAMERA_STUDY in job or CALIBRATION_STUDY in job:
                 study = CALIBRATION_STUDY if calibration else CAMERA_STUDY
                 reason = f"Fitting worker exited with status {process.returncode}"
@@ -888,13 +1017,22 @@ def main(argv=None):
                     ))
                 ):
                     failed = True
-            elif FOCAL_STUDY in result:
+            elif FOCAL_STUDY in result or CONVERGENCE_STUDY in result:
                 failed |= (
                     result["execution_status"] == "failed"
                     or not result["compatibility"]["matches_experimental_design"]
                     or result["optimization"]["final_gradient"]["status"] == "failed"
                     or any(item["status"] == "failed" for item in result["observability_status"].values())
                 )
+                if convergence:
+                    transition = result["stage_transition"] or {}
+                    calibration_diagnostics = result.get("calibration_diagnostics") or {}
+                    failed |= (
+                        transition.get("status") in ("discontinuous", "unavailable")
+                        or calibration_diagnostics.get("status") == "failed"
+                        or calibration_diagnostics.get("identity_frozen") is False
+                        or calibration_diagnostics.get("expression_frozen") is False
+                    )
             elif corrected and (
                 result["status"] in FAILED_STATUSES or not result["compatibility"]["fully_representable"]
                 or (result.get("held_out") or {}).get("status") in FAILED_STATUSES
@@ -921,6 +1059,18 @@ def main(argv=None):
             temporary = summary_path.with_suffix(".tmp")
             write_json(temporary, summary if calibration or focal else summarize_camera_study(report["cases"]))
             temporary.replace(summary_path)
+    if convergence:
+        summary = focal_convergence.summarize(report["cases"], args.focal_strategies, v52)
+        for key in ("comparisons", "aggregates", "historical_comparison", "optimization_prefix_tolerances"):
+            report[key] = summary[key]
+        failed |= any(
+            pair["common_prefix"] is None or pair["common_prefix"]["status"] != "matched"
+            for pair in summary["comparisons"]["budget_isolation"]
+        )
+        for path, content in ((report_path, report), (summary_path, summary)):
+            temporary = path.with_suffix(".tmp")
+            write_json(temporary, content)
+            temporary.replace(path)
     return int(failed)
 
 

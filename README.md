@@ -1456,3 +1456,53 @@ relative tolerance. Fitted and reference depths are recorded with the gauge
 status. Solver failures give a nonzero command exit status, including in
 intentionally incompatible conditions. Reports preserve each case and its
 termination reason.
+
+#### Focal convergence and initialization stability
+
+The opt-in `focal-convergence` study reuses V5.2's six Scenario C datasets
+with nine clean perspective observations each. It runs the 21 compatible
+trainable-focal configurations at three explicit accepted-update schedules.
+
+| Strategy | Pose and camera | Identity | Joint |
+| --- | ---: | ---: | ---: |
+| J100 | 0 | 0 | 100 |
+| J200 | 0 | 0 | 200 |
+| P100 | 20 | 0 | 80 |
+
+Each fit starts from the ordinary deterministic initializer. P100 first
+fits pose, camera translation, depth and the selected focal coordinates.
+Identity and expression stay frozen until the joint stage. Both stages use
+the same parameter object and the original camera reference coordinates.
+The solver initializes LM damping from the configuration at each executed
+stage. Stage budgets are independent. A calibration stage that converges or
+exhausts its budget can proceed to the joint stage. A failed calibration ends
+the fit. The production focal mode is fixed and the production stage budgets
+are 30, 70 and 100.
+
+Put the pinned model asset at `.gnm-cache/v3_0/gnm_head.npz` and use a fresh
+output directory.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-convergence \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --spectra --output outputs/identity-study-v5.3
+```
+
+The command runs all 63 cases. Select schedules explicitly with
+`--focal-strategies J100 J200`, for example. The reports include the ordered
+dataset identifiers, full optimizer histories, per-stage counters and the
+physical state and full objective on both sides of the P100 boundary.
+Boundary objective evaluations are counted separately from solver evaluations.
+P100's calibration metrics describe its frozen identity and expression state.
+With `--spectra`, the report includes both the active calibration spectrum
+and the prospective joint identity and focal spectra at that state.
+
+The dataset comparison uses independently regenerated V5.2 identifiers from
+the pinned source commit and checks observation order. Pass an archived
+detailed V5.2 report with `--v52-report` to compare matching J100
+configurations, snapshots and recorded trajectories. `summary.json` links
+each case to `report.json` and records matched comparisons, statuses and
+recovery targets. Solver failures retain their outcomes and give the study
+a nonzero exit status.

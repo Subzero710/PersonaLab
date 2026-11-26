@@ -21,6 +21,17 @@ class OptimizationUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptedState:
+    stage_iteration: int
+    objective: float
+    damping_after_update: float
+    full_identity_l2: float
+    trainable_identity_l2: float | None
+    focal_factors: tuple[float, ...] | None
+    camera_translations: list[list[float]]
+
+
+@dataclass(frozen=True, slots=True)
 class Trial:
     stage: str
     stage_iteration: int
@@ -97,7 +108,7 @@ def peak_rss_bytes():
 
 
 class FitMeasurements:
-    def __init__(self, device):
+    def __init__(self, device, *, trace_stages=False):
         self.device = device
         self.initial_objective = None
         self.last_objective = None
@@ -107,6 +118,19 @@ class FitMeasurements:
         self.updates = []
         self.trials = []
         self.linearizations = []
+        self.accepted_states = [] if trace_stages else None
+        self.stage_damping = None
+
+    def trace_accepted_state(self, parameters, count, values):
+        if self.accepted_states is None:
+            return
+        state = parameters.state(0, count)
+        update = self.updates[-1]
+        self.accepted_states.append(AcceptedState(
+            update.stage_iteration, values.total, self.stage_damping, finite_norm(state.identity),
+            finite_norm(parameters.identity) if parameters.identity is not None else None,
+            update.focal_factors, [camera.translation.tolist() for camera in state.cameras],
+        ))
 
     @contextmanager
     def time(self, phase):

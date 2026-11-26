@@ -76,7 +76,7 @@ def _direction(identity, focal, depth, names, singular):
     }
 
 
-def _focal_observability(data, parameters, layout, base, position, width, rtol, atol):
+def _focal_observability(data, parameters, layout, base, position, width, rtol, atol, stage_groups=()):
     names = parameters.selection.identity
     empty = position.identity.new_empty((0, width), dtype=torch.float64)
     identity_blocks = dict.fromkeys((
@@ -88,6 +88,7 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
     pose = locals_.get("pose")
     depth_column = locals_["camera_delta"].start + 2
     depth_rows, distinct_focals, raw_focal_norms = [], [], []
+    active_blocks = []
     rows = 0
     for index in range(len(data)):
         _, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
@@ -100,6 +101,12 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
             local = jacobian[:, width:]
             # Local focal is the final column, after camera translation.
             focal, other = local[:, -1:], local[:, :-1]
+        if stage_groups:
+            active = [local[:, columns] for name, columns in locals_.items()
+                      if PARAMETER_GROUPS[name] in stage_groups]
+            if layout.shared_focal and "camera" in stage_groups:
+                active.insert(0, focal)
+            active_blocks.append(torch.linalg.qr(torch.cat(active, dim=1), mode="r").R)
         raw_focal_norms.append(float(torch.linalg.vector_norm(focal)))
         expression_columns = local[:, expression] if expression is not None else local[:, :0]
         pose_columns = local[:, pose] if pose is not None else local[:, :0]
@@ -163,7 +170,7 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
             continue
         weight = getattr(parameters.config, f"{PARAMETER_GROUPS[name]}_weight")
         local_priors[name] = weight / getattr(parameters, name).numel()
-    return {
+    result = {
         "absolute_threshold": threshold,
         **{name: _describe(matrix, rows, threshold, rtol) for name, matrix in identity_blocks.items()},
         "joint_identity_and_focal": joint_record, "conditional_focal": conditional_record,
@@ -171,6 +178,16 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
         "fixed_nuisance_focal_column_l2": [math.hypot(*raw_focal_norms)] if layout.shared_focal else raw_focal_norms,
         "local_prior_jtj_diagonal": local_priors, "focal_prior_jtj_diagonal": 0.0,
     }
+    if active_blocks:
+        shared = int(layout.shared_focal and "camera" in stage_groups)
+        local = torch.block_diag(*(block[:, shared:] for block in active_blocks))
+        active = torch.cat((torch.cat([block[:, :shared] for block in active_blocks]), local), dim=1)
+        result["active_calibration"] = _describe(active, rows, threshold, rtol) | {
+            "parameter_groups": list(stage_groups),
+            "local_coordinates": [name for name in locals_ if PARAMETER_GROUPS[name] in stage_groups],
+            "shared_focal": bool(shared),
+        }
+    return result
 
 
 def _state(model, data, config, selection, initial, fit, at):
@@ -185,9 +202,12 @@ def _state(model, data, config, selection, initial, fit, at):
         or fit.observation_ids != data.ids or fit.selection != selection
     ):
         raise ValueError("Observability requires the same model, configuration and ordered observations as the fit")
-    snapshot = getattr(fit, at)
+    if at in ("initial", "final"):
+        snapshot = getattr(fit, at)
+    else:
+        snapshot = next((stage.after.state for stage in fit.stage_diagnostics if stage.name == at), None)
     if snapshot is None:
-        raise ValueError("The fit has no final snapshot")
+        raise ValueError(f"The fit has no {at} snapshot")
     # Evaluate the nuisance tangent at the actual camera, using local offsets from
     # that camera. Other native coordinates are copied directly from the snapshot.
     return TensorState(
@@ -199,7 +219,7 @@ def _state(model, data, config, selection, initial, fit, at):
 @torch.no_grad()
 def identity_observability(model, observations, config, *, initial=None, fit=None,
                            at="initial", rtol=1e-6, atol=0.0):
-    """Measure unregularized identity sensitivity at initialization or a fit snapshot.
+    """Measure unregularized sensitivity at initialization, final fit or focal calibration.
 
     Use the same landmark weights as fitting. One view is differentiated at a
     time and each stacked identity Jacobian is compressed by QR as views arrive.
@@ -209,8 +229,14 @@ def identity_observability(model, observations, config, *, initial=None, fit=Non
     atol = finite_number(atol, "Jacobian absolute tolerance")
     if not 0 < rtol < 1 or atol < 0:
         raise ValueError("Jacobian tolerances require 0 < rtol < 1 and atol >= 0")
+    stage_groups = ()
     if at not in ("initial", "final"):
-        raise ValueError("Observability state must be initial or final")
+        stage_groups = next((
+            stage.active_groups for stage in fit.stages
+            if stage.name == at and stage.status != "skipped"
+        ), ()) if isinstance(fit, FitResult) else ()
+        if config.focal_mode == "fixed" or stage_groups != ("pose", "camera"):
+            raise ValueError("Observability state must be initial, final or a traced focal calibration stage")
     if torch.is_inference_mode_enabled():
         raise ValueError("Jacobian analysis requires PyTorch autograd outside inference mode")
     validate_model(model)
@@ -225,11 +251,14 @@ def identity_observability(model, observations, config, *, initial=None, fit=Non
     base = parameters.values()
     position = layout.pack(base, model.reference, len(data))
     if config.focal_mode != "fixed":
-        return {
+        result = {
             "state": at, "observation_ids": list(data.ids), "identity_names": list(selection.identity),
             "identity_parameter_count": width, "relative_tolerance": rtol, "absolute_tolerance": atol,
             "identity_prior_jtj_diagonal": config.identity_weight / width, "focal_mode": config.focal_mode,
-        } | _focal_observability(data, parameters, layout, base, position, width, rtol, atol)
+        } | _focal_observability(data, parameters, layout, base, position, width, rtol, atol, stage_groups)
+        if stage_groups:
+            result["joint_parameter_groups"] = list(GROUPS)
+        return result
     expression_slice = layout.expression_slice()
 
     names = ("fixed_nuisance", "after_expression", "after_all_nuisance")

@@ -305,9 +305,10 @@ def test_checkpoint_states_and_deterministic_prefix_comparison():
     trace = {
         "status": "budget_exhausted", "reason": "joint: iteration budget reached", "final": {"scored": True},
         "optimization": {
-            "updates": [{"stage_iteration": i + 1} for i in range(60)],
-            "trials": [{"stage_iteration": i, "damping": 1e-7, "accepted": True} for i in range(60)],
-            "linearizations": [{"stage_iteration": i} for i in range(60)], "initial_objective": {"total": 7.0},
+            "updates": [{"stage": "joint", "stage_iteration": i + 1} for i in range(60)],
+            "trials": [{"stage": "joint", "stage_iteration": i, "damping": 1e-7, "accepted": True} for i in range(60)],
+            "linearizations": [{"stage": "joint", "stage_iteration": i} for i in range(60)],
+            "initial_objective": {"total": 7.0},
         },
         "history": [{"iteration": 60, "gradient_norms": {}, "losses": {"total": 1e-16}, "elapsed_seconds": 3.0}],
         "parameter_snapshots": {"initial": {"identity": [0.0]}}, "initialization": [],

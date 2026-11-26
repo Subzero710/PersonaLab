@@ -254,6 +254,7 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
     position = layout.pack(base, model.reference, len(data))
     expression_slice = layout.expression_slice()
     damping = options.initial_damping
+    measurements.stage_damping = damping
     best, stale = values.total, 0
     for index in range(stage.iterations):
         measurements.jacobian_evaluations += 1
@@ -333,10 +334,13 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
                     damping = max(options.minimum_damping, damping / 3)
                 elif ratio < 0.25:
                     damping = min(options.maximum_damping, damping * 4)
+                measurements.stage_damping = damping
+                measurements.trace_accepted_state(parameters, len(data), values)
                 break
             if damping >= options.maximum_damping:
                 return values, stats, "no_acceptable_step", f"damping limit reached ({reason})"
             damping = min(options.maximum_damping, damping * 4)
+            measurements.stage_damping = damping
         else:
             return values, stats, "no_acceptable_step", f"trial-step budget exhausted ({reason})"
 

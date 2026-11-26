@@ -11,10 +11,11 @@ import torch
 from .configuration import FitConfig
 from .initialization import initialize
 from .levenberg_marquardt import fit_stage as fit_lm_stage
+from .losses import evaluate_objective
 from .monitoring import FitMeasurements, OptimizationUpdate, finite_norm, peak_rss_bytes
 from .observations import prepare_observations
-from .parameters import FitInitialization, FittingParameters, resolve_selection, validate_model
-from .results import FAILED_STATUSES, FitResult, FitState, Iteration, StageSummary
+from .parameters import PARAMETER_GROUPS, FitInitialization, FittingParameters, resolve_selection, validate_model
+from .results import FAILED_STATUSES, FitResult, FitState, Iteration, StageBoundary, StageDiagnostics, StageSummary
 
 
 def _gradient_norms(active):
@@ -95,11 +96,28 @@ def _fit_adam_stage(model, data, parameters, stage, names, values, run, record):
     return values, stats, status, reason
 
 
-def fit_identity(model, observations, config=None, *, initial=None, progress=None) -> FitResult:
+def _stage_boundary(model, data, parameters):
+    """Evaluate the full LM objective in the live coordinates without affecting the solver trace."""
+    state = None
+    coordinates = {
+        name: value.detach().tolist() if (value := getattr(parameters, name)) is not None else None
+        for name in PARAMETER_GROUPS
+    }
+    try:
+        with torch.no_grad():
+            state = FitState.from_tensors(parameters.state(0, len(data)))
+        values, _ = evaluate_objective(model, data, parameters, least_squares=True)
+    except (ArithmeticError, RuntimeError, ValueError) as error:
+        return StageBoundary(state, coordinates, None, str(error))
+    return StageBoundary(state, coordinates, values, None)
+
+
+def fit_identity(model, observations, config=None, *, initial=None, progress=None, trace_stages=False) -> FitResult:
     """Fit a single subject using only observations, a verified model and explicit inputs.
 
     Configuration and initialization errors raise ValueError. Numerical failures
     during optimization return a failed result with no final parameters.
+    Opt-in LM stage diagnostics are kept in memory for benchmark reporting.
     """
     config = FitConfig() if config is None else config
     initial = FitInitialization() if initial is None else initial
@@ -109,6 +127,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         raise ValueError("Identity fitting requires PyTorch autograd outside inference mode")
     validate_model(model)
     use_adam = config.solver == "adam"
+    if trace_stages and use_adam:
+        raise ValueError("Stage tracing requires the Levenberg–Marquardt solver")
     device = model.reference.device
     started = perf_counter()
     data = prepare_observations(observations, model.reference, config)
@@ -123,11 +143,13 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     initialization_seconds = perf_counter() - started
 
     history, stages = [], []
-    run = FitMeasurements(device)
+    run = FitMeasurements(device, trace_stages=trace_stages)
+    stage_diagnostics = []
     initial_stats, final, final_stats = None, None, None
     status, reason = "budget_exhausted", "Iteration budget reached"
     stage_name = "initial evaluation"
     running_stage = None
+    trace_start = None
 
     def record(stage, stage_iteration, losses, stats, norms):
         log = Iteration(len(run.updates), stage, stage_iteration, losses, stats.overall,
@@ -135,6 +157,18 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         history.append(log)
         if progress is not None:
             progress(log)
+
+    def finish_trace(stage):
+        if trace_start is None:
+            return
+        boundary, objectives, jacobians, trials, updates = trace_start
+        stage_diagnostics.append(StageDiagnostics(
+            stage.name, boundary, _stage_boundary(model, data, parameters),
+            run.objective_evaluations - objectives, run.jacobian_evaluations - jacobians,
+            sum(not trial.accepted for trial in run.trials[trials:]),
+            config.lm.initial_damping if run.stage_damping is not None else None, run.stage_damping,
+            tuple(run.accepted_states[updates:]),
+        ))
 
     try:
         values, initial_stats = run.evaluate(model, data, parameters, least_squares=not use_adam)
@@ -155,6 +189,12 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
 
             before = len(run.updates)
             running_stage = (stage, names, before, start_loss)
+            if trace_stages:
+                run.stage_damping = None
+                trace_start = (
+                    _stage_boundary(model, data, parameters), run.objective_evaluations,
+                    run.jacobian_evaluations, len(run.trials), before,
+                )
             if use_adam:
                 values, current_stats, status, reason = _fit_adam_stage(
                     model, data, parameters, stage, names, values, run, record,
@@ -164,6 +204,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
                     model, data, parameters, stage, names, values, current_stats, run, record,
                 )
             steps = len(run.updates) - before
+            finish_trace(stage)
+            trace_start = None
             stages.append(StageSummary(stage.name, names, steps, status, start_loss, values.total, reason))
             reason = f"{stage.name}: {reason}"
             running_stage = None
@@ -180,6 +222,7 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         reason = f"{stage_name}: {error}"
         if running_stage is not None:
             stage, names, before, start_loss = running_stage
+            finish_trace(stage)
             stages.append(StageSummary(
                 stage.name, names, len(run.updates) - before, status, start_loss, run.last_objective.total, str(error),
             ))
@@ -204,5 +247,5 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             "jacobian_seconds": run.seconds["jacobian"] if not use_adam else None,
             "linear_solve_seconds": run.seconds["linear_solve"] if not use_adam else None,
         },
-        optimization=run.diagnostics(),
+        optimization=run.diagnostics(), stage_diagnostics=tuple(stage_diagnostics),
     )

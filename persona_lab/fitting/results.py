@@ -17,7 +17,7 @@ from ..correspondences import DFL_LANDMARK_COUNT
 from .configuration import FitConfig
 from .initialization import InitializationChoice
 from .losses import LossValues, PixelStatistics, Reprojection
-from .monitoring import Linearization, OptimizationDiagnostics, OptimizationUpdate, Trial, optimization_record
+from .monitoring import AcceptedState, Linearization, OptimizationDiagnostics, OptimizationUpdate, Trial, optimization_record
 from .parameters import ParameterSelection, TensorState, copy_camera, resolve_selection, validate_model
 
 
@@ -67,6 +67,27 @@ class FitState:
         return cls(*arrays, tuple(copy_camera(camera, device="cpu") for camera in state.cameras))
 
 
+@dataclass(frozen=True, slots=True)
+class StageBoundary:
+    state: FitState | None
+    coordinates: dict
+    objective: LossValues | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StageDiagnostics:
+    name: str
+    before: StageBoundary
+    after: StageBoundary
+    objective_evaluations: int
+    jacobian_evaluations: int
+    rejected_trials: int
+    initial_damping: float | None
+    final_damping: float | None
+    accepted_states: tuple[AcceptedState, ...]
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class FitResult:
     model: dict
@@ -86,6 +107,7 @@ class FitResult:
     reason: str
     runtime: dict
     optimization: OptimizationDiagnostics | None = None
+    stage_diagnostics: tuple[StageDiagnostics, ...] = ()
 
     @property
     def gauge(self):

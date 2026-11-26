@@ -50,7 +50,7 @@ def _factor(camera):
     return camera["focal_length"][0] / min(camera["image_size"])
 
 
-def _camera_row(item, before, after, fit, index, reference_root):
+def _camera_row(item, before, after, focal_mode, after_root, reference_root):
     reference = item["camera"]
     ref_focal = reference["focal_length"][0]
     fitted_focal = after["focal_length"][0] if after is not None else None
@@ -60,15 +60,15 @@ def _camera_row(item, before, after, fit, index, reference_root):
     if after is not None:
         mismatches = [name for name in ("image_size", "rotation", "principal_point")
                       if after[name] != reference[name]]
-        same_focal = (error == 0 if fit.config.focal_mode == "fixed" else error / ref_focal <= FOCAL_TARGET)
+        same_focal = (error == 0 if focal_mode == "fixed" else error / ref_focal <= FOCAL_TARGET)
         if not same_focal:
             mismatches.append("focal_length")
-        shared_root = np.array_equal(fit.final.translation[index], reference_root)
+        shared_root = np.array_equal(after_root, reference_root)
         if not shared_root:
             mismatches.append("root_translation")
     comparable = mismatches == []
     return {
-        "id": item["id"], "focal_mode": fit.config.focal_mode,
+        "id": item["id"], "focal_mode": focal_mode,
         "reference_focal_length_px": ref_focal, "initial_focal_length_px": before["focal_length"][0],
         "fitted_focal_length_px": fitted_focal, "absolute_focal_error_px": error,
         "relative_focal_error": error / ref_focal if error is not None else None,
@@ -81,7 +81,7 @@ def _camera_row(item, before, after, fit, index, reference_root):
         "translation_comparability": {
             "status": "unavailable" if mismatches is None else ("comparable" if comparable else "not_comparable"),
             "mismatched_fields": mismatches, "shared_root": shared_root,
-            "trainable_focal_relative_tolerance": FOCAL_TARGET if fit.config.focal_mode != "fixed" else None,
+            "trainable_focal_relative_tolerance": FOCAL_TARGET if focal_mode != "fixed" else None,
         },
         "translation_l2_m": float(np.linalg.norm(np.subtract(after["translation"], reference["translation"])))
         if comparable else None,
@@ -90,12 +90,13 @@ def _camera_row(item, before, after, fit, index, reference_root):
     }
 
 
-def add_diagnostics(record, case, truth, fit, targets):
+def add_diagnostics(record, case, truth, fit, targets, *, study=STUDY):
     initial = _snapshot(fit.initial)
     final = _snapshot(fit.final) if fit.final is not None else None
     cameras = [
         _camera_row(item, initial["cameras"][i], final["cameras"][i] if final is not None else None,
-                    fit, i, truth.arrays["translation"][i])
+                    fit.config.focal_mode, fit.final.translation[i] if final is not None else None,
+                    truth.arrays["translation"][i])
         for i, item in enumerate(truth.observations)
     ]
     reference_factors = [camera["reference_focal_factor"] for camera in cameras]
@@ -137,7 +138,7 @@ def add_diagnostics(record, case, truth, fit, targets):
                 status="evaluated" if camera["translation_l2_m"] is not None else "partially_evaluated",
             )
     record.update({
-        STUDY: case, "dataset_verified": True, "camera_recovery": cameras, "focal_recovery": focal,
+        study: case, "dataset_verified": True, "camera_recovery": cameras, "focal_recovery": focal,
         "reference_focal_factors": reference_factors, "initial_focal_factors": initial_factors,
         "final_focal_factors": final_factors, "identity_coefficient_norms": _identity_norms(fit),
         "parameter_snapshots": {"initial": initial, "final": final},
@@ -156,7 +157,7 @@ def add_diagnostics(record, case, truth, fit, targets):
     })
 
 
-def complete_record(record):
+def complete_record(record, *, study=STUDY):
     """Add derived report fields using the preserved metrics and optimizer trace."""
     if not record.get("dataset_verified"):
         return
@@ -172,7 +173,7 @@ def complete_record(record):
     record["optimization"]["checkpoints"] = _checkpoints(record)
     for at in ("initial", "final"):
         spectrum = record.get(f"{at}_identity_observability")
-        if spectrum is None or record[STUDY]["focal_mode"] != "fixed":
+        if spectrum is None or record[study]["focal_mode"] != "fixed":
             continue
         score = record[at]
         if at == "initial":
@@ -199,11 +200,11 @@ def _observability(spectrum):
             for name, block in spectrum.items() if isinstance(block, dict) and "rank" in block}
 
 
-def _case_row(index, record):
+def _case_row(index, record, *, study=STUDY):
     final = record.get("final")
     optimization = record.get("optimization") or {}
     return {
-        "case": record["case"], "report_case": f"report.json#/cases/{index}", **record[STUDY],
+        "case": record["case"], "report_case": f"report.json#/cases/{index}", **record[study],
         **{key: record.get(key) for key in DATASET_FIELDS},
         **{key: record.get(key) for key in (
             "dataset_verified", "status", "reason", "execution_status", "converged",

@@ -81,8 +81,9 @@ def _camera_changes(ids, initial, final):
 def _checkpoints(record):
     optimization = record["optimization"]
     updates = optimization["updates"]
-    trials = {item["stage_iteration"] + 1: item for item in optimization["trials"] if item["accepted"]}
-    linearizations = {item["stage_iteration"]: item for item in optimization["linearizations"]}
+    trials = {(item["stage"], item["stage_iteration"] + 1): item
+              for item in optimization["trials"] if item["accepted"]}
+    linearizations = {(item["stage"], item["stage_iteration"]): item for item in optimization["linearizations"]}
     losses = {item["iteration"]: item["losses"] for item in record["history"]}
     checkpoints = []
     for index in CHECKPOINTS:
@@ -90,11 +91,13 @@ def _checkpoints(record):
             checkpoints.append({"accepted_update": index, "status": "unavailable", "reason": record["reason"]})
             continue
         has_snapshot = index == len(updates) and record["final"] is not None
+        update = updates[index - 1]
+        stage, step = update["stage"], update["stage_iteration"]
         checkpoints.append({
-            "accepted_update": index, "status": "reached", "update": updates[index - 1],
-            "accepted_trial": trials[index], "objective_after_update": losses.get(index),
-            "linearization_before_update": linearizations.get(index - 1),
-            "linearization_after_update": linearizations.get(index),
+            "accepted_update": index, "status": "reached", "update": update,
+            "accepted_trial": trials[stage, step], "objective_after_update": losses.get(index),
+            "linearization_before_update": linearizations.get((stage, step - 1)),
+            "linearization_after_update": linearizations.get((stage, step)),
             "recovery_metrics": {
                 "status": "available", "case_pointer": "#/final",
             } if has_snapshot else {
