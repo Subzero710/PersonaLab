@@ -173,6 +173,13 @@ def test_requested_device_cold_start_and_isolated_diagnostic_failure(reference, 
     job = {"case": case, "config": _short_configuration(4).to_dict(), "model_file": str(model_file),
            "dataset": str(archive), "reference": provenance, "spectra": True, "result": str(result_path)}
     calls = []
+    from persona_lab.benchmark.dataset import BenchmarkDataset
+    original_truth = BenchmarkDataset.ground_truth
+    in_fit = False
+    def guarded_truth(dataset, subject):
+        assert not in_fit, "Ground truth entered the fitting function"
+        return original_truth(dataset, subject)
+    monkeypatch.setattr(BenchmarkDataset, "ground_truth", guarded_truth)
     load = focal_scalability.load_benchmark_model
 
     def inspect_load(*args, **kwargs):
@@ -185,7 +192,12 @@ def test_requested_device_cold_start_and_isolated_diagnostic_failure(reference, 
         assert all(item.known_camera is None and item.camera_initialization is None for item in observations)
         assert all(item.landmarks.device.type == device and item.landmarks.dtype == torch.float32
                    for item in observations)
-        fit = fit_identity(model, observations, config, initial=initial, trace_stages=trace_stages, profile=profile, progress=progress)
+        nonlocal in_fit
+        in_fit = True
+        try:
+            fit = fit_identity(model, observations, config, initial=initial, trace_stages=trace_stages, profile=profile, progress=progress)
+        finally:
+            in_fit = False
         assert not np.any(fit.initial.identity) and not np.any(fit.initial.expression)
         assert all(camera.focal_length.tolist() == [1.5 * min(camera.image_size.width, camera.image_size.height)] * 2
                    for camera in fit.initial.cameras)
@@ -201,6 +213,10 @@ def test_requested_device_cold_start_and_isolated_diagnostic_failure(reference, 
     assert len(calls) == 1 and calls[0].type == device
     assert row["actual_execution_device"].split(":")[0] == device and row["actual_dtype"] == "float32"
     assert row["dataset_verified"]
+    oracle = row["reference_precision"]
+    assert oracle["status"] == "evaluated" and not oracle["used_for_fitting"]
+    assert oracle["compensated_minus_archive"]["eligible_landmarks"] == 3400
+    assert len(oracle["truth_linearization"]["identity_step"]) == 170
     assert row["environment"]["determinism"]["float32_matmul_precision"] == "highest"
     assert not row["environment"]["determinism"]["cuda_matmul_allow_tf32"]
     assert row["execution_status"] == "completed" and row["final"] is not None
@@ -225,14 +241,14 @@ def test_batch_size_controls_lm_projection_and_preserves_numerics(reference, mon
     observations = dataset.fitting_observations(subject, dtype="float32", include_known_cameras=False)
     model = focal_scalability.load_benchmark_model(model_file, dtype="float32")
     from persona_lab.fitting import batched_jacobian
-    project_batch = batched_jacobian.project_fp32_batch
+    project_batch = batched_jacobian.residual_fp32_batch
     executed = []
 
-    def tracked(parameters, start, stop, values):
+    def tracked(data, parameters, start, stop, values):
         executed.append(stop - start)
-        return project_batch(parameters, start, stop, values)
+        return project_batch(data, parameters, start, stop, values)
 
-    monkeypatch.setattr(batched_jacobian, "project_fp32_batch", tracked)
+    monkeypatch.setattr(batched_jacobian, "residual_fp32_batch", tracked)
     first = fit_identity(model, observations, _short_configuration(1))
     assert set(executed) == {1}
     executed.clear()
@@ -258,7 +274,7 @@ def test_batch_size_controls_lm_projection_and_preserves_numerics(reference, mon
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_square_root_batched_jacobian_against_single_view(reference, device):
-    """The new derivative must agree with the old sparse reference on real GNM."""
+    """The batched derivative must agree with independent single-view derivatives on real GNM."""
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     from persona_lab.fitting.batched_jacobian import batch_jacobian

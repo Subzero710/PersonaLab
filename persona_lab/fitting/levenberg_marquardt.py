@@ -10,7 +10,7 @@ from .monitoring import Linearization, OptimizationUpdate, Trial, finite_norm
 from .parameters import FOCAL_PARAMETERS, InvalidGeometry, PARAMETER_GROUPS, SHARED_PARAMETERS
 from .schur import BlockVector, NormalBlocks, column_scales, damped_schur_step
 from .square_root import SquareRootBlocks, square_root_step
-from .batched_jacobian import batch_jacobian
+from .batched_jacobian import batch_jacobian, residual_fp32_batch
 
 
 def _lm_norm(*values):
@@ -82,6 +82,10 @@ class StageCoordinates:
 def observation_residual(data, parameters, layout, base, position, index, point):
     p = position.identity.numel()
     batch = layout.unpack(base.batch(index, index + 1), BlockVector(point[:p], point[None, p:]))
+    if lm_dtype(parameters.config) == torch.float32:
+        normalized, _ = residual_fp32_batch(data, parameters, index, index + 1, batch)
+        from .losses import _weighted
+        return _weighted(normalized, data, index, index + 1, dtype=torch.float32)
     state = parameters.state(index, index + 1, batch)
     landmarks = parameters.landmark_geometry(state.identity, state.expression, state.rotations, state.translation)
     projected = project_landmarks(landmarks, state.cameras, (data.ids[index],))
@@ -420,13 +424,13 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
                 break
             if damping >= options.maximum_damping:
                 if square_root and _precision_limited(values, scaled_norm, reason):
-                    return values, stats, "stopped", "FP32 precision-limited objective; recovery targets evaluated separately"
+                    return values, stats, "stopped", "FP32 small-residual stagnation; recovery targets evaluated separately"
                 return values, stats, "no_acceptable_step", f"damping limit reached ({reason})"
             damping = min(options.maximum_damping, damping * 4)
             measurements.stage_damping = damping
         else:
             if square_root and _precision_limited(values, scaled_norm, reason):
-                return values, stats, "stopped", "FP32 precision-limited objective; recovery targets evaluated separately"
+                return values, stats, "stopped", "FP32 small-residual stagnation; recovery targets evaluated separately"
             return values, stats, "no_acceptable_step", f"trial-step budget exhausted ({reason})"
 
         if config.improvement_tolerance is not None:

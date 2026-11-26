@@ -8,10 +8,8 @@ from dataclasses import replace
 
 import torch
 
-from ..camera import PerspectiveCamera, project
-from ..coordinates import gnm_to_frontal_axes
-from .losses import _landmark_residuals
-from .parameters import InvalidGeometry, stack_cameras
+from .precise_projection import perspective_residual
+from .parameters import InvalidGeometry
 
 
 def _require_supported(parameters, layout):
@@ -23,8 +21,8 @@ def _require_supported(parameters, layout):
         raise ValueError("FP32 square-root fitting currently requires the explicit zero-prior joint per-observation perspective protocol")
 
 
-def project_fp32_batch(parameters, start, stop, values):
-    """Same sparse residual forward for FP32 objectives and Jacobians."""
+def fp32_geometry_batch(parameters, start, stop, values):
+    """Shared sparse geometry and decoded physical camera for FP32 fitting."""
     count = stop - start
     initial = parameters.initial
     if (values.identity is None or values.expression is None or values.pose is None
@@ -35,10 +33,11 @@ def project_fp32_batch(parameters, start, stop, values):
                                                             values.identity.expand(count, -1))
     expression = initial.expression[start:stop].index_copy(1, parameters.expression_indices, values.expression)
     rotations = initial.rotations[start:stop].index_copy(1, parameters.head_indices, values.pose[:, None, :])
-    cameras = initial.cameras[start:stop]
-    if any(not isinstance(camera, PerspectiveCamera) or camera.image_size != cameras[0].image_size for camera in cameras):
-        raise ValueError("Batched FP32 Jacobian requires one perspective raster size")
-    camera = stack_cameras(cameras)
+    camera, matrices = parameters.fp32_camera_batch
+    camera = replace(camera, rotation=camera.rotation[start:stop],
+                     translation=camera.translation[start:stop],
+                     focal_length=camera.focal_length[start:stop],
+                     principal_point=camera.principal_point[start:stop])
     offsets = values.camera_delta
     initial_z = camera.translation[:, 2:]
     translation = torch.cat((camera.translation[:, :2] + offsets[:, :2] * initial_z,
@@ -46,10 +45,25 @@ def project_fp32_batch(parameters, start, stop, values):
     focal = camera.focal_length * values.local_log_focal.exp()
     camera = replace(camera, translation=translation, focal_length=focal)
     landmarks = parameters.landmark_geometry(identity, expression, rotations, initial.translation[start:stop])
+    rotated = (landmarks * landmarks.new_tensor((1, -1, -1))) @ matrices[start:stop].mT
+    return rotated, camera, landmarks
+
+
+def residual_fp32_batch(data, parameters, start, stop, values):
+    """Evaluate one common compensated residual for trials and derivatives."""
+    rotated, camera, _ = fp32_geometry_batch(parameters, start, stop, values)
+    indices = data.gnm_indices[start:stop, :, None].expand(-1, -1, 3)
+    mapped = rotated.gather(1, indices)
+    eligible = data.eligible[start:stop, :, None]
+    # Unsupported rows cannot affect the loss; use a finite centered target.
+    observed = torch.where(eligible, data.pixels[start:stop], camera.principal_point[:, None, :])
     try:
-        return project(gnm_to_frontal_axes(landmarks), camera)
+        pixels = perspective_residual(mapped, camera.translation, camera.focal_length,
+                                      camera.principal_point, observed)
     except ValueError as error:
         raise InvalidGeometry(str(error)) from error
+    pixels = pixels.masked_fill(~eligible, 0)
+    return pixels / data.short_edges[start:stop, None, None], pixels
 
 
 @torch.enable_grad()
@@ -61,8 +75,7 @@ def batch_jacobian(data, parameters, layout, position, start, stop):
     values = replace(parameters.values().batch(start, stop), identity=point[:, :width], **{
         name: point[:, width:][:, columns] for name, columns in layout.columns()
     })
-    projected = project_fp32_batch(parameters, start, stop, values)
-    normalized, _ = _landmark_residuals(projected, data, start, stop)
+    normalized, _ = residual_fp32_batch(data, parameters, start, stop, values)
     weights = (data.weights[start:stop] / data.weight_sum).sqrt()
     residual = (normalized * weights[..., None]).flatten(1)
     summed = residual.sum(0)
@@ -76,6 +89,6 @@ def batch_jacobian(data, parameters, layout, position, start, stop):
         gradient, = torch.autograd.grad(summed, point, grad_outputs=seeds,
                                         is_grads_batched=True, retain_graph=end < m)
         jacobian[:, begin:end] = gradient.transpose(0, 1)
-    if not torch.isfinite(residual).all() or not torch.isfinite(jacobian).all():
+    if not bool(torch.isfinite(residual).all() & torch.isfinite(jacobian).all()):
         raise FloatingPointError("Nonfinite batched residual or Jacobian")
     return residual.detach(), jacobian.detach()

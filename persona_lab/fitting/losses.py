@@ -113,13 +113,11 @@ def regularization_residual(parameters, name, value, start=0, stop=None):
 def _statistics(squared_pixels, counts):
     distances = squared_pixels.sqrt()
     total = counts.sum()
-    eligible = int(total)
-    overall = PixelStatistics(
-        eligible, squared_pixels.numel() - eligible,
-        float(distances.sum() / total),
-        float((squared_pixels.sum() / total).sqrt()),
-        float(distances.max()),
-    )
+    eligible_value, mean, rms, maximum = torch.stack((
+        total, distances.sum() / total, (squared_pixels.sum() / total).sqrt(), distances.max(),
+    )).cpu().tolist()
+    eligible = int(eligible_value)
+    overall = PixelStatistics(eligible, squared_pixels.numel() - eligible, mean, rms, maximum)
     values = torch.stack((
         counts, distances.sum(1) / counts, (squared_pixels.sum(1) / counts).sqrt(),
         distances.amax(1),
@@ -142,9 +140,10 @@ def evaluate_objective(model, data, parameters, active=(), *, candidate=None, le
             stop = min(start + batch_size, len(data))
             values = None if candidate is None else candidate.batch(start, stop)
             if least_squares and parameters.config.lm.arithmetic_dtype == "float32":
-                from .batched_jacobian import project_fp32_batch
-                projected = project_fp32_batch(parameters, start, stop,
+                from .batched_jacobian import residual_fp32_batch
+                normalized, pixel_residual = residual_fp32_batch(data, parameters, start, stop,
                     parameters.values().batch(start, stop) if values is None else values)
+                projected = None
             else:
                 state = parameters.state(start, stop, values)
                 projected = project_batch(
@@ -153,12 +152,13 @@ def evaluate_objective(model, data, parameters, active=(), *, candidate=None, le
                 )
                 del state
             if least_squares:
-                normalized, pixel_residual = _landmark_residuals(projected, data, start, stop)
+                if projected is not None:
+                    normalized, pixel_residual = _landmark_residuals(projected, data, start, stop)
                 loss = _weighted(normalized, data, start, stop, dtype=dtype).square().sum()
                 distances = pixel_residual.detach().to(dtype).square().sum(-1)
             else:
                 loss, distances = landmark_contribution(projected, data, start, stop)
-            if not torch.isfinite(loss) or not torch.isfinite(distances).all():
+            if not bool(torch.isfinite(loss) & torch.isfinite(distances).all()):
                 raise FloatingPointError("Nonfinite landmark objective or pixel distances")
             if active:
                 if not loss.requires_grad:

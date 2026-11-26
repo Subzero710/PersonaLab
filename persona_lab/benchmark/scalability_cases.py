@@ -4,7 +4,7 @@ from itertools import product
 
 
 STUDY = "focal-scalability"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BASE_COMMIT = "0f9940827d2444c10e6f60d0991ef485065a48db"
 SEEDS = (42, 43, 44)
 COUNTS = (50, 100, 300, 600)

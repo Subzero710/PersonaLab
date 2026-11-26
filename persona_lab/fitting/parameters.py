@@ -10,7 +10,7 @@ from torch import Tensor, nn
 
 from ..benchmark.dataset import _validate_model
 from ..benchmark.model import BenchmarkModel
-from ..camera import Camera, PerspectiveCamera, WeakPerspectiveCamera, _camera_batch
+from ..camera import Camera, PerspectiveCamera, WeakPerspectiveCamera, _camera_batch, _rotation_matrix
 from ..coordinates import _validate_tensor
 from ..gnm_geometry import SparseHeadLandmarks
 from .configuration import FitConfig
@@ -247,6 +247,17 @@ class FittingParameters:
             if config.focal_mode == "per-observation" else None
         )
         self._head = head
+
+    @cached_property
+    def fp32_camera_batch(self):
+        """Fixed camera fields and rotations, computed once per fit."""
+        cameras = self.initial.cameras
+        if any(not isinstance(c, PerspectiveCamera) or c.image_size != cameras[0].image_size
+               for c in cameras):
+            raise ValueError("Batched FP32 fitting requires one perspective raster size")
+        with torch.no_grad():
+            camera = stack_cameras(cameras)
+            return camera, _rotation_matrix(camera.rotation)
 
     @cached_property
     def landmark_geometry(self):

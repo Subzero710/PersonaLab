@@ -7,7 +7,7 @@ x-personalab: &personalab-common
     GNM_CACHE_DIR: /cache/gnm
     PYTEST_ADDOPTS: "-o cache_dir=/cache/gnm/.pytest_cache"
   volumes:
-    - ./datasets:/app/datasets:ro
+    - ./datasets:/app/datasets
     - ./models:/app/models:ro
     - ./outputs:/app/outputs
     - ./.gnm-cache:/cache/gnm

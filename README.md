@@ -1595,14 +1595,14 @@ disagreements independently of the exact-recovery target results. Matched
 time and memory growth is reported between adjacent verified counts, with
 per-linearization timing and update counts alongside total optimization time.
 
-V6.1 FP32 uses `lm.arithmetic_dtype: float32` and a square-root block QR solver.
+V6.2 FP32 uses `lm.arithmetic_dtype: float32` and a square-root block QR solver.
 The old normal-equation path remains exclusively in the explicitly configured
 FP64 LM mode. FP32 currently requires the zero-prior joint per-observation
 perspective protocol; unsupported configurations raise an error. The fitting
 objective and Jacobians use the same sparse GNM forward, while the independent
 full-native evaluator and all scientific targets are unchanged. Reference
 archives remain the V6 CPU FP32 archives (reference schema v2); the result
-schema is v3. TF32 remains disabled. Local Householder reflectors eliminate
+schema is v4. TF32 remains disabled. Local Householder reflectors eliminate
 local coordinates without forming a dense global Jacobian or J-transpose-J.
 
 Strict stopping tolerances are preserved. If all trial steps are rejected at
@@ -1621,3 +1621,37 @@ CPU and CUDA pilots, and choose a fresh output directory. Optionally add
 one separate initial linearization and QR solve into a Chrome trace; these
 runs are excluded from timing comparisons. A missing CUDA profiler is a
 reported diagnostic failure. No automatic CPU or FP64 fallback is permitted.
+
+### V6.2 compensated residual and reference precision audit
+
+The FP32 objective and both single-view and batched Jacobians now evaluate
+`(f * X - (observed - principal) * Z) / Z`, without rounding absolute
+predicted raster coordinates before subtraction. Error-free FP32 sums and
+products compensate the camera-space translation, observation centering
+and numerator products. The backward pass uses the analytic smooth
+perspective derivative evaluated in FP32 rather than differentiating
+discrete roundoff corrections. Fixed camera matrices are cached per fit,
+and finite checks and pixel-statistic transfers are grouped. The optimizer
+uses the original sparse GNM geometry, original selection, damping, QR,
+priors, scientific thresholds and original immutable raster observations.
+The independent full-native pixel/mesh evaluator is unchanged.
+
+The separate `reference_precision` phase runs only after publishing the
+blind fit. It replays the archived truth with full GNM single-view, sparse
+single-view, sparse batched and compensated residual evaluation on the
+requested device. It reports 3D and 2D path differences, stored pixel
+half-ULP envelopes, the truth-state objective and projected gradient, and
+one QR correction at the damping floor (never applied). This correction
+is a local bias diagnostic, not a lower bound on recovery error. The ULP
+envelope describes only the final raster rounding, not GNM or camera
+roundoff. No truth reaches the solver. The diagnostic time is separated
+from optimization; diagnostic failure is explicit and makes the benchmark
+return nonzero. Small-residual stagnation is still not convergence.
+
+Reuse the existing V6 archives and the V6.1 primary-only pilot commands,
+with a fresh V6.2 output directory. Reports use schema 4 and cannot be
+compared as matched V6.1 schema-3 runs. No device, precision or solver
+fallback; no regeneration of observations, and no automatic relaxation
+of the scientific targets. Neither a more accurate residual nor a full
+rank Jacobian guarantees recovery of exact latent coefficients from
+rounded observations.

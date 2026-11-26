@@ -19,6 +19,7 @@ from .configuration import torch_options
 from .focal_convergence import _stage_rows
 from .full_native_camera import final_gradient
 from .model import MODEL_SHA256, load_benchmark_model
+from .residual_precision import reference_precision
 from .scalability_cases import BASE_COMMIT, SCHEMA_VERSION, STUDY, case_matrix
 from .scalability_data import (
     REFERENCE_SCHEMA, SCHEDULE, generate_parent, load_parent, verified_subset, verify_fitter_input,
@@ -204,7 +205,7 @@ def run_worker(job, fit_function, score_fit):
                   f"objective={log.losses.total:.7g} rms_px={log.reprojection.rms_px:.7g} "
                   f"elapsed={log.elapsed_seconds:.2f}s device={model.reference.device}", flush=True)
 
-        print(f"{record['case']} fitting on {model.reference.device} FP32 square-root QR", flush=True)
+        print(f"{record['case']} fitting on {model.reference.device} FP32 square-root QR compensated residual", flush=True)
         fit = fit_function(model, observations, config, initial=None, trace_stages=True, profile=measurements,
                            progress=progress)
         measurements.start("fit_record_preparation")
@@ -223,6 +224,14 @@ def run_worker(job, fit_function, score_fit):
             score_fit(record, model, dataset, subject, fit)
         except (ArithmeticError, RuntimeError, ValueError, MemoryError) as error:
             _mark_failure(record, _failure(backend_failure(error) or error_kind, phase, error))
+        # The fit snapshot has already been published. Oracle truth is now
+        # permitted for this separate diagnostic only.
+        measurements.start("reference_precision")
+        try:
+            record["reference_precision"] = reference_precision(model, dataset, subject, observations, fit)
+        except (ArithmeticError, RuntimeError, TypeError, ValueError, MemoryError) as error:
+            record["reference_precision"] = {"status": "failed", "reason": str(error), "used_for_fitting": False}
+        measurements.end()
         measurements.start("final_gradient")
         record["optimization"]["final_gradient"] = final_gradient(model, observations, fit, config.stages[-1].groups)
         measurements.end()
@@ -405,6 +414,7 @@ def run(args, config_for, write_reports):
             "configurable": ["pose grid initialization", "sparse objective", "observation Jacobians", "local QR elimination"],
             "observation_jacobians": "independent batched view coordinates; bounded autograd residual-row batches",
             "schur": "square-root local QR elimination and shared residual QR; no normal equations",
+            "residual": "compensated homogeneous perspective FP32; immutable V6 raster observations",
         },
         "device_transfers": [
             "Dataset archives are loaded and validated on CPU. The verified model starts on CPU and moves to the requested device once.",
@@ -421,6 +431,7 @@ def run(args, config_for, write_reports):
                       or not (row["recovery"] or {}).get("exact_compatible_recovery")
                       or row["spectra_requested"] and not row["observability_complete"]
                       or row["final_gradient_status"] == "failed"
+                      or (row.get("reference_precision") or {}).get("status") != "evaluated"
                       or args.scalability_profile_kernels and (row.get("kernel_profile") or {}).get("status") != "evaluated"
                       for row in summary["cases"])
     return int(failed_case or any(pair["status"] != "consistent" for pair in summary["batching_consistency"]))
