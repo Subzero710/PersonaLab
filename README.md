@@ -1249,6 +1249,61 @@ original available for the summary's references.
 gzip -k outputs/identity-study-v5/report.json
 ```
 
+#### Camera calibration and convergence
+
+The V5.1 `camera-calibration` study uses nine clean, head-only Scenario C
+observations for each of seeds 42, 43 and 44. Each seed shares one dataset
+across the perspective cases and one across the weak-perspective cases.
+Each fit starts independently with the standard estimated-camera initializer.
+
+| Cases | Camera model | Fixed focal factor | Joint LM budgets |
+| --- | --- | ---: | --- |
+| A1, A2 | Estimated weak perspective | — | 60, 100 |
+| B1, B2 | Estimated perspective with calibrated intrinsics | 1.4 | 60, 100 |
+| C1, C2 | Estimated perspective with incorrect fixed intrinsics | 1.5 | 60, 100 |
+
+Perspective fits estimate camera translation with a prescribed focal length.
+For B1 and B2, the known focal factor is the only supplied calibration.
+The strict V5 joint LM criteria apply, with zero regularization for this
+diagnostic. Run from the repository root with the verified official asset
+at `.gnm-cache/v3_0/gnm_head.npz`.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies camera-calibration \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --camera-study-budgets 60 100 --spectra \
+  --output outputs/identity-study-v5.1
+```
+
+Select `camera-calibration` by itself and supply both budgets with
+`--camera-study-budgets`. The command writes 18 cases to
+`outputs/identity-study-v5.1/report.json` and one linked row per case to
+`outputs/identity-study-v5.1/summary.json`. The comparisons require verified
+source and evaluation dataset IDs, identical ordered observations and the
+same settings outside the varied factor or budget. Metric deltas subtract
+the first condition from the second. For a comparison with V5 condition C,
+check both dataset IDs, observation order and the recorded fit configuration
+with the joint budget omitted. B1 and B2 use a different focal factor from V5.
+
+The report preserves the complete available solver trace and snapshots at
+initialization and termination. Checkpoints at accepted updates 10, 20, 30,
+60 and 100 indicate which diagnostics and snapshot metrics are available.
+The budget comparisons check initial parameters and objectives, then the
+common prefixes of the accepted updates, trial records, linearizations and
+linearization-time iteration logs. Structural fields, integers, booleans and
+labels match exactly. Floats use relative tolerance `1e-10` and absolute
+tolerance `1e-15`. Elapsed times and budget-dependent stage-end rows are
+excluded from prefix checks.
+
+Convergence, execution status and the known-camera recovery references are
+reported independently. Budget exhaustion can retain final metrics. A solver
+failure keeps the original termination reason and available diagnostics.
+Geometry is scored in unaligned native meters. With `--spectra`, use the
+absolute singular values alongside local numerical ranks and condition numbers
+when comparing identity sensitivity.
+
 ## GNM Ecosystem Packages
 
 Here we list all the available GNM packages:

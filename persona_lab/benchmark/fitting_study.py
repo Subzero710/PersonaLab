@@ -18,6 +18,7 @@ from ..fitting.configuration import SOLVERS, LevenbergMarquardtConfig
 from ..fitting.monitoring import peak_rss_bytes
 from ..fitting.observability import identity_observability
 from ..fitting.results import FAILED_STATUSES
+from . import camera_calibration
 from .configuration import resolve_config
 from .dataset import camera_from_record, camera_to_record, load_dataset
 from .evaluate import _pool_expression, _pool_reprojection, _score_observation
@@ -37,6 +38,7 @@ from .storage import json_bytes, read_json, write_json
 
 COUNTS = (1, 5, 10, 25, 50, 100)
 IDENTITY_STUDIES = ("exact", "convergence", "count", "held-out", "robustness")
+CALIBRATION_STUDY = camera_calibration.STUDY
 STRICT_LM = LevenbergMarquardtConfig(
     scaled_gradient_tolerance=1e-12, minimum_damping=1e-12,
     native_step_tolerance=1e-6, scaled_step_tolerance=1e-10,
@@ -198,13 +200,23 @@ def _held_out(model, job, config, fit, training_truth):
 def _run_job(job):
     case_started = perf_counter()
     config = FitConfig.from_dict(job["config"])
-    camera_case = job.get(CAMERA_STUDY)
+    calibration = CALIBRATION_STUDY in job
+    camera_study = CALIBRATION_STUDY if calibration else CAMERA_STUDY
+    camera_case = job.get(camera_study)
+    if calibration and (config.camera_mode != "estimated" or job["known_pose_diagnostic"]):
+        raise ValueError("Camera calibration requires blind initialization and estimated cameras")
     parent = load_dataset(job["dataset"])
     subject, = parent.subject_ids
     ids = parent.observation_ids(subject)[:job["observations"]]
     if len(ids) != job["observations"]:
         raise ValueError("The source dataset does not contain the requested observation count")
     dataset = parent.select_observations(subject, ids)
+    provenance = {
+        "source_dataset_id": parent.source_dataset_id, "evaluation_dataset_id": dataset.dataset_id,
+        "observation_ids": ids,
+    }
+    if calibration and json_bytes(provenance) != json_bytes(job["expected_dataset"]):
+        raise ValueError(f"Camera calibration dataset or observation order differs from the generated source: {provenance}")
     started = perf_counter()
     model = load_benchmark_model(job["model_file"], dtype=job["dtype"], device=job["device"])
     load_seconds = perf_counter() - started
@@ -232,8 +244,7 @@ def _run_job(job):
     record = {
         "case": job["case"], "experiment": job["experiment"], "generation": parent.config.metadata(),
         "seed": job["seed"], "solver": config.solver, "config": asdict(config),
-        "observations": len(ids), "observation_ids": ids, "status": fit.status, "reason": fit.reason,
-        "source_dataset_id": parent.source_dataset_id, "evaluation_dataset_id": dataset.dataset_id,
+        "observations": len(ids), "status": fit.status, "reason": fit.reason, **provenance,
         "model_asset_sha256": model.metadata["asset_sha256"], "geometry_aligned": False,
         "budget": job["budget"], "known_pose_diagnostic": job["known_pose_diagnostic"],
         "selection": asdict(fit.selection), "gauge": fit.gauge,
@@ -294,7 +305,15 @@ def _run_job(job):
     if camera_case:
         record["observability_status"] = spectra_status
         record["optimization"]["final_gradient"] = final_gradient(model, observations, fit, config.stages[-1].groups)
-        _camera_study_result(record, camera_case, model, fit)
+        _camera_study_result(record, camera_case, model, fit, study=camera_study)
+    if calibration:
+        camera_calibration.add_diagnostics(record, fit, _judge_targets(record["final"]))
+        mismatched = record["representability_details"]["fixed_focal_gauge_observations"]
+        expected = list(ids) if camera_case["calibration_condition"] == "incorrect-fixed-intrinsics" else []
+        record.update(dataset_verified=True, focal_calibration_check={
+            "matches_expected": mismatched == expected,
+            "expected_mismatch_observation_ids": expected, "actual_mismatch_observation_ids": mismatched,
+        })
     if job["held_out_dataset"] is not None:
         record["held_out"] = _held_out(model, job, config, fit, truth)
     if "identity_studies" in job:
@@ -329,7 +348,7 @@ def _judge_targets(final):
     return scores
 
 
-def _camera_study_result(record, case, model, fit):
+def _camera_study_result(record, case, model, fit, *, study=CAMERA_STUDY):
     compatibility = record["compatibility"]
     native_names = model.metadata["identity_names"]
     regions = gnm_utils.identity_regions_indices(model.head)
@@ -345,7 +364,7 @@ def _camera_study_result(record, case, model, fit):
     all_targets_met = all(item["met"] for item in targets.values()) if final is not None else None
     spectrum = record.get("final_identity_observability")
     record.update({
-        CAMERA_STUDY: case,
+        study: case,
         "execution_status": "failed" if fit.status in FAILED_STATUSES else "completed",
         "converged": fit.status == "converged",
         "representability_status": classification["status"],
@@ -373,7 +392,9 @@ def _camera_study_result(record, case, model, fit):
 
 
 def _corrected_jobs(args):
+    selected = set(args.identity_studies)
     sources = {}
+    dataset_provenance = {}
 
     def source(scenario, seed, count, noise=0.0, *, camera="both", identity_selection="head"):
         key = (scenario, seed, count, noise, camera, identity_selection)
@@ -388,17 +409,30 @@ def _corrected_jobs(args):
             config = resolve_config(
                 scenario, seed=seed, observations_per_subject=count, camera=camera, **options,
             )
-            generate_dataset(path, config, model_file=args.model_file)
+            dataset = generate_dataset(path, config, model_file=args.model_file)
             sources[key] = str(path)
+            if CALIBRATION_STUDY in selected:
+                subject, = dataset.subject_ids
+                dataset_provenance[str(path)] = {
+                    "source_dataset_id": dataset.source_dataset_id, "evaluation_dataset_id": dataset.dataset_id,
+                    "observation_ids": dataset.observation_ids(subject),
+                }
         return sources[key]
 
     def job(name, studies, dataset, seed, count, *, strict=True, held_out=False,
-            identity_weight=0.0, expression_weight=0.0, camera_mode="known", camera_model=None):
-        config = _fit_config("levenberg-marquardt", args.lm_iterations, {
+            identity_weight=0.0, expression_weight=0.0, camera_mode="known", camera_model=None,
+            joint_budget=None, focal_factor=None):
+        budget = args.lm_iterations if joint_budget is None else (0, 0, joint_budget)
+        overrides = {
             "camera_mode": camera_mode, "camera_model": camera_model, "train_identity": ("head",),
             "identity_weight": identity_weight, "expression_weight": expression_weight,
             "lm": STRICT_LM if strict else LevenbergMarquardtConfig(),
-        })
+        }
+        if joint_budget is not None:
+            overrides.update(pose_weight=0.0, camera_weight=0.0)
+        if focal_factor is not None:
+            overrides["perspective_focal_per_short_edge"] = focal_factor
+        config = _fit_config("levenberg-marquardt", budget, overrides)
         both_spectra = args.spectra or "convergence" in studies
         return {
             "case": name, "experiment": "corrected-identity", "identity_studies": studies,
@@ -410,7 +444,6 @@ def _corrected_jobs(args):
             "spectra": both_spectra or count == 1, "final_spectra": both_spectra,
         }
 
-    selected = set(args.identity_studies)
     for seed in args.seeds:
         exact = [name for name in ("exact", "convergence") if name in selected]
         if exact:
@@ -451,6 +484,15 @@ def _corrected_jobs(args):
                 name, [CAMERA_STUDY], path, seed, 9,
                 camera_mode=mode, camera_model=camera if mode == "estimated" else None,
             ) | {CAMERA_STUDY: case}
+    if CALIBRATION_STUDY in selected:
+        for case in camera_calibration.case_matrix(args.seeds, args.camera_study_budgets):
+            condition, seed, camera = case["condition"], case["seed"], case["camera_model"]
+            path = source("C", seed, 9, camera=camera, identity_selection="head")
+            yield job(
+                f"{CALIBRATION_STUDY}-{condition}-{seed}", [CALIBRATION_STUDY], path, seed, 9,
+                camera_mode=case["camera_mode"], camera_model=camera,
+                joint_budget=case["joint_lm_budget"], focal_factor=case["focal_factor"],
+            ) | {CALIBRATION_STUDY: case, "expected_dataset": dataset_provenance[path]}
 
 
 def _jobs(args):
@@ -633,13 +675,15 @@ def main(argv=None):
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--protocol", choices=("historical", "corrected-identity"), default="historical")
     parser.add_argument("--experiments", choices=tuple("ABCDEFGH"), nargs="+")
-    parser.add_argument("--identity-studies", choices=IDENTITY_STUDIES + (CAMERA_STUDY,), nargs="+")
+    parser.add_argument("--identity-studies", choices=IDENTITY_STUDIES + (CAMERA_STUDY, CALIBRATION_STUDY), nargs="+")
     parser.add_argument("--noise-levels", type=float, nargs="+", metavar="PX")
     parser.add_argument("--identity-weights", type=float, nargs="+")
     parser.add_argument("--expression-weights", type=float, nargs="+")
     parser.add_argument("--seeds", type=int, nargs="+", default=(42, 43, 44))
     parser.add_argument("--adam-iterations", type=int, nargs=3)
     parser.add_argument("--lm-iterations", type=int, nargs=3, metavar=("POSE", "IDENTITY", "JOINT"))
+    parser.add_argument("--camera-study-budgets", type=int, nargs=2, metavar=("SHORT", "LONG"),
+                        help="explicit joint LM budgets for camera-calibration (60 100)")
     parser.add_argument("--scaling-full", action="store_true")
     parser.add_argument("--spectra", action="store_true",
                         help="initial spectra for A–C or both states in corrected studies")
@@ -655,6 +699,18 @@ def main(argv=None):
     if args.model_file is None or not Path(args.model_file).is_file():
         parser.error("--model-file must identify the existing pinned GNM asset")
     corrected = args.protocol == "corrected-identity"
+    calibration = CALIBRATION_STUDY in (args.identity_studies or ())
+    if args.camera_study_budgets is not None and not (corrected and calibration):
+        parser.error("--camera-study-budgets requires the corrected-identity camera-calibration study")
+    if corrected and calibration:
+        if args.identity_studies != [CALIBRATION_STUDY]:
+            parser.error("select camera-calibration as the only identity study")
+        if tuple(args.camera_study_budgets or ()) != camera_calibration.BUDGETS:
+            parser.error("camera-calibration requires --camera-study-budgets 60 100")
+        if args.lm_iterations is not None:
+            parser.error("camera-calibration takes its joint budgets from --camera-study-budgets exclusively")
+        if args.device != "cpu" or set(args.seeds) != set(camera_calibration.SEEDS):
+            parser.error("camera-calibration requires CPU and seeds 42 43 44")
     if corrected and args.adam_iterations is not None:
         parser.error("--adam-iterations requires the historical protocol")
     args.adam_iterations = args.adam_iterations or (30, 70, 900)
@@ -720,6 +776,8 @@ def main(argv=None):
                 "gaussian_noise_px": args.noise_levels, "identity_weights": args.identity_weights,
                 "expression_weights": args.expression_weights,
             }
+    if calibration:
+        report.update(adam_iterations=None, lm_iterations=None, camera_study_budgets=args.camera_study_budgets)
     report_path = args.output / "report.json"
     summary_path = args.output / "summary.json"
     failed = False
@@ -728,32 +786,41 @@ def main(argv=None):
         job["result"] = str(jobs_path / (job["case"] + ".result.json"))
         write_json(path, job)
         print(f"Running {job['case']}", flush=True)
-        process = subprocess.run([sys.executable, "-m", __spec__.name, "--worker", str(path)], check=False)
+        worker_options = {"stderr": subprocess.PIPE, "text": True} if calibration else {}
+        process = subprocess.run([sys.executable, "-m", __spec__.name, "--worker", str(path)],
+                                 check=False, **worker_options)
         if process.returncode:
             failed = True
             result = {"case": job["case"], "experiment": job["experiment"], "status": "worker_failed",
                       "return_code": process.returncode}
-            if CAMERA_STUDY in job:
+            if CAMERA_STUDY in job or CALIBRATION_STUDY in job:
+                study = CALIBRATION_STUDY if calibration else CAMERA_STUDY
                 reason = f"Fitting worker exited with status {process.returncode}"
+                if calibration and process.stderr.strip():
+                    reason = f"{reason}: {process.stderr.strip().splitlines()[-1]}"
                 result.update({
-                    CAMERA_STUDY: job[CAMERA_STUDY], "reason": reason,
+                    study: job[study], "reason": reason,
                     "execution_status": "failed", "converged": None, "final": None,
                     "representability_status": "unavailable",
                     "observability_status": {
                         at: {"status": "unavailable", "reason": reason} for at in ("initial", "final")
                     } if job["spectra"] else {},
                 })
+                if calibration:
+                    result.update(job["expected_dataset"], dataset_verified=False, config=job["config"],
+                                  worker_stderr=process.stderr, reference_targets=_judge_targets(None))
         else:
             result = read_json(Path(job["result"]))
             if result["experiment"] == "E" and result["generation"]["scenario"] == "C" and result["seed"] == 42:
                 _compare_reference(result, reference.get(result["observations"]))
-            if CAMERA_STUDY in result:
+            if CAMERA_STUDY in result or CALIBRATION_STUDY in result:
                 if (
                     result["execution_status"] == "failed"
                     or result["representability_status"] == "unexpected_incompatibility"
                     or result["optimization"]["final_gradient"]["status"] == "failed"
                     or any(item["status"] == "failed" for item in result["observability_status"].values())
                     or (result.get("historical_comparison") or {}).get("matches_source_dataset_id") is False
+                    or (calibration and not result["focal_calibration_check"]["matches_expected"])
                     or (result["final"] is not None and (
                         not result["final"]["fixed_identity_preserved"]
                         or not result["identity_error_floor"]["decomposition"]["valid"]
@@ -767,12 +834,21 @@ def main(argv=None):
                 failed = True
         report["cases"].append(result)
         report["count_study"] = _summarize_counts(report["cases"], corrected=corrected)
+        if calibration:
+            summary = camera_calibration.summarize(report["cases"])
+            report.update({key: summary[key] for key in (
+                "comparisons", "optimization_prefix_tolerances", "historical_comparison",
+            )})
+            failed |= any(
+                pair["status"] != "matched" or (pair["optimization_prefix"] or {}).get("status") == "discrepant"
+                for comparison in summary["comparisons"] for pair in comparison["pairs"]
+            )
         temporary = report_path.with_suffix(".tmp")
         write_json(temporary, report)
         temporary.replace(report_path)
-        if CAMERA_STUDY in result:
+        if calibration or CAMERA_STUDY in result:
             temporary = summary_path.with_suffix(".tmp")
-            write_json(temporary, summarize_camera_study(report["cases"]))
+            write_json(temporary, summary if calibration else summarize_camera_study(report["cases"]))
             temporary.replace(summary_path)
     return int(failed)
 
