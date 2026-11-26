@@ -1,13 +1,16 @@
 """Local Jacobian diagnostics for the active native parameter selection."""
 
 import math
+from functools import partial
 
 import torch
 
 from ..benchmark.configuration import finite_number
 from .configuration import GROUPS
 from .initialization import initialize
+from .losses import lm_dtype
 from .levenberg_marquardt import StageCoordinates, observation_jacobian
+from .batched_jacobian import batch_jacobian
 from .observations import prepare_observations
 from .parameters import (
     PARAMETER_GROUPS, FitInitialization, FittingParameters, TensorState, copy_camera, resolve_selection, validate_model,
@@ -15,10 +18,10 @@ from .parameters import (
 from .results import ARRAY_FIELDS, FitResult
 
 
-def _remove_nuisance(identity, nuisance, rtol):
+def _remove_nuisance(identity, nuisance, rtol, svd=torch.linalg.svd):
     if not nuisance.shape[1]:
         return identity
-    u, s, _ = torch.linalg.svd(nuisance, full_matrices=False)
+    u, s, _ = svd(nuisance, full_matrices=False)
     basis = u[:, s > s[0] * rtol]
     return identity - basis @ (basis.mT @ identity)
 
@@ -41,12 +44,12 @@ def _spectrum(matrix, values, threshold):
     }
 
 
-def _compress(previous, rows):
-    return torch.linalg.qr(torch.cat((previous, rows), dim=0), mode="r").R
+def _compress(previous, rows, qr=torch.linalg.qr):
+    return qr(torch.cat((previous, rows), dim=0), mode="r").R
 
 
-def _describe(matrix, rows, threshold, rtol):
-    values = torch.linalg.svdvals(matrix)
+def _describe(matrix, rows, threshold, rtol, svdvals=torch.linalg.svdvals):
+    values = svdvals(matrix)
     record = _spectrum(matrix, values, threshold)
     record["parameter_count"] = record.pop("identity_parameter_count")
     return record | {
@@ -57,8 +60,8 @@ def _describe(matrix, rows, threshold, rtol):
     }
 
 
-def _project_with_depth(columns, nuisance, depth_column, rtol):
-    u, singular, vh = torch.linalg.svd(nuisance, full_matrices=False)
+def _project_with_depth(columns, nuisance, depth_column, rtol, svd=torch.linalg.svd):
+    u, singular, vh = svd(nuisance, full_matrices=False)
     keep = singular > singular[0] * rtol
     basis = u[:, keep]
     coefficients = basis.mT @ columns
@@ -76,9 +79,18 @@ def _direction(identity, focal, depth, names, singular):
     }
 
 
-def _focal_observability(data, parameters, layout, base, position, width, rtol, atol, stage_groups=()):
+def _focal_observability(data, parameters, layout, base, position, width, rtol, atol,
+                         stage_groups=(), operations=None):
+    jacobian_at = observation_jacobian
+    qr, svd, svdvals, pinv = torch.linalg.qr, torch.linalg.svd, torch.linalg.svdvals, torch.linalg.pinv
+    if operations is not None:
+        jacobian_at = partial(operations.call, "diagnostic_jacobian", jacobian_at)
+        qr = partial(operations.call, "qr", qr)
+        svd = partial(operations.call, "svd", svd)
+        svdvals = partial(operations.call, "svdvals", svdvals)
+        pinv = partial(operations.call, "pinv", pinv)
     names = parameters.selection.identity
-    empty = position.identity.new_empty((0, width), dtype=torch.float64)
+    empty = position.identity.new_empty((0, width), dtype=lm_dtype(parameters.config))
     identity_blocks = dict.fromkeys((
         "fixed_nuisance", "after_expression", "after_expression_and_pose", "after_all_nuisance",
     ), empty)
@@ -90,8 +102,21 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
     depth_rows, distinct_focals, raw_focal_norms = [], [], []
     active_blocks = []
     rows = 0
-    for index in range(len(data)):
-        _, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
+    def jacobians():
+        if parameters.config.lm.arithmetic_dtype != "float32":
+            for index in range(len(data)):
+                yield jacobian_at(data, parameters, layout, base, position, index)[1]
+            return
+        batch = parameters.config.batch_size
+        for start in range(0, len(data), batch):
+            stop = min(len(data), start + batch)
+            args = (data, parameters, layout, position, start, stop)
+            _, jacobian = (batch_jacobian(*args) if operations is None else
+                           operations.call("diagnostic_jacobian_batch", batch_jacobian, *args))
+            for row, mask in zip(jacobian, data.eligible[start:stop], strict=True):
+                yield row[mask.repeat_interleave(2)]
+
+    for index, jacobian in enumerate(jacobians()):
         identity = jacobian[:, :width]
         rows += len(jacobian)
         if layout.shared_focal:
@@ -106,34 +131,36 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
                       if PARAMETER_GROUPS[name] in stage_groups]
             if layout.shared_focal and "camera" in stage_groups:
                 active.insert(0, focal)
-            active_blocks.append(torch.linalg.qr(torch.cat(active, dim=1), mode="r").R)
+            active_blocks.append(qr(torch.cat(active, dim=1), mode="r").R)
         raw_focal_norms.append(float(torch.linalg.vector_norm(focal)))
         expression_columns = local[:, expression] if expression is not None else local[:, :0]
         pose_columns = local[:, pose] if pose is not None else local[:, :0]
         blocks = {
             "fixed_nuisance": identity,
-            "after_expression": _remove_nuisance(identity, expression_columns, rtol),
+            "after_expression": _remove_nuisance(identity, expression_columns, rtol, svd),
             "after_expression_and_pose": _remove_nuisance(
-                identity, torch.cat((expression_columns, pose_columns), dim=1), rtol,
+                identity, torch.cat((expression_columns, pose_columns), dim=1), rtol, svd,
             ),
         }
-        adjusted, depth = _project_with_depth(torch.cat((identity, focal), dim=1), other, depth_column, rtol)
+        adjusted, depth = _project_with_depth(torch.cat((identity, focal), dim=1), other, depth_column, rtol, svd)
         depth_rows.append(depth)
         if layout.shared_focal:
-            joint = _compress(joint, adjusted)
+            joint = _compress(joint, adjusted, qr)
         else:
-            blocks["after_all_nuisance"] = _remove_nuisance(identity, local, rtol)
+            blocks["after_all_nuisance"] = _remove_nuisance(identity, local, rtol, svd)
             # Put the focal column first to leave exactly one focal-bearing row
             # per view. Compress the remaining identity-only rows as they arrive.
-            reduced = torch.linalg.qr(torch.cat((adjusted[:, -1:], adjusted[:, :-1]), dim=1), mode="r").R
+            reduced = qr(torch.cat((adjusted[:, -1:], adjusted[:, :-1]), dim=1), mode="r").R
             distinct_focals.append(reduced[0])
-            joint = _compress(joint, reduced[1:, 1:]) if index else reduced[1:, 1:]
+            joint = _compress(joint, reduced[1:, 1:], qr) if index else reduced[1:, 1:]
         for name, block in blocks.items():
-            identity_blocks[name] = _compress(identity_blocks[name], block)
+            identity_blocks[name] = _compress(identity_blocks[name], block, qr)
+        if operations is not None and (index + 1) % 32 == 0:
+            operations.drain()
 
     depths = torch.stack(depth_rows)
     if layout.shared_focal:
-        identity_blocks["after_all_nuisance"] = _remove_nuisance(joint[:, :width], joint[:, width:], rtol)
+        identity_blocks["after_all_nuisance"] = _remove_nuisance(joint[:, :width], joint[:, width:], rtol, svd)
     else:
         focal_rows = torch.stack(distinct_focals)
         focal_count = len(data)
@@ -142,11 +169,11 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
             torch.cat((focal_rows[:, 1:], focal_rows[:, 0].diag()), dim=1),
         ))
 
-    threshold = max(atol, rtol * float(torch.linalg.svdvals(identity_blocks["fixed_nuisance"])[0]))
-    conditional = _remove_nuisance(joint[:, width:], joint[:, :width], rtol)
-    joint_record = _describe(joint, rows, threshold, rtol)
-    conditional_record = _describe(conditional, rows, threshold, rtol)
-    _, _, vh = torch.linalg.svd(joint, full_matrices=True)
+    threshold = max(atol, rtol * float(svdvals(identity_blocks["fixed_nuisance"])[0]))
+    conditional = _remove_nuisance(joint[:, width:], joint[:, :width], rtol, svd)
+    joint_record = _describe(joint, rows, threshold, rtol, svdvals)
+    conditional_record = _describe(conditional, rows, threshold, rtol, svdvals)
+    _, _, vh = svd(joint, full_matrices=True)
 
     def describe_direction(direction, singular):
         identity, focal = direction[:width], direction[width:]
@@ -157,9 +184,9 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
         describe_direction(vh[index], joint_record["singular_values"][index])
         for index in range(len(vh) - 1, max(-1, len(vh) - 4), -1)
     ]
-    _, _, focal_vh = torch.linalg.svd(conditional, full_matrices=True)
+    _, _, focal_vh = svd(conditional, full_matrices=True)
     focal_direction = focal_vh[-1]
-    identity_direction = -torch.linalg.pinv(joint[:, :width], rtol=rtol) @ (joint[:, width:] @ focal_direction)
+    identity_direction = -pinv(joint[:, :width], rtol=rtol) @ (joint[:, width:] @ focal_direction)
     conditional_record["weakest_direction"] = describe_direction(
         torch.cat((identity_direction, focal_direction)), conditional_record["minimum_singular_value"],
     )
@@ -172,7 +199,7 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
         local_priors[name] = weight / getattr(parameters, name).numel()
     result = {
         "absolute_threshold": threshold,
-        **{name: _describe(matrix, rows, threshold, rtol) for name, matrix in identity_blocks.items()},
+        **{name: _describe(matrix, rows, threshold, rtol, svdvals) for name, matrix in identity_blocks.items()},
         "joint_identity_and_focal": joint_record, "conditional_focal": conditional_record,
         "focal_coordinate_names": focal_names,
         "fixed_nuisance_focal_column_l2": [math.hypot(*raw_focal_norms)] if layout.shared_focal else raw_focal_norms,
@@ -182,10 +209,18 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
         shared = int(layout.shared_focal and "camera" in stage_groups)
         local = torch.block_diag(*(block[:, shared:] for block in active_blocks))
         active = torch.cat((torch.cat([block[:, :shared] for block in active_blocks]), local), dim=1)
-        result["active_calibration"] = _describe(active, rows, threshold, rtol) | {
+        result["active_calibration"] = _describe(active, rows, threshold, rtol, svdvals) | {
             "parameter_groups": list(stage_groups),
             "local_coordinates": [name for name in locals_ if PARAMETER_GROUPS[name] in stage_groups],
             "shared_focal": bool(shared),
+        }
+    if operations is not None:
+        result["compressed_tensors"] = {
+            name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "device": str(tensor.device),
+                   "storage_bytes": tensor.numel() * tensor.element_size()}
+            for name, tensor in (identity_blocks | {
+                "joint_identity_and_focal": joint, "conditional_focal": conditional,
+            }).items()
         }
     return result
 
@@ -218,7 +253,7 @@ def _state(model, data, config, selection, initial, fit, at):
 
 @torch.no_grad()
 def identity_observability(model, observations, config, *, initial=None, fit=None,
-                           at="initial", rtol=1e-6, atol=0.0):
+                           at="initial", rtol=1e-6, atol=0.0, operations=None):
     """Measure unregularized sensitivity at initialization, final fit or focal calibration.
 
     Use the same landmark weights as fitting. One view is differentiated at a
@@ -255,14 +290,14 @@ def identity_observability(model, observations, config, *, initial=None, fit=Non
             "state": at, "observation_ids": list(data.ids), "identity_names": list(selection.identity),
             "identity_parameter_count": width, "relative_tolerance": rtol, "absolute_tolerance": atol,
             "identity_prior_jtj_diagonal": config.identity_weight / width, "focal_mode": config.focal_mode,
-        } | _focal_observability(data, parameters, layout, base, position, width, rtol, atol, stage_groups)
+        } | _focal_observability(data, parameters, layout, base, position, width, rtol, atol, stage_groups, operations)
         if stage_groups:
             result["joint_parameter_groups"] = list(GROUPS)
         return result
     expression_slice = layout.expression_slice()
 
     names = ("fixed_nuisance", "after_expression", "after_all_nuisance")
-    compressed = [model.reference.new_empty((0, width), dtype=torch.float64) for _ in names]
+    compressed = [model.reference.new_empty((0, width), dtype=lm_dtype(config)) for _ in names]
     for index in range(len(data)):
         _, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
         identity, nuisance = jacobian[:, :width], jacobian[:, width:]

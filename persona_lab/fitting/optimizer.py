@@ -12,7 +12,7 @@ from .configuration import FitConfig
 from .initialization import initialize
 from .levenberg_marquardt import fit_stage as fit_lm_stage
 from .losses import evaluate_objective
-from .monitoring import FitMeasurements, OptimizationUpdate, finite_norm, peak_rss_bytes
+from .monitoring import FitMeasurements, OptimizationUpdate, backend_failure, finite_norm, peak_rss_bytes
 from .observations import prepare_observations
 from .parameters import PARAMETER_GROUPS, FitInitialization, FittingParameters, resolve_selection, validate_model
 from .results import FAILED_STATUSES, FitResult, FitState, Iteration, StageBoundary, StageDiagnostics, StageSummary
@@ -112,12 +112,14 @@ def _stage_boundary(model, data, parameters):
     return StageBoundary(state, coordinates, values, None)
 
 
-def fit_identity(model, observations, config=None, *, initial=None, progress=None, trace_stages=False) -> FitResult:
+def fit_identity(model, observations, config=None, *, initial=None, progress=None,
+                 trace_stages=False, profile=None) -> FitResult:
     """Fit a single subject using only observations, a verified model and explicit inputs.
 
     Configuration and initialization errors raise ValueError. Numerical failures
     during optimization return a failed result with no final parameters.
     Opt-in LM stage diagnostics are kept in memory for benchmark reporting.
+    An optional benchmark profile is notified at the initialization and optimization boundaries.
     """
     config = FitConfig() if config is None else config
     initial = FitInitialization() if initial is None else initial
@@ -127,9 +129,13 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         raise ValueError("Identity fitting requires PyTorch autograd outside inference mode")
     validate_model(model)
     use_adam = config.solver == "adam"
+    if config.lm.arithmetic_dtype == "float32" and (use_adam or model.reference.dtype != torch.float32):
+        raise ValueError("FP32 LM arithmetic requires an FP32 model and Levenberg-Marquardt")
     if trace_stages and use_adam:
         raise ValueError("Stage tracing requires the Levenberg–Marquardt solver")
     device = model.reference.device
+    if profile is not None:
+        profile.start("initialization")
     started = perf_counter()
     data = prepare_observations(observations, model.reference, config)
     selection = resolve_selection(model, config)
@@ -141,15 +147,24 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         raise ValueError("No stage has an available trainable parameter group")
     initial_snapshot = FitState.from_tensors(initial_state)
     initialization_seconds = perf_counter() - started
+    if profile is not None:
+        profile.start("optimization")
 
     history, stages = [], []
-    run = FitMeasurements(device, trace_stages=trace_stages)
+    run = FitMeasurements(device, trace_stages=trace_stages, profile_operations=profile is not None)
     stage_diagnostics = []
     initial_stats, final, final_stats = None, None, None
     status, reason = "budget_exhausted", "Iteration budget reached"
     stage_name = "initial evaluation"
     running_stage = None
     trace_start = None
+    failure = None
+
+    def traced_boundary():
+        trace_started = perf_counter()
+        boundary = _stage_boundary(model, data, parameters)
+        run.stage_trace_seconds += perf_counter() - trace_started
+        return boundary
 
     def record(stage, stage_iteration, losses, stats, norms):
         log = Iteration(len(run.updates), stage, stage_iteration, losses, stats.overall,
@@ -163,7 +178,7 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             return
         boundary, objectives, jacobians, trials, updates = trace_start
         stage_diagnostics.append(StageDiagnostics(
-            stage.name, boundary, _stage_boundary(model, data, parameters),
+            stage.name, boundary, traced_boundary(),
             run.objective_evaluations - objectives, run.jacobian_evaluations - jacobians,
             sum(not trial.accepted for trial in run.trials[trials:]),
             config.lm.initial_damping if run.stage_damping is not None else None, run.stage_damping,
@@ -192,7 +207,7 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             if trace_stages:
                 run.stage_damping = None
                 trace_start = (
-                    _stage_boundary(model, data, parameters), run.objective_evaluations,
+                    traced_boundary(), run.objective_evaluations,
                     run.jacobian_evaluations, len(run.trials), before,
                 )
             if use_adam:
@@ -218,6 +233,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
                 final = FitState.from_tensors(parameters.state(0, len(data)))
             final_stats = current_stats
     except (FloatingPointError, RuntimeError, ValueError) as error:
+        if profile is not None:
+            failure = backend_failure(error)
         status = "failed" if use_adam else "numerical_failure"
         reason = f"{stage_name}: {error}"
         if running_stage is not None:
@@ -227,6 +244,16 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
                 stage.name, names, len(run.updates) - before, status, start_loss, run.last_objective.total, str(error),
             ))
 
+    instrumentation = {}
+    if profile is not None:
+        try:
+            operations = run.operations.record()
+        except RuntimeError as error:
+            operations = {"error": str(error)}
+        instrumentation = {
+            "operations": operations, "normal_system": run.normal_system,
+            "stage_trace_seconds": run.stage_trace_seconds, "infrastructure_failure": failure,
+        }
     elapsed = perf_counter() - started
     return FitResult(
         model=deepcopy(model.metadata), dtype=model.numpy_dtype.name,
@@ -246,6 +273,7 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             "objective_seconds": run.seconds["objective"],
             "jacobian_seconds": run.seconds["jacobian"] if not use_adam else None,
             "linear_solve_seconds": run.seconds["linear_solve"] if not use_adam else None,
+            **instrumentation,
         },
         optimization=run.diagnostics(), stage_diagnostics=tuple(stage_diagnostics),
     )

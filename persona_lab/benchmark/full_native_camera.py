@@ -5,7 +5,7 @@ from math import hypot, isclose, sqrt
 from statistics import mean, pstdev
 import sys
 
-from ..fitting.levenberg_marquardt import StageCoordinates, bound_mask, gradient_norms, normal_blocks
+from ..fitting.levenberg_marquardt import StageCoordinates, bound_mask, gradient_norms, normal_blocks, square_root_blocks
 from ..fitting.monitoring import finite_norm
 from ..fitting.observability import _state
 from ..fitting.observations import prepare_observations
@@ -105,14 +105,19 @@ def final_gradient(model, observations, fit, groups):
         layout = StageCoordinates.from_parameters(parameters, groups)
         base = parameters.values()
         point = layout.pack(base, model.reference, len(data))
-        system = normal_blocks(model, data, parameters, layout, base, point)
-        scales = column_scales(system, config.lm.diagonal_floor)
+        if config.lm.arithmetic_dtype == "float32":
+            system = square_root_blocks(data, parameters, layout, point)
+            scales = system.scales(config.lm.diagonal_floor)
+        else:
+            system = normal_blocks(model, data, parameters, layout, base, point)
+            scales = column_scales(system, config.lm.diagonal_floor)
         gradient = system.gradient
         active_bounds = bound_mask(point, gradient, layout.expression_slice(), config.expression_limit)
         norms = gradient_norms(layout, gradient, active_bounds)
         scaled = finite_norm(
             2 * scales.identity * gradient.identity,
             (2 * scales.local * gradient.local).masked_fill(active_bounds, 0),
+            dtype=gradient.identity.dtype,
         )
     except (ArithmeticError, RuntimeError, ValueError) as error:
         return {"status": "failed", "reason": str(error)}

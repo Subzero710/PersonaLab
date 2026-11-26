@@ -83,16 +83,20 @@ def landmark_contribution(projected, data, start, stop):
     return loss, residual.detach().square().sum(-1)
 
 
-def weighted_landmark_residuals(projected, data, start, stop):
+def lm_dtype(config):
+    return {"float32": torch.float32, "float64": torch.float64}[config.lm.arithmetic_dtype]
+
+
+def weighted_landmark_residuals(projected, data, start, stop, *, dtype=torch.float64):
     """Square-root weighting with the full dataset's eligible weight sum."""
     normalized, _ = _landmark_residuals(projected, data, start, stop)
-    return _weighted(normalized, data, start, stop)
+    return _weighted(normalized, data, start, stop, dtype=dtype)
 
 
-def _weighted(normalized, data, start, stop):
+def _weighted(normalized, data, start, stop, *, dtype=torch.float64):
     mask = data.eligible[start:stop]
-    scale = (data.weights[start:stop][mask].double() / data.weight_sum.double()).sqrt()
-    return (normalized[mask].double() * scale[:, None]).flatten()
+    scale = (data.weights[start:stop][mask].to(dtype) / data.weight_sum.to(dtype)).sqrt()
+    return (normalized[mask].to(dtype) * scale[:, None]).flatten()
 
 
 def regularization_residual(parameters, name, value, start=0, stop=None):
@@ -100,10 +104,10 @@ def regularization_residual(parameters, name, value, start=0, stop=None):
     group = PARAMETER_GROUPS[name]
     strength = 0.0 if name in FOCAL_PARAMETERS else getattr(parameters.config, f"{group}_weight")
     if strength == 0:
-        return torch.zeros_like(value, dtype=torch.float64), 0.0
+        return torch.zeros_like(value, dtype=lm_dtype(parameters.config)), 0.0
     slope = math.sqrt(strength / getattr(parameters, name).numel())
     delta = parameters.penalty_delta(name, value, start, stop)
-    return delta.double() * slope, slope
+    return delta.to(lm_dtype(parameters.config)) * slope, slope
 
 
 def _statistics(squared_pixels, counts):
@@ -130,22 +134,28 @@ def _statistics(squared_pixels, counts):
 def evaluate_objective(model, data, parameters, active=(), *, candidate=None, least_squares=False):
     """Backpropagate each batch, then apply the global regularizers once."""
     batch_size = parameters.config.batch_size
-    dtype = torch.float64 if least_squares else model.reference.dtype
+    dtype = lm_dtype(parameters.config) if least_squares else model.reference.dtype
     landmarks = model.reference.new_zeros((), dtype=dtype)
     squared_pixels = []
     with torch.set_grad_enabled(bool(active)):
         for start in range(0, len(data), batch_size):
             stop = min(start + batch_size, len(data))
             values = None if candidate is None else candidate.batch(start, stop)
-            state = parameters.state(start, stop, values)
-            projected = project_batch(
-                model, state, tuple(obs.observation_id for obs in data.observations[start:stop]),
-                check_geometry=least_squares,
-            )
+            if least_squares and parameters.config.lm.arithmetic_dtype == "float32":
+                from .batched_jacobian import project_fp32_batch
+                projected = project_fp32_batch(parameters, start, stop,
+                    parameters.values().batch(start, stop) if values is None else values)
+            else:
+                state = parameters.state(start, stop, values)
+                projected = project_batch(
+                    model, state, tuple(obs.observation_id for obs in data.observations[start:stop]),
+                    check_geometry=least_squares,
+                )
+                del state
             if least_squares:
                 normalized, pixel_residual = _landmark_residuals(projected, data, start, stop)
-                loss = _weighted(normalized, data, start, stop).square().sum()
-                distances = pixel_residual.detach().double().square().sum(-1)
+                loss = _weighted(normalized, data, start, stop, dtype=dtype).square().sum()
+                distances = pixel_residual.detach().to(dtype).square().sum(-1)
             else:
                 loss, distances = landmark_contribution(projected, data, start, stop)
             if not torch.isfinite(loss) or not torch.isfinite(distances).all():
@@ -156,7 +166,7 @@ def evaluate_objective(model, data, parameters, active=(), *, candidate=None, le
                 loss.backward()
             landmarks = landmarks + loss.detach()
             squared_pixels.append(distances)
-            del state, projected, loss
+            del projected, loss
 
         missing = [name for name, parameter in active if parameter.grad is None]
         if missing:

@@ -102,8 +102,11 @@ class LevenbergMarquardtConfig:
     jacobian_rows: int = 8
     native_step_tolerance: float | None = None
     scaled_step_tolerance: float | None = None
+    arithmetic_dtype: str = "float64"
 
     def __post_init__(self):
+        if self.arithmetic_dtype not in ("float32", "float64"):
+            raise ValueError("LM arithmetic_dtype must be float32 or float64")
         for name in ("max_trials", "jacobian_rows"):
             _integer(getattr(self, name), name, 1)
         for name in (
@@ -230,6 +233,8 @@ class FitConfig:
     def to_dict(self):
         """Keep the established fixed-focal configuration representation."""
         options = asdict(self)
+        if self.lm.arithmetic_dtype == "float64":
+            del options["lm"]["arithmetic_dtype"]
         if self.focal_mode == "fixed":
             del options["focal_mode"], options["initial_focal_factor"]
         return options

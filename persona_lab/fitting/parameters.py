@@ -317,7 +317,8 @@ class FittingParameters:
         if log_focal is None:
             return None
         initial = torch.stack([camera.focal_length[0] for camera in self.initial.cameras])
-        return tuple(((initial * log_focal.exp()).double() / self.short_edges).tolist())
+        dtype = {"float32": torch.float32, "float64": torch.float64}[self.config.lm.arithmetic_dtype]
+        return tuple(((initial * log_focal.exp()).to(dtype) / self.short_edges).tolist())
 
     def penalty_delta(self, name, value, start=0, stop=None):
         if name == "pose":

@@ -1506,3 +1506,118 @@ configurations, snapshots and recorded trajectories. `summary.json` links
 each case to `report.json` and records matched comparisons, statuses and
 recovery targets. Solver failures retain their outcomes and give the study
 a nonzero exit status.
+
+### Issue #5 V6 CPU and CUDA scalability
+
+The explicit `corrected-identity` study `focal-scalability` uses float32 J200
+with estimated perspective cameras, one log focal coordinate per observation,
+and a starting focal factor of 1.5. It fits a head-only synthetic identity
+with the V5.3 native parameter selection and clean exact-recovery targets.
+Each case starts from the deterministic initializer. The default V6 matrix
+covers seeds 42–44 and 50, 100, 300, and 600 observations on each requested
+device. An additional study compares batch sizes 1, 4, 16, and 32 at seed
+42 and 100 observations, with one shared batch-size-4 result per device.
+
+Place the pinned GNM v3.0 Head file at `.gnm-cache/v3_0/gnm_head.npz`.
+Run from the repository root with fresh output directories.
+
+```sh
+mkdir -p datasets models outputs .gnm-cache/v3_0
+export PERSONALAB_UID="$(id -u)" PERSONALAB_GID="$(id -g)"
+printf '%s  %s\n' \
+  '61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb' \
+  '.gnm-cache/v3_0/gnm_head.npz' | sha256sum -c -
+
+docker compose build personalab
+docker compose run --rm -e PERSONALAB_GNM_MODEL_FILE=/cache/gnm/v3_0/gnm_head.npz \
+  personalab python -m pytest -v tests
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float32 \
+  --seeds 42 43 44 --scalability-counts 50 100 300 600 --scalability-batch-size 4 \
+  --spectra --output outputs/identity-study-v6-cpu
+
+docker compose --profile cuda build personalab-cuda
+docker compose --profile cuda run --rm -e PERSONALAB_GNM_MODEL_FILE=/cache/gnm/v3_0/gnm_head.npz \
+  personalab-cuda python -m pytest -v tests
+docker compose --profile cuda run --rm personalab-cuda python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cuda --dtype float32 \
+  --seeds 42 43 44 --scalability-counts 50 100 300 600 --scalability-batch-size 4 \
+  --scalability-datasets-in outputs/identity-study-v6-cpu/datasets \
+  --spectra --output outputs/identity-study-v6-cuda
+
+docker compose run --rm personalab python -m persona_lab.benchmark.scalability_report \
+  --cpu-report outputs/identity-study-v6-cpu/report.json \
+  --cuda-report outputs/identity-study-v6-cuda/report.json \
+  --output outputs/identity-study-v6-comparison
+```
+
+The CPU command creates three 600-observation Scenario C parents and an index
+in its `datasets/` directory. Use `--scalability-datasets-out` to choose
+another fresh reference directory. CUDA requires `--scalability-datasets-in`
+with that index and its archives. Each case verifies the archive hashes, the
+ordered parent prefix, its full scientific input hash, and the landmarks,
+masks and weights on the fitting device. The focal factors repeat on the same
+cycle as the nine Scenario C viewpoints. The reports give actual viewpoint,
+expression preset and focal counts for every subset. Repeated viewpoints and
+expressions should be interpreted in the context of those distributions.
+
+Each device writes `report.json` and `summary.json` under its output directory.
+The comparison writes `comparison.json` under its output directory. Detailed
+reports retain native parameter snapshots, camera and geometry recovery,
+optimization histories and each selected singular spectrum. Use `--spectra`
+to request both initial and final observability. A diagnostic failure is
+recorded alongside the saved fit. Reports identify failed and unexecuted
+cases, including unavailable CUDA devices and invalid datasets.
+
+Batch size sets the pose grid, sparse objective, batched observation Jacobian
+and local QR elimination batch sizes. V6.1 computes independent per-view
+Jacobians in observation batches and eliminates local blocks by Householder QR. The observation count and actual
+accepted updates are reported with per-observation objective and Jacobian
+timings. Reported Schur time includes damping. Observation-Jacobian
+construction and column equilibration have their own measurements.
+
+Worker timings use elapsed wall time for CPU and synchronize CUDA at phase
+boundaries. CUDA operation timings use stream events. The trace, event
+bookkeeping, diagnostic and serialization costs have separate fields.
+Generation time is recorded per parent. Worker wall time includes process
+startup, and optimization time covers the fitting phase only. RSS
+high-water marks cover the whole worker, and Linux phase RSS uses 20 ms
+samples and phase boundary readings. CUDA peaks record allocated and
+reserved memory separately. The report times host and device copies used by
+model transfer, input verification, scoring and record creation.
+
+For paired numerical comparisons, each field uses an absolute tolerance
+plus a relative tolerance against the larger magnitude of the two values.
+The comparison JSON lists the tolerances, exact rank checks, and any
+disagreements independently of the exact-recovery target results. Matched
+time and memory growth is reported between adjacent verified counts, with
+per-linearization timing and update counts alongside total optimization time.
+
+V6.1 FP32 uses `lm.arithmetic_dtype: float32` and a square-root block QR solver.
+The old normal-equation path remains exclusively in the explicitly configured
+FP64 LM mode. FP32 currently requires the zero-prior joint per-observation
+perspective protocol; unsupported configurations raise an error. The fitting
+objective and Jacobians use the same sparse GNM forward, while the independent
+full-native evaluator and all scientific targets are unchanged. Reference
+archives remain the V6 CPU FP32 archives (reference schema v2); the result
+schema is v3. TF32 remains disabled. Local Householder reflectors eliminate
+local coordinates without forming a dense global Jacobian or J-transpose-J.
+
+Strict stopping tolerances are preserved. If all trial steps are rejected at
+a near-roundoff objective (normalized residual RMS <= 4 FP32 eps and scaled
+gradient <= 8 FP32 eps), the result is explicitly `stopped`, not `converged`.
+Strict convergence, target recovery and infrastructure status remain separate.
+For a failed optimizer, the last valid committed state is scored in
+`last_accepted_evaluation`, never substituted for a successful final fit.
+CPU/CUDA comparison tolerances are unchanged and may expose differences.
+
+Worker progress is streamed. Use `--scalability-primary-only` for an explicit
+pilot without the batching sweep, for example one seed (42) and count (50).
+Reuse the verified V6 FP32 datasets with `--scalability-datasets-in` for both
+CPU and CUDA pilots, and choose a fresh output directory. Optionally add
+`--scalability-profile-kernels` to a single CUDA primary-only case to capture
+one separate initial linearization and QR solve into a Chrome trace; these
+runs are excluded from timing comparisons. A missing CUDA profiler is a
+reported diagnostic failure. No automatic CPU or FP64 fallback is permitted.

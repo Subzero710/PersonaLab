@@ -99,12 +99,17 @@ class BenchmarkModel:
         return landmarks
 
 
-def load_benchmark_model(model_file=None, *, dtype="float64", device="cpu"):
+def load_benchmark_model(model_file=None, *, dtype="float64", device="cpu", profile=None):
     """Load the verified GNM asset through PersonaLab's existing PyTorch loader."""
     dtype, device = torch_options(dtype, device)
     path = Path(model_file) if model_file is not None else _cached_asset()
     checksum = _verify_asset(path)
-    head = load_head_model(path).to(device=device, dtype=dtype)
+    head = load_head_model(path)
+    if profile is not None:
+        profile.start("model_device_transfer")
+    head = head.to(device=device, dtype=dtype)
+    if profile is not None:
+        profile.start("model_metadata")
     landmarks = load_sparse_landmarks(head)
     triangles = head.triangles.detach().cpu().numpy().copy()
     metadata = {

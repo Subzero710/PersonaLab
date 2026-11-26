@@ -5,10 +5,16 @@ import math
 
 import torch
 
-from .losses import project_landmarks, regularization_residual, weighted_landmark_residuals
+from .losses import lm_dtype, project_landmarks, regularization_residual, weighted_landmark_residuals
 from .monitoring import Linearization, OptimizationUpdate, Trial, finite_norm
 from .parameters import FOCAL_PARAMETERS, InvalidGeometry, PARAMETER_GROUPS, SHARED_PARAMETERS
 from .schur import BlockVector, NormalBlocks, column_scales, damped_schur_step
+from .square_root import SquareRootBlocks, square_root_step
+from .batched_jacobian import batch_jacobian
+
+
+def _lm_norm(*values):
+    return finite_norm(*values, dtype=values[0].dtype)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +85,7 @@ def observation_residual(data, parameters, layout, base, position, index, point)
     state = parameters.state(index, index + 1, batch)
     landmarks = parameters.landmark_geometry(state.identity, state.expression, state.rotations, state.translation)
     projected = project_landmarks(landmarks, state.cameras, (data.ids[index],))
-    return weighted_landmark_residuals(projected, data, index, index + 1)
+    return weighted_landmark_residuals(projected, data, index, index + 1, dtype=lm_dtype(parameters.config))
 
 
 @torch.enable_grad()
@@ -112,19 +118,23 @@ def observation_jacobian(data, parameters, layout, base, position, index):
 
 
 @torch.no_grad()
-def normal_blocks(model, data, parameters, layout, base, position):
-    """Accumulate double-precision normal blocks without keeping view Jacobians."""
+def normal_blocks(model, data, parameters, layout, base, position, *, operations=None):
+    """Accumulate normal blocks in the configured LM precision without keeping view Jacobians."""
     n = len(data)
     p, q = position.identity.numel(), position.local.shape[1]
     ref = model.reference
-    identity = ref.new_zeros((p, p), dtype=torch.float64)
-    coupling = ref.new_empty((n, p, q), dtype=torch.float64)
-    local = ref.new_empty((n, q, q), dtype=torch.float64)
-    gradient_a = ref.new_zeros(p, dtype=torch.float64)
-    gradient_b = ref.new_empty((n, q), dtype=torch.float64)
+    identity = ref.new_zeros((p, p), dtype=lm_dtype(parameters.config))
+    coupling = ref.new_empty((n, p, q), dtype=lm_dtype(parameters.config))
+    local = ref.new_empty((n, q, q), dtype=lm_dtype(parameters.config))
+    gradient_a = ref.new_zeros(p, dtype=lm_dtype(parameters.config))
+    gradient_b = ref.new_empty((n, q), dtype=lm_dtype(parameters.config))
 
     for index in range(n):
-        residual, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
+        if operations is None:
+            residual, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
+        else:
+            with operations.measure("observation_jacobian"):
+                residual, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
         hessian = jacobian.mT @ jacobian
         gradient = jacobian.mT @ residual
         identity.add_(hessian[:p, :p])
@@ -148,6 +158,24 @@ def normal_blocks(model, data, parameters, layout, base, position):
     return NormalBlocks(identity, coupling, local, BlockVector(gradient_a, gradient_b))
 
 
+@torch.no_grad()
+def square_root_blocks(data, parameters, layout, position, *, operations=None):
+    residuals, jacobians = [], []
+    batch = parameters.config.batch_size
+    for start in range(0, len(data), batch):
+        stop = min(len(data), start + batch)
+        if operations is None:
+            residual, jacobian = batch_jacobian(data, parameters, layout, position, start, stop)
+        else:
+            with operations.measure("observation_jacobian_batch"):
+                residual, jacobian = batch_jacobian(data, parameters, layout, position, start, stop)
+        if operations is not None:
+            operations.counts["observation_jacobian"] += stop - start
+        residuals.append(residual)
+        jacobians.append(jacobian)
+    return SquareRootBlocks.create(torch.cat(jacobians), torch.cat(residuals), position.identity.numel(), batch)
+
+
 def bound_mask(position, gradient, expression_slice, limit):
     mask = torch.zeros_like(position.local, dtype=torch.bool)
     if expression_slice is not None:
@@ -159,21 +187,21 @@ def bound_mask(position, gradient, expression_slice, limit):
 
 def gradient_norms(layout, gradient, fixed_local):
     norms = {
-        ("focal" if name in FOCAL_PARAMETERS else name): finite_norm(2 * gradient.identity[columns])
+        ("focal" if name in FOCAL_PARAMETERS else name): _lm_norm(2 * gradient.identity[columns])
         for name, columns in layout.shared_columns()
     }
     local = 2 * gradient.local.masked_fill(fixed_local, 0)
     for name, columns in layout.columns():
         group = "focal" if name in FOCAL_PARAMETERS else PARAMETER_GROUPS[name]
-        norms[group] = math.hypot(norms.get(group, 0.0), finite_norm(local[:, columns]))
+        norms[group] = math.hypot(norms.get(group, 0.0), _lm_norm(local[:, columns]))
     if not all(math.isfinite(value) for value in norms.values()):
         raise FloatingPointError("Nonfinite projected gradient norm")
     return norms
 
 
 def _candidate(position, step, expression_slice, limit):
-    identity = (position.identity.double() + step.identity).to(position.identity.dtype)
-    local = (position.local.double() + step.local).to(position.local.dtype)
+    identity = (position.identity.to(step.identity.dtype) + step.identity).to(position.identity.dtype)
+    local = (position.local.to(step.local.dtype) + step.local).to(position.local.dtype)
     if not torch.isfinite(identity).all() or not torch.isfinite(local).all():
         raise FloatingPointError("Nonfinite trial parameter coordinates")
     if expression_slice is not None:
@@ -181,17 +209,17 @@ def _candidate(position, step, expression_slice, limit):
     return BlockVector(identity, local)
 
 
-def _effective_step(position, point):
+def _effective_step(position, point, dtype=torch.float64):
     return BlockVector(
-        point.identity.double() - position.identity.double(),
-        point.local.double() - position.local.double(),
+        point.identity.to(dtype) - position.identity.to(dtype),
+        point.local.to(dtype) - position.local.to(dtype),
     )
 
 
 def _step_norms(effective, scales):
     return (
-        finite_norm(effective.identity, effective.local),
-        finite_norm(effective.identity / scales.identity, effective.local / scales.local),
+        _lm_norm(effective.identity, effective.local),
+        _lm_norm(effective.identity / scales.identity, effective.local / scales.local),
     )
 
 
@@ -203,16 +231,17 @@ def _focal_norms(layout, vector, scales, *, gradient=False):
     if gradient:
         values = 2 * values
     scaled = values * scale if gradient else values / scale
-    return {"native": finite_norm(values), "scaled": finite_norm(scaled)}
+    return {"native": _lm_norm(values), "scaled": _lm_norm(scaled)}
 
 
 def _trial_focal_displacement(layout, position, step, scales):
     current = layout.focal_coordinates(position)
     if current is None:
         return None
-    proposed = (current.double() + layout.focal_coordinates(step)).to(current.dtype)
-    update = proposed.double() - current.double()
-    return {"native": finite_norm(update), "scaled": finite_norm(update / layout.focal_coordinates(scales))}
+    focal_step = layout.focal_coordinates(step)
+    proposed = (current.to(focal_step.dtype) + focal_step).to(current.dtype)
+    update = proposed.to(focal_step.dtype) - current.to(focal_step.dtype)
+    return {"native": _lm_norm(update), "scaled": _lm_norm(update / layout.focal_coordinates(scales))}
 
 
 def _trial_step(model, data, parameters, base, position, layout, system, scales, step,
@@ -220,7 +249,7 @@ def _trial_step(model, data, parameters, base, position, layout, system, scales,
     norm = scaled = predicted = actual = ratio = None
     try:
         point = _candidate(position, step, expression_slice, parameters.config.expression_limit)
-        effective = _effective_step(position, point)
+        effective = _effective_step(position, point, system.gradient.identity.dtype)
         norm, scaled = _step_norms(effective, scales)
         reduction = system.predicted_reduction(effective)
         if not math.isfinite(reduction):
@@ -245,6 +274,14 @@ def _trial_step(model, data, parameters, base, position, layout, system, scales,
     return (point, values, stats), "accepted", (norm, scaled, predicted, actual, ratio)
 
 
+def _precision_limited(values, scaled_norm, reason):
+    # Explicit near-roundoff stop, NOT strict convergence. No GT is consulted.
+    eps = torch.finfo(torch.float32).eps
+    return (reason in ("insufficient_reduction", "nonpositive_predicted_reduction")
+            and math.sqrt(values.landmarks) <= 4 * eps
+            and scaled_norm <= 8 * eps)
+
+
 @torch.no_grad()
 def fit_stage(model, data, parameters, stage, groups, values, stats, measurements, record):
     config = parameters.config
@@ -255,15 +292,59 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
     expression_slice = layout.expression_slice()
     damping = options.initial_damping
     measurements.stage_damping = damping
+    operations = measurements.operations
+    profile_options = {"operations": operations} if operations is not None else {}
     best, stale = values.total, 0
+    square_root = options.arithmetic_dtype == "float32"
+    solve_step = square_root_step if square_root else damped_schur_step
+    scale_columns = (lambda system, floor: system.scales(floor)) if square_root else column_scales
     for index in range(stage.iterations):
         measurements.jacobian_evaluations += 1
         with measurements.time("jacobian"):
-            system = normal_blocks(model, data, parameters, layout, base, position)
-        scales = column_scales(system, options.diagonal_floor)
+            if square_root:
+                system = square_root_blocks(data, parameters, layout, position, **profile_options)
+            else:
+                system = normal_blocks(model, data, parameters, layout, base, position, **profile_options)
+        if operations is None:
+            scales = scale_columns(system, options.diagonal_floor)
+        else:
+            operations.drain()
+            if measurements.normal_system is None and square_root:
+                measurements.normal_system = {
+                    "representation": "square_root_qr", "normal_equations_bytes": 0,
+                    "shared_dimensions": [position.identity.numel()] * 2,
+                    "local_dimensions": [position.local.shape[1]] * 2,
+                    "local_blocks": len(data), "dtype": str(system.shared.dtype),
+                    "local_coordinate_widths": dict(zip(layout.names, layout.widths, strict=True)),
+                    "device": str(system.shared.device),
+                    "active_trainable_parameters": position.identity.numel() + position.local.numel(),
+                    "valid_residual_coordinates": 2 * int(data.counts.sum()),
+                    "jacobian_storage_bytes": sum(t.numel() * t.element_size() for t in (system.shared, system.local, system.residual)),
+                    "jacobian_observation_batch_size": config.batch_size,
+                }
+            elif measurements.normal_system is None:
+                storage = {
+                    name: block.numel() * block.element_size()
+                    for name, block in (
+                        ("shared", system.identity), ("local", system.local), ("coupling", system.coupling),
+                        ("shared_gradient", system.gradient.identity), ("local_gradient", system.gradient.local),
+                    )
+                }
+                measurements.normal_system = {
+                    "shared_dimensions": list(system.identity.shape),
+                    "local_dimensions": list(system.local.shape[1:]),
+                    "local_coordinate_widths": dict(zip(layout.names, layout.widths, strict=True)),
+                    "local_blocks": len(system.local),
+                    "active_trainable_parameters": position.identity.numel() + position.local.numel(),
+                    "valid_residual_coordinates": 2 * int(data.counts.sum()),
+                    "normal_equations_bytes": sum(storage.values()), "storage_bytes": storage,
+                    "dtype": str(system.gradient.identity.dtype), "device": str(system.identity.device),
+                }
+            with operations.measure("column_equilibration"):
+                scales = scale_columns(system, options.diagonal_floor)
         fixed_local = bound_mask(position, system.gradient, expression_slice, config.expression_limit)
         gradient = system.gradient
-        scaled_norm = finite_norm(
+        scaled_norm = _lm_norm(
             2 * (scales.identity * gradient.identity),
             2 * (scales.local * gradient.local).masked_fill(fixed_local, 0),
         )
@@ -280,9 +361,9 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
             # Strong damping can make a large unresolved displacement appear small.
             # Probe at the configured floor without evaluating or accepting a trial.
             with measurements.time("linear_solve"):
-                probe, _ = damped_schur_step(system, scales, options.minimum_damping, fixed_local)
+                probe, _ = solve_step(system, scales, options.minimum_damping, fixed_local)
             point = _candidate(position, probe, expression_slice, config.expression_limit)
-            effective = _effective_step(position, point)
+            effective = _effective_step(position, point, system.gradient.identity.dtype)
             probe_norms = _step_norms(effective, scales)
             focal_probe = _focal_norms(layout, effective, scales)
         measurements.linearizations.append(Linearization(
@@ -306,7 +387,7 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
             trial += 1
             try:
                 with measurements.time("linear_solve"):
-                    step, condition = damped_schur_step(system, scales, damping, fixed_local)
+                    step, condition = solve_step(system, scales, damping, fixed_local)
             except (FloatingPointError, RuntimeError) as error:
                 measurements.trials.append(Trial(
                     stage.name, index, trial, damping, False, str(error), scaled_norm,
@@ -338,10 +419,14 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
                 measurements.trace_accepted_state(parameters, len(data), values)
                 break
             if damping >= options.maximum_damping:
+                if square_root and _precision_limited(values, scaled_norm, reason):
+                    return values, stats, "stopped", "FP32 precision-limited objective; recovery targets evaluated separately"
                 return values, stats, "no_acceptable_step", f"damping limit reached ({reason})"
             damping = min(options.maximum_damping, damping * 4)
             measurements.stage_damping = damping
         else:
+            if square_root and _precision_limited(values, scaled_norm, reason):
+                return values, stats, "stopped", "FP32 precision-limited objective; recovery targets evaluated separately"
             return values, stats, "no_acceptable_step", f"trial-step budget exhausted ({reason})"
 
         if config.improvement_tolerance is not None:

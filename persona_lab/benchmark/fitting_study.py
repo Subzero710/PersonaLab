@@ -18,8 +18,8 @@ from ..fitting.configuration import SOLVERS, LevenbergMarquardtConfig
 from ..fitting.monitoring import optimization_record, peak_rss_bytes
 from ..fitting.observability import identity_observability
 from ..fitting.results import FAILED_STATUSES
-from . import camera_calibration, focal_convergence, focal_estimation
-from .configuration import resolve_config
+from . import camera_calibration, focal_convergence, focal_estimation, focal_scalability, scalability_report
+from .configuration import _parse_device, resolve_config
 from .dataset import camera_from_record, camera_to_record, load_dataset
 from .evaluate import _pool_expression, _pool_reprojection, _score_observation
 from .full_native_camera import (
@@ -33,6 +33,7 @@ from .metrics import (
 )
 from .model import load_benchmark_model
 from .predictions import ObservationPrediction, SubjectPrediction
+from .scalability_cases import COUNTS as V6_COUNTS, PARENT_SIZE, PRIMARY_BATCH_SIZE, STUDY as SCALABILITY_STUDY
 from .storage import json_bytes, read_json, write_json
 
 
@@ -75,6 +76,87 @@ def _scoring_geometry(model, state, truth, trainable):
         ),
         **neutral_geometry_errors(model, state.identity, truth.arrays["neutral_vertices"]),
     }
+
+
+def _scalability_config(batch_size):
+    return _fit_config("levenberg-marquardt", focal_convergence.STRATEGIES["J200"], {
+        "camera_mode": "estimated", "camera_model": "perspective",
+        "focal_mode": "per-observation", "initial_focal_factor": 1.5,
+        "batch_size": batch_size, "train_identity": ("head",),
+        "lm": replace(STRICT_LM, arithmetic_dtype="float32", jacobian_rows=32),
+        "identity_weight": 0.0, "expression_weight": 0.0, "pose_weight": 0.0, "camera_weight": 0.0,
+    })
+
+
+def _fitted_geometry(model, state, initial, truth, trainable):
+    scores = _scoring_geometry(model, state, truth, trainable)
+    fixed = ~np.isin(model.metadata["identity_names"], trainable)
+    scores["fixed_identity_preserved"] = bool(np.array_equal(initial.identity[fixed], state.identity[fixed]))
+    return scores
+
+
+def _score_scalability_fit(record, model, dataset, subject, fit):
+    truth = dataset.ground_truth(subject)
+    record.update(
+        metric_units=METRIC_UNITS, geometry_aligned=False,
+        compatibility=_compatibility(model, truth, fit, _active_groups(fit.config)),
+        initial=_scoring_geometry(model, fit.initial, truth, fit.selection.identity),
+        final=None,
+    )
+    if fit.final is not None:
+        final = _fitted_geometry(model, fit.final, fit.initial, truth, fit.selection.identity)
+        final["training_reprojection_and_nuisance_recovery"] = _score_observations(
+            model, dataset, truth, fitted_camera_prediction(fit), "complete",
+            trainable_expression=fit.selection.expression,
+        )
+        final["neutral_vertices_m"] = model.neutral(fit.final.identity).tolist()
+        record["final"] = final
+    # V5.2 B3 supplies the heterogeneous per-observation camera compatibility checks.
+    camera_case = {"condition": "B3", "focal_mode": fit.config.focal_mode}
+    focal_estimation.add_diagnostics(record, camera_case, truth, fit, _judge_targets(record["final"]),
+                                     study=SCALABILITY_STUDY)
+    focal_estimation.complete_record(record, study=SCALABILITY_STUDY)
+    record["camera_metrics"] = focal_convergence.camera_diagnostics(record["camera_recovery"])
+    record["recovery"]["reprojection"] = record["reference_targets"]["reprojection_rms_px"]["met"]
+    record["recovery"]["focal"] = record["focal_recovery"]["target_met"]
+    # A failed optimizer is not a successful prediction. Evaluate its last
+    # committed state explicitly without changing final/status/recovery counts.
+    if fit.final is None and fit.stage_diagnostics:
+        boundary = fit.stage_diagnostics[-1].after
+        state = boundary.state
+        if state is not None and boundary.objective is not None and boundary.error is None:
+            prediction = SubjectPrediction(state.identity, {
+                key: ObservationPrediction(expression=state.expression[i], rotations=state.rotations[i],
+                    translation=state.translation[i], camera=state.cameras[i])
+                for i, key in enumerate(fit.observation_ids)
+            })
+            score = _fitted_geometry(model, state, fit.initial, truth, fit.selection.identity)
+            score["training_reprojection_and_nuisance_recovery"] = _score_observations(
+                model, dataset, truth, prediction, "complete", trainable_expression=fit.selection.expression,
+            )
+            cameras = [focal_estimation._camera_row(item, camera_to_record(fit.initial.cameras[i]),
+                camera_to_record(state.cameras[i]), fit.config.focal_mode, state.translation[i],
+                truth.arrays["translation"][i]) for i, item in enumerate(truth.observations)]
+            focal_error = max(row["relative_focal_error"] for row in cameras)
+            record["last_accepted_evaluation"] = {
+                "status": "evaluated", "termination_status": fit.status,
+                "accepted_updates": fit.optimization.accepted_updates,
+                "state_kind": "last_accepted" if fit.optimization.accepted_updates else "initial",
+                "complete_objective": asdict(boundary.objective),
+                "metrics": score, "reference_targets": _judge_targets(score),
+                "camera_recovery": cameras,
+                "maximum_relative_focal_error": focal_error,
+                "focal_target_met": focal_error <= focal_estimation.FOCAL_TARGET,
+            }
+        else:
+            record["last_accepted_evaluation"] = {"status": "unavailable", "reason": boundary.error or fit.reason}
+    stages = record["stage_diagnostics"]
+    record["optimization"]["initialization_objective_evaluations"] = fit.optimization.objective_evaluations - sum(
+        stage["objective_evaluations"] or 0 for stage in stages
+    )
+    record["optimization"]["boundary_objective_evaluations"] = sum(
+        stage["boundary_objective_evaluations"] for stage in stages
+    )
 
 
 def _active_groups(config):
@@ -332,12 +414,7 @@ def _run_job(job):
     }
     if fit.final is not None:
         estimated = config.camera_mode == "estimated"
-        score_final = _scoring_geometry(model, fit.final, truth, train_identity)
-        fixed_names = set(model.metadata["identity_names"]) - set(train_identity)
-        fixed = [name in fixed_names for name in model.metadata["identity_names"]]
-        score_final["fixed_identity_preserved"] = bool(
-            np.array_equal(fit.initial.identity[fixed], fit.final.identity[fixed]),
-        )
+        score_final = _fitted_geometry(model, fit.final, fit.initial, truth, train_identity)
         prediction = fitted_camera_prediction(fit) if camera_case or focal_case else fit.to_prediction()
         training = _score_observations(
             model, dataset, truth, prediction, "complete" if estimated or camera_case or focal_case else "known-camera",
@@ -785,6 +862,51 @@ def _compare_reference(record, historical):
     record["historical_comparison"] = comparison
 
 
+def _run_scalability(args, parser):
+    if args.protocol != "corrected-identity" or args.identity_studies != [SCALABILITY_STUDY]:
+        parser.error("select focal-scalability alone under --protocol corrected-identity")
+    if args.dtype != "float32":
+        parser.error("focal-scalability requires explicit --dtype float32")
+    if any(getattr(args, name) is not None for name in (
+        "experiments", "adam_iterations", "lm_iterations", "noise_levels", "identity_weights",
+        "expression_weights", "historical_report", "camera_study_budgets", "focal_study_budget",
+        "focal_strategies", "v51_report", "v52_report",
+    )) or args.scaling_full:
+        parser.error("focal-scalability uses the J200 estimated-camera protocol without historical or sweep overrides")
+    args.scalability_counts = tuple(args.scalability_counts or V6_COUNTS)
+    if (len(set(args.scalability_counts)) != len(args.scalability_counts)
+            or any(not 50 <= count <= PARENT_SIZE for count in args.scalability_counts)):
+        parser.error("scalability counts must be unique integers from 50 through 600")
+    if args.scalability_batch_size is None:
+        args.scalability_batch_size = PRIMARY_BATCH_SIZE
+    if not 1 <= args.scalability_batch_size <= PARENT_SIZE:
+        parser.error("scalability batch size must be an integer from 1 through 600")
+    if len(set(args.seeds)) != len(args.seeds) or any(not 0 <= seed < 2**64 for seed in args.seeds):
+        parser.error("study seeds must be unique unsigned 64-bit integers")
+    try:
+        device = _parse_device(args.device)
+    except ValueError as error:
+        parser.error(str(error))
+    args.device = str(device)
+    if args.scalability_profile_kernels and (device.type != "cuda" or not args.scalability_primary_only
+            or len(args.seeds) != 1 or len(args.scalability_counts) != 1):
+        parser.error("Kernel profiling requires CUDA, --scalability-primary-only and one seed/count")
+    if device.type == "cuda" and args.scalability_datasets_in is None:
+        parser.error("CUDA focal-scalability requires --scalability-datasets-in from a verified CPU reference")
+    if args.model_file is None:
+        parser.error("focal-scalability requires --model-file identifying the pinned GNM asset")
+    if args.scalability_datasets_out is not None and args.scalability_datasets_out.resolve().exists():
+        parser.error("choose a fresh --scalability-datasets-out directory")
+    if args.scalability_datasets_out is not None and (
+        args.scalability_datasets_out.resolve() in (args.output.resolve(), *args.output.resolve().parents)
+    ):
+        parser.error("the reference output directory must not contain the study output directory")
+    try:
+        return focal_scalability.run(args, _scalability_config, scalability_report.write_reports)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="create a new study directory")
@@ -794,7 +916,7 @@ def main(argv=None):
     parser.add_argument("--protocol", choices=("historical", "corrected-identity"), default="historical")
     parser.add_argument("--experiments", choices=tuple("ABCDEFGH"), nargs="+")
     parser.add_argument("--identity-studies", choices=IDENTITY_STUDIES + (
-        CAMERA_STUDY, CALIBRATION_STUDY, FOCAL_STUDY, CONVERGENCE_STUDY,
+        CAMERA_STUDY, CALIBRATION_STUDY, FOCAL_STUDY, CONVERGENCE_STUDY, SCALABILITY_STUDY,
     ), nargs="+")
     parser.add_argument("--noise-levels", type=float, nargs="+", metavar="PX")
     parser.add_argument("--identity-weights", type=float, nargs="+")
@@ -811,6 +933,13 @@ def main(argv=None):
                         help="explicit schedules for focal-convergence (default: all three)")
     parser.add_argument("--v52-report", type=Path, help="archived V5.2 focal-estimation report for matched J100 comparisons")
     parser.add_argument("--scaling-full", action="store_true")
+    parser.add_argument("--scalability-counts", type=int, nargs="+", metavar="N")
+    parser.add_argument("--scalability-batch-size", type=int, metavar="N")
+    parser.add_argument("--scalability-primary-only", action="store_true", help="Explicit pilot without the batching sweep")
+    parser.add_argument("--scalability-profile-kernels", action="store_true", help="Profile a separate CUDA linearization after the pilot")
+    references = parser.add_mutually_exclusive_group()
+    references.add_argument("--scalability-datasets-in", type=Path, metavar="DIR")
+    references.add_argument("--scalability-datasets-out", type=Path, metavar="DIR")
     parser.add_argument("--spectra", action="store_true",
                         help="initial spectra for A–C or both states in corrected studies")
     parser.add_argument("--historical-report", type=Path, help="the original count-study-v2.json")
@@ -818,10 +947,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.worker:
         job = read_json(args.worker)
+        if job.get(SCALABILITY_STUDY):
+            return focal_scalability.run_worker(job, fit_identity, _score_scalability_fit)
         write_json(Path(job["result"]), _run_job(job))
         return 0
     if args.output is None:
         parser.error("--output is required")
+    if SCALABILITY_STUDY in (args.identity_studies or ()):
+        return _run_scalability(args, parser)
+    if args.scalability_primary_only or args.scalability_profile_kernels or any(getattr(args, name) is not None for name in (
+        "scalability_counts", "scalability_batch_size", "scalability_datasets_in", "scalability_datasets_out",
+    )):
+        parser.error("scalability options require the corrected-identity focal-scalability study")
     if args.model_file is None or not Path(args.model_file).is_file():
         parser.error("--model-file must identify the existing pinned GNM asset")
     corrected = args.protocol == "corrected-identity"
