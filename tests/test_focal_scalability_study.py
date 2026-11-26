@@ -312,3 +312,73 @@ def test_square_root_batched_jacobian_against_single_view(reference, device):
             assert jacobians.dtype == torch.float32 and jacobians.device.type == device
     objective, _ = evaluate_objective(model, data, parameters, least_squares=True)
     assert objective.landmarks == pytest.approx(float(squared), rel=2e-6, abs=1e-12)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_compensated_reference_replay_and_cold_start(reference, device):
+    """Official asset integration: independent CPU targets, requested-device replay and fitting."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from persona_lab.benchmark.dataset import camera_from_record
+    from persona_lab.fitting import precision_geometry as pg
+    from persona_lab.fitting.batched_jacobian import residual_fp32_batch
+    from persona_lab.fitting.observations import prepare_observations
+    from persona_lab.fitting.parameters import FittingParameters, TensorState, stack_cameras, resolve_selection
+    from persona_lab.gnm_geometry import SparseHeadLandmarks
+
+    model_file, archive, provenance = reference
+    parent = scalability_data.load_parent(archive, 42, provenance)
+    dataset, subject, _ = scalability_data.verified_subset(parent, 9)
+    truth = dataset.ground_truth(subject)
+    cpu = focal_scalability.load_benchmark_model(model_file, dtype="float32", device="cpu")
+    cpu_cameras = stack_cameras([camera_from_record(item["camera"], dtype=torch.float32, device=torch.device("cpu"))
+                                 for item in truth.observations])
+    points = pg.landmark_pair(SparseHeadLandmarks(cpu.head),
+                             *(cpu.tensor(truth.arrays[name]) for name in ("identity", "expression", "rotations", "translation")))
+    high, low = pg.projected_pair(points, cpu_cameras.rotation, cpu_cameras.translation,
+                                  cpu_cameras.focal_length, cpu_cameras.principal_point)
+    indices = [item.gnm_index for item in dataset.correspondences.entries]
+    high, low = high[:, indices], low[:, indices]
+    raw = dataset.fitting_observations(subject, dtype="float32", device=device, include_known_cameras=False)
+    observations = tuple(replace(obs, landmarks=high[i].to(device), pixel_low=low[i].to(device)) for i, obs in enumerate(raw))
+    config = fitting_study._scalability_config(4, precision_forward=True)
+    config = replace(config, stages=(*config.stages[:-1], replace(config.stages[-1], iterations=2)))
+    model = cpu if device == "cpu" else focal_scalability.load_benchmark_model(model_file, dtype="float32", device=device)
+    data = prepare_observations(observations, model.reference, config)
+    cameras = tuple(camera_from_record(item["camera"], dtype=torch.float32, device=model.reference.device)
+                    for item in truth.observations)
+    state = TensorState(*(model.tensor(truth.arrays[name]) for name in ("identity", "expression", "rotations", "translation")), cameras)
+    parameters = FittingParameters(model, data, state, resolve_selection(model, config), config)
+    assert parameters.camera_delta is None and parameters.local_log_focal is None
+    assert torch.equal(parameters.camera_native, torch.stack([c.translation for c in cameras]))
+    values = parameters.values()
+    _, residual = residual_fp32_batch(data, parameters, 0, len(data), values)
+    assert float(residual.abs().max()) <= 1e-9
+    assert all(o.known_camera is None and o.camera_initialization is None for o in observations)
+    fit = fit_identity(model, observations, config, initial=None)
+    assert not np.any(fit.initial.identity)
+    assert fit.final is not None, fit.reason
+    assert fit.final_reprojection.overall.rms_px < fit.initial_reprojection.overall.rms_px
+
+
+def test_precision_archive_publishes_distinct_verified_targets(reference, tmp_path):
+    from persona_lab.benchmark.precision_archive import generate_precision_parent
+    model_file, archive, provenance = reference
+    parent = scalability_data.load_parent(archive, 42, provenance)
+    original = scalability_data.file_digests(archive)
+    model = focal_scalability.load_benchmark_model(model_file, dtype="float32", device="cpu")
+    new_path = tmp_path / "precise"
+    result = generate_precision_parent(parent, read_json(archive / "manifest.json") | {"verified_directory": str(archive)},
+                                       model, new_path)
+    assert result.dataset_id != parent.dataset_id and result.has_precision_pixels
+    assert result.precision_source_dataset_id == parent.dataset_id
+    entry = {"dataset_id": result.dataset_id, "files_sha256": scalability_data.file_digests(new_path),
+             "pixel_representation": "compensated-fp32-high-low-v1", "source_dataset_id": parent.dataset_id}
+    loaded = scalability_data.load_parent(new_path, 42, entry)
+    subset, subject, verified = scalability_data.verified_subset(loaded, 50)
+    obs = subset.fitting_observations(subject, dtype="float32", include_known_cameras=False)
+    scalability_data.verify_fitter_input(obs, verified, device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="differ from"):
+        altered = (replace(obs[0], pixel_low=torch.zeros_like(obs[0].pixel_low)), *obs[1:])
+        scalability_data.verify_fitter_input(altered, verified, device=torch.device("cpu"))
+    assert scalability_data.file_digests(archive) == original

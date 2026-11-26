@@ -115,7 +115,7 @@ def _compact(row):
         "requested_device", "actual_execution_device", "dtype", "batch_size", "focal_mode",
         "requested_stage_budgets", "reuse_case", "termination_status", "execution_status", "converged",
         "recovery", "reference_targets", "focal_recovery", "reason", "failure", "report_case", "spectra_requested",
-        "worker_started", "actual_dtype",
+        "worker_started", "actual_dtype", "pixel_representation", "precision_source_dataset_id",
     )} | {
         "accepted_updates": optimization.get("accepted_updates"), "rejected_trials": optimization.get("rejected_trials"),
         "last_accepted_evaluation": row.get("last_accepted_evaluation"),

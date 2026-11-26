@@ -206,9 +206,12 @@ class FitMeasurements:
         if dtype == torch.float32:
             identity = parameters.initial.identity.index_copy(0, parameters.identity_indices, parameters.identity)
             initial = torch.stack([camera.translation for camera in parameters.initial.cameras])
-            offsets = parameters.camera_delta
-            translations = torch.cat((initial[:, :2] + offsets[:, :2] * initial[:, 2:],
-                                      initial[:, 2:] * offsets[:, 2:].exp()), dim=1).tolist()
+            if parameters.camera_native is not None:
+                translations = parameters.camera_native.tolist()
+            else:
+                offsets = parameters.camera_delta
+                translations = torch.cat((initial[:, :2] + offsets[:, :2] * initial[:, 2:],
+                                          initial[:, 2:] * offsets[:, 2:].exp()), dim=1).tolist()
         else:
             state = parameters.state(0, count)
             identity = state.identity

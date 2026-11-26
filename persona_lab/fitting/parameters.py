@@ -55,8 +55,9 @@ class TensorState:
 PARAMETER_GROUPS = {
     "identity": "identity", "expression": "expression", "pose": "pose",
     "root": "pose", "camera_delta": "camera", "shared_log_focal": "camera", "local_log_focal": "camera",
+    "camera_native": "camera", "local_focal": "camera",
 }
-FOCAL_PARAMETERS = ("shared_log_focal", "local_log_focal")
+FOCAL_PARAMETERS = ("shared_log_focal", "local_log_focal", "local_focal")
 SHARED_PARAMETERS = ("identity", "shared_log_focal")
 
 
@@ -73,6 +74,8 @@ class ParameterValues:
     camera_delta: Tensor | None
     shared_log_focal: Tensor | None = None
     local_log_focal: Tensor | None = None
+    camera_native: Tensor | None = None
+    local_focal: Tensor | None = None
 
     def batch(self, start, stop):
         return replace(self, **{
@@ -235,17 +238,20 @@ class FittingParameters:
         self.expression = self._parameter(initial.expression.index_select(1, self.expression_indices))
         self.pose = nn.Parameter(initial.rotations[:, self.head_index].clone()) if selection.joints else None
         self.root = nn.Parameter(initial.translation.clone()) if selection.root_translation else None
+        precise = config.lm.fp32_forward == "compensated"
         self.camera_delta = (
             nn.Parameter(reference.new_zeros((len(observations), 3)))
-            if config.camera_mode == "estimated" else None
+            if config.camera_mode == "estimated" and not precise else None
         )
         self.shared_log_focal = (
             nn.Parameter(reference.new_zeros(1)) if config.focal_mode == "shared" else None
         )
         self.local_log_focal = (
             nn.Parameter(reference.new_zeros((len(observations), 1)))
-            if config.focal_mode == "per-observation" else None
+            if config.focal_mode == "per-observation" and not precise else None
         )
+        self.camera_native = nn.Parameter(torch.stack([c.translation for c in initial.cameras])) if precise else None
+        self.local_focal = nn.Parameter(torch.stack([c.focal_length[:1] for c in initial.cameras])) if precise else None
         self._head = head
 
     @cached_property
@@ -270,7 +276,8 @@ class FittingParameters:
     def groups(self):
         groups = {
             "identity": (self.identity,), "expression": (self.expression,),
-            "pose": (self.pose, self.root), "camera": (self.camera_delta, self.shared_log_focal, self.local_log_focal),
+            "pose": (self.pose, self.root), "camera": (self.camera_delta, self.shared_log_focal, self.local_log_focal,
+                                                        self.camera_native, self.local_focal),
         }
         return {name: tuple(p for p in values if p is not None) for name, values in groups.items()}
 
@@ -313,6 +320,15 @@ class FittingParameters:
         if values.pose is not None:
             rotations = rotations.index_copy(1, self.head_indices, values.pose[:, None, :])
         translation = self.initial.translation[start:stop] if values.root is None else values.root
+        if values.camera_native is not None:
+            if values.local_focal is None or not bool(
+                    torch.isfinite(values.camera_native).all() & torch.isfinite(values.local_focal).all()
+                    & (values.camera_native[:, 2] > 0).all() & (values.local_focal > 0).all()):
+                raise InvalidGeometry("Invalid native perspective camera coordinates")
+            cameras = tuple(replace(self.initial.cameras[index], translation=values.camera_native[row],
+                                    focal_length=values.local_focal[row].expand(2))
+                            for row, index in enumerate(range(start, stop)))
+            return TensorState(identity, expression, rotations, translation, cameras)
         cameras = tuple(
             self._camera(
                 index, None if values.camera_delta is None else values.camera_delta[row],
@@ -324,6 +340,8 @@ class FittingParameters:
 
     def focal_factors(self):
         """Normalized focal lengths at a committed state, in observation order."""
+        if self.local_focal is not None:
+            return tuple((self.local_focal[:, 0] / self.short_edges).tolist())
         log_focal = self.shared_log_focal if self.local_log_focal is None else self.local_log_focal[:, 0]
         if log_focal is None:
             return None

@@ -78,12 +78,13 @@ def _scoring_geometry(model, state, truth, trainable):
     }
 
 
-def _scalability_config(batch_size):
+def _scalability_config(batch_size, *, precision_forward=False):
     return _fit_config("levenberg-marquardt", focal_convergence.STRATEGIES["J200"], {
         "camera_mode": "estimated", "camera_model": "perspective",
         "focal_mode": "per-observation", "initial_focal_factor": 1.5,
         "batch_size": batch_size, "train_identity": ("head",),
-        "lm": replace(STRICT_LM, arithmetic_dtype="float32", jacobian_rows=32),
+        "lm": replace(STRICT_LM, arithmetic_dtype="float32", jacobian_rows=32,
+                      fp32_forward="compensated" if precision_forward else "projection"),
         "identity_weight": 0.0, "expression_weight": 0.0, "pose_weight": 0.0, "camera_weight": 0.0,
     })
 
@@ -893,6 +894,12 @@ def _run_scalability(args, parser):
         parser.error("Kernel profiling requires CUDA, --scalability-primary-only and one seed/count")
     if device.type == "cuda" and args.scalability_datasets_in is None:
         parser.error("CUDA focal-scalability requires --scalability-datasets-in from a verified CPU reference")
+    if args.scalability_datasets_in is None and args.scalability_datasets_out is None:
+        parser.error("Select an explicit persistent --scalability-datasets-in or --scalability-datasets-out directory")
+    if args.scalability_datasets_out is not None and (
+            args.output.resolve() in args.scalability_datasets_out.resolve().parents
+            or Path("outputs").resolve() in (args.scalability_datasets_out.resolve(), *args.scalability_datasets_out.resolve().parents)):
+        parser.error("Reference datasets must not be stored inside study outputs")
     if args.model_file is None:
         parser.error("focal-scalability requires --model-file identifying the pinned GNM asset")
     if args.scalability_datasets_out is not None and args.scalability_datasets_out.resolve().exists():
@@ -902,7 +909,8 @@ def _run_scalability(args, parser):
     ):
         parser.error("the reference output directory must not contain the study output directory")
     try:
-        return focal_scalability.run(args, _scalability_config, scalability_report.write_reports)
+        return focal_scalability.run(args, lambda batch: _scalability_config(batch, precision_forward=args.scalability_precision_forward),
+                                     scalability_report.write_reports)
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
@@ -935,6 +943,8 @@ def main(argv=None):
     parser.add_argument("--scaling-full", action="store_true")
     parser.add_argument("--scalability-counts", type=int, nargs="+", metavar="N")
     parser.add_argument("--scalability-batch-size", type=int, metavar="N")
+    parser.add_argument("--scalability-precision-forward", action="store_true",
+                        help="Explicit experimental compensated GNM forward and native camera coordinates")
     parser.add_argument("--scalability-primary-only", action="store_true", help="Explicit pilot without the batching sweep")
     parser.add_argument("--scalability-profile-kernels", action="store_true", help="Profile a separate CUDA linearization after the pilot")
     references = parser.add_mutually_exclusive_group()
@@ -955,7 +965,7 @@ def main(argv=None):
         parser.error("--output is required")
     if SCALABILITY_STUDY in (args.identity_studies or ()):
         return _run_scalability(args, parser)
-    if args.scalability_primary_only or args.scalability_profile_kernels or any(getattr(args, name) is not None for name in (
+    if args.scalability_primary_only or args.scalability_profile_kernels or args.scalability_precision_forward or any(getattr(args, name) is not None for name in (
         "scalability_counts", "scalability_batch_size", "scalability_datasets_in", "scalability_datasets_out",
     )):
         parser.error("scalability options require the corrected-identity focal-scalability study")

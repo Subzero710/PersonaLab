@@ -18,6 +18,7 @@ from .storage import digest_arrays, digest_json, json_bytes
 
 
 REFERENCE_SCHEMA = f"{STUDY}-reference-v2-fp32"
+PRECISION_REFERENCE_SCHEMA = f"{STUDY}-reference-v3-fp32-high-low"
 SCHEDULE = tuple(islice(cycle(HETEROGENEOUS_FACTORS), PARENT_SIZE))
 INPUT_FIELDS = {"observed": "landmarks", "validity": "validity", "weights": "weights"}
 REFERENCE_FILES = ("manifest.json", "topology.npz", "subject_0000.npz")
@@ -49,6 +50,10 @@ def load_parent(path, seed, reference):
     if files != reference["files_sha256"]:
         raise ValueError(f"Reference archive fingerprint mismatch for seed {seed}")
     dataset = load_dataset(path)
+    if (reference.get("pixel_representation") not in (None, "raster-fp32", "compensated-fp32-high-low-v1")
+            or dataset.has_precision_pixels != (reference.get("pixel_representation") == "compensated-fp32-high-low-v1")
+            or dataset.has_precision_pixels and dataset.precision_source_dataset_id != reference.get("source_dataset_id")):
+        raise ValueError("Reference pixel representation differs from dataset schema")
     if (
         dataset.dataset_id != reference["dataset_id"]
         or json_bytes(dataset.config.metadata()) != json_bytes(generation_config(seed).metadata())
@@ -68,9 +73,13 @@ def _input_digest(arrays, ids, image_sizes, dataset_id):
 
 def verify_fitter_input(observations, provenance, *, device):
     """Verify the transferred observation values without exposing truth to the fitter."""
+    precise = provenance.get("pixel_representation") == "compensated-fp32-high-low-v1"
+    fields = INPUT_FIELDS | ({"pixel_low": "pixel_low"} if precise else {})
     for item in observations:
+        if (item.pixel_low is not None) != precise:
+            raise ValueError("Transferred pixel representation differs from the reference")
         if item.known_camera is not None or item.camera_initialization is not None or any(
-            getattr(item, field).device != device for field in INPUT_FIELDS.values()
+            getattr(item, field).device != device for field in fields.values()
         ):
             raise ValueError("V6 fitting requires estimated cameras and observations on the requested device")
         if item.correspondences != DFL_TO_GNM or item.coordinate_convention != "aligned_pixels":
@@ -78,7 +87,7 @@ def verify_fitter_input(observations, provenance, *, device):
         if item.landmarks.dtype != torch.float32 or item.weights.dtype != torch.float32:
             raise ValueError("V6 fitting requires float32 landmarks and weights")
     arrays = {name: torch.stack([getattr(obs, field) for obs in observations]).cpu().numpy()
-              for name, field in INPUT_FIELDS.items()}
+              for name, field in fields.items()}
     ids = tuple(obs.observation_id for obs in observations)
     sizes = tuple((obs.image_size.width, obs.image_size.height) for obs in observations)
     if _input_digest(arrays, ids, sizes, provenance["dataset_id"]) != provenance["fitter_input_sha256"]:
@@ -100,7 +109,11 @@ def verified_subset(parent, count):
     if not np.allclose(factors, SCHEDULE[:count], atol=0, rtol=2 * np.finfo("float32").eps):
         raise ValueError("Reference focal factors differ from the requested V6 schedule")
     expression_norms = np.linalg.norm(truth.arrays["expression"], axis=1)
+    precise = dataset.has_precision_pixels
+    fields = INPUT_FIELDS | ({"pixel_low": "pixel_low"} if precise else {})
     provenance = {
+        "pixel_representation": "compensated-fp32-high-low-v1" if precise else "raster-fp32",
+        "precision_source_dataset_id": dataset.precision_source_dataset_id,
         "source_dataset_id": parent.dataset_id, "dataset_id": dataset.dataset_id,
         "observation_ids": ids, "actual_observations": len(ids),
         "content_sha256": digest_json({
@@ -109,7 +122,7 @@ def verified_subset(parent, count):
         }),
         "identity_sha256": digest_arrays({"identity": truth.arrays["identity"]}),
         "fitter_input_sha256": _input_digest(
-            {name: truth.arrays[name] for name in INPUT_FIELDS}, ids, sizes, dataset.dataset_id,
+            {name: truth.arrays[name] for name in fields}, ids, sizes, dataset.dataset_id,
         ),
         "distribution": {
             "viewpoint_counts": dict(Counter(row["view"] for row in truth.observations)),

@@ -70,7 +70,7 @@ class StageCoordinates:
     def focal_coordinates(self, vector):
         if self.shared_focal:
             return vector.identity[-1:]
-        return next((vector.local[:, columns] for name, columns in self.columns() if name == "local_log_focal"), None)
+        return next((vector.local[:, columns] for name, columns in self.columns() if name in ("local_log_focal", "local_focal")), None)
 
     def commit(self, parameters, point):
         for name, columns in self.shared_columns():

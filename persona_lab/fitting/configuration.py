@@ -103,8 +103,12 @@ class LevenbergMarquardtConfig:
     native_step_tolerance: float | None = None
     scaled_step_tolerance: float | None = None
     arithmetic_dtype: str = "float64"
+    fp32_forward: str = "projection"
 
     def __post_init__(self):
+        if self.fp32_forward not in ("projection", "compensated") or (
+                self.fp32_forward == "compensated" and self.arithmetic_dtype != "float32"):
+            raise ValueError("Compensated geometry requires an explicit FP32 LM configuration")
         if self.arithmetic_dtype not in ("float32", "float64"):
             raise ValueError("LM arithmetic_dtype must be float32 or float64")
         for name in ("max_trials", "jacobian_rows"):
@@ -165,6 +169,12 @@ class FitConfig:
     def __post_init__(self):
         if self.solver not in SOLVERS or not isinstance(self.lm, LevenbergMarquardtConfig):
             raise ValueError("Select a supported solver and a LevenbergMarquardtConfig")
+        if self.lm.fp32_forward == "compensated" and (
+                (self.camera_mode, self.camera_model, self.focal_mode, self.solver) !=
+                ("estimated", "perspective", "per-observation", "levenberg-marquardt")
+                or self.train_root or not self.train_head
+                or any(getattr(self, f"{g}_weight") != 0 for g in GROUPS)):
+            raise ValueError("Compensated FP32 requires joint zero-prior estimated perspective fitting")
         if self.camera_mode not in ("known", "estimated"):
             raise ValueError("Camera mode must be known or estimated")
         if self.camera_model is not None and self.camera_model not in CAMERA_MODELS:
@@ -233,6 +243,8 @@ class FitConfig:
     def to_dict(self):
         """Keep the established fixed-focal configuration representation."""
         options = asdict(self)
+        if self.lm.fp32_forward == "projection":
+            del options["lm"]["fp32_forward"]
         if self.lm.arithmetic_dtype == "float64":
             del options["lm"]["arithmetic_dtype"]
         if self.focal_mode == "fixed":

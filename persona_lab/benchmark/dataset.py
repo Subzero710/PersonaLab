@@ -23,6 +23,7 @@ from .storage import (
 
 
 SCHEMA_VERSION = 1
+PRECISION_SCHEMA_VERSION = 2
 MODEL_FIELDS = {
     "asset", "asset_sha256", "version", "variant", "identity_count", "identity_names",
     "expression_count", "expression_names", "joint_count", "joint_names", "vertex_count",
@@ -138,7 +139,7 @@ def _validate_model(metadata):
             raise ValueError(f"Invalid model {key}")
 
 
-def _subject_specs(config, model):
+def _subject_specs(config, model, *, precise=False):
     dtype = np.dtype(config.dtype)
     n = config.observations_per_subject
     slots = (n, DFL_LANDMARK_COUNT)
@@ -152,11 +153,20 @@ def _subject_specs(config, model):
         "observed": (dtype, (*slots, 2)),
         "offset_px": (dtype, (*slots, 2)),
         "weights": (dtype, slots),
+        **({"pixel_low": (np.dtype("float32"), (*slots, 2))} if precise else {}),
         **{name: (np.dtype(bool), slots) for name in MASKS},
     }
 
 
 def _validate_subject(record, arrays, config, mapping):
+    if "pixel_low" in arrays:
+        high, low = arrays["observed"], arrays["pixel_low"]
+        if (config.dtype != "float32" or not np.array_equal(high, arrays["clean"])
+                or np.any(low[~arrays["supported"]])
+                or np.any(np.abs(low) > 0.5 * np.maximum(
+                    np.nextafter(high, np.float32(np.inf)) - high,
+                    high - np.nextafter(high, np.float32(-np.inf))))):
+            raise ValueError("Invalid high/low clean pixel representation")
     items = record["observations"]
     size = ImageSize(*config.image_size)
     if not isinstance(items, list) or len(items) != config.observations_per_subject:
@@ -233,6 +243,14 @@ class BenchmarkDataset:
     @property
     def dataset_id(self):
         return self._manifest["dataset_id"]
+
+    @property
+    def has_precision_pixels(self):
+        return self._manifest["schema_version"] == PRECISION_SCHEMA_VERSION
+
+    @property
+    def precision_source_dataset_id(self):
+        return self._manifest["generator"].get("precision_source_dataset_id")
 
     @property
     def source_dataset_id(self):
@@ -319,6 +337,8 @@ class BenchmarkDataset:
                 validity=torch.tensor(truth.arrays["validity"][index], device=device),
                 weights=torch.tensor(truth.arrays["weights"][index], dtype=dtype, device=device),
                 known_camera=camera,
+                pixel_low=torch.tensor(truth.arrays["pixel_low"][index], dtype=dtype, device=device)
+                if "pixel_low" in truth.arrays else None,
             ))
         return tuple(result)
 
@@ -333,8 +353,16 @@ def _read_dataset(path, manifest):
         "schema_version", "dataset_id", "config", "model", "coordinates", "correspondences",
         "runtime", "generator", "subjects",
     }, "Dataset manifest")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] not in (SCHEMA_VERSION, PRECISION_SCHEMA_VERSION):
         raise ValueError("Unsupported benchmark dataset schema version")
+    precise = manifest["schema_version"] == PRECISION_SCHEMA_VERSION
+    if precise and (not isinstance(manifest["generator"], dict)
+            or manifest["generator"].get("pixel_representation") != "compensated-fp32-high-low-v1"
+            or not is_sha256(manifest["generator"].get("precision_source_dataset_id"))
+            or not isinstance(manifest["generator"].get("precision_source_files_sha256"), dict)
+            or set(manifest["generator"]["precision_source_files_sha256"]) != {"manifest.json", "subject_0000.npz", "topology.npz"}
+            or not all(is_sha256(v) for v in manifest["generator"]["precision_source_files_sha256"].values())):
+        raise ValueError("High/low dataset requires explicit generator provenance")
     if manifest["dataset_id"] != _manifest_id(manifest):
         raise ValueError("Benchmark manifest does not match its dataset identifier")
     if manifest["coordinates"] != COORDINATES or not isinstance(manifest["runtime"], dict) or (
@@ -382,7 +410,7 @@ def _read_dataset(path, manifest):
         require_keys(record, {"id", "observations", "arrays_sha256"}, "Subject record")
         if record["id"] != subject_id(index):
             raise ValueError("Invalid, duplicate or out-of-order subject identifier")
-        arrays = read_arrays(path / f"{record['id']}.npz", _subject_specs(config, model))
+        arrays = read_arrays(path / f"{record['id']}.npz", _subject_specs(config, model, precise=precise))
         if np.any(arrays["identity"][fixed_identity] != 0):
             raise ValueError("Unselected synthetic identity coefficients must be exactly zero")
         if digest_arrays(arrays) != record["arrays_sha256"]:
@@ -402,11 +430,11 @@ def load_dataset(path):
     return _read_dataset(path, read_json(path / "manifest.json"))
 
 
-def write_dataset(destination, *, config, model, subjects, mapping, runtime, generator):
+def write_dataset(destination, *, config, model, subjects, mapping, runtime, generator, precise=False):
     """Write verified numeric data, then publish the validated completion manifest."""
     records = []
     manifest = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": PRECISION_SCHEMA_VERSION if precise else SCHEMA_VERSION,
         "config": config.metadata(),
         "model": model.metadata,
         "coordinates": COORDINATES,
@@ -420,7 +448,7 @@ def write_dataset(destination, *, config, model, subjects, mapping, runtime, gen
         for index, subject in enumerate(subjects):
             if subject.subject_id != subject_id(index):
                 raise ValueError("Subjects must be supplied in stable identifier order")
-            validate_arrays(subject.arrays, _subject_specs(config, model.metadata), subject.subject_id)
+            validate_arrays(subject.arrays, _subject_specs(config, model.metadata, precise=precise), subject.subject_id)
             records.append({
                 "id": subject.subject_id,
                 "observations": list(subject.observations),

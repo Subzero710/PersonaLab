@@ -1535,6 +1535,7 @@ docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study
   --protocol corrected-identity --identity-studies focal-scalability \
   --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float32 \
   --seeds 42 43 44 --scalability-counts 50 100 300 600 --scalability-batch-size 4 \
+  --scalability-datasets-out datasets/synthetic/focal-scalability-fp32 \
   --spectra --output outputs/identity-study-v6-cpu
 
 docker compose --profile cuda build personalab-cuda
@@ -1544,7 +1545,7 @@ docker compose --profile cuda run --rm personalab-cuda python -m persona_lab.ben
   --protocol corrected-identity --identity-studies focal-scalability \
   --model-file /cache/gnm/v3_0/gnm_head.npz --device cuda --dtype float32 \
   --seeds 42 43 44 --scalability-counts 50 100 300 600 --scalability-batch-size 4 \
-  --scalability-datasets-in outputs/identity-study-v6-cpu/datasets \
+  --scalability-datasets-in datasets/synthetic/focal-scalability-fp32 \
   --spectra --output outputs/identity-study-v6-cuda
 
 docker compose run --rm personalab python -m persona_lab.benchmark.scalability_report \
@@ -1554,8 +1555,10 @@ docker compose run --rm personalab python -m persona_lab.benchmark.scalability_r
 ```
 
 The CPU command creates three 600-observation Scenario C parents and an index
-in its `datasets/` directory. Use `--scalability-datasets-out` to choose
-another fresh reference directory. CUDA requires `--scalability-datasets-in`
+in the explicitly selected persistent `datasets/synthetic/` directory.
+Reference generation requires a writable synthetic directory mount; the
+original real-image datasets can remain read-only. Use a fresh directory
+with `--scalability-datasets-out`. CUDA requires `--scalability-datasets-in`
 with that index and its archives. Each case verifies the archive hashes, the
 ordered parent prefix, its full scientific input hash, and the landmarks,
 masks and weights on the fitting device. The focal factors repeat on the same
@@ -1655,3 +1658,62 @@ fallback; no regeneration of observations, and no automatic relaxation
 of the scientific targets. Neither a more accurate residual nor a full
 rank Jacobian guarantees recovery of exact latent coefficients from
 rounded observations.
+
+
+### V6.3 experimental end-to-end compensated FP32 control
+
+Select `--scalability-precision-forward` explicitly. The normal V6.2 FP32
+mode remains available only through its original explicit experiment
+configuration; it is never invoked automatically on a numerical failure.
+The experimental forward carries FP32 high/low components through the
+identity/expression/joint bases, pose correctives, Rodrigues rotation,
+forward kinematics, skinning, barycentrics and perspective projection.
+Reduction order is fixed across view batching. The rotation polynomial is
+restricted to axis-angle norms at most 2*pi; an invalid trial is rejected,
+not retried with different arithmetic. Smooth native GNM derivatives are
+still computed by FP32 autograd, and the QR solver remains unchanged.
+
+In this mode the independent camera coordinates are `camera_native`
+(translation in meters) and `local_focal` (isotropic focal length in pixels),
+not offsets and logarithms. Positive depth and focal length are enforced
+explicitly. The strict tolerance numbers and all scientific targets are
+unchanged, but native-step norms and camera-coordinate spectra have
+changed units and must not be interpreted as legacy log-coordinate norms.
+Initialization still uses the high raster component. The independent full
+native evaluator still uses the rounded high pixel component for the
+historical scientific metrics; the objective uses high plus low when
+available. The report includes the actual physical-snapshot objective,
+legacy absolute and projection-compensated reference QR probes, and the
+original camera log/exp roundtrip error. No probe is applied to fitting.
+
+First run the new forward on the verified historical raster archive. For
+an additional controlled experiment, explicitly generate a separate
+high/low archive from the same reference parameters, with the same
+identity, views, expressions, cameras, masks and weights. This is a
+matched-forward synthetic control, not independent evidence of real-photo
+accuracy. The source is verified and never modified. The new archive has
+its own schema, source provenance, data ID and input fingerprint including
+the low component. It cannot be used without the experimental flag.
+
+```sh
+# Requires a writable datasets/synthetic directory in the CPU container.
+docker compose run --rm personalab python -m persona_lab.benchmark.precision_archive \
+  --source datasets/synthetic/focal-scalability-fp32 \
+  --output datasets/synthetic/focal-scalability-fp32-high-low \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --seeds 42 --batch-size 8
+
+# Run once with the historical input, and separately with the high/low input.
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float32 \
+  --seeds 42 --scalability-counts 50 --scalability-batch-size 32 \
+  --scalability-primary-only --scalability-precision-forward \
+  --scalability-datasets-in datasets/synthetic/focal-scalability-fp32-high-low \
+  --spectra --output outputs/v6.3-control-cpu
+```
+
+Reports use schema 5. Do not treat historical-raster and high/low-control
+reports as matched identical-input comparisons. The compensated forward
+adds elementwise work and may cost more time or memory, especially on
+CUDA; measure pilot costs before any full-scale campaign. CPU/CUDA exact
+agreement and exact GNM identity recovery require actual integration runs.

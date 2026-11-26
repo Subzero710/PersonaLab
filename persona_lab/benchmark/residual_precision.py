@@ -1,17 +1,20 @@
-"""Post-fit oracle diagnostics for the unchanged FP32 synthetic archives.
+"""Post-fit oracle diagnostics for raster and high/low FP32 synthetic archives.
 
 This module must never feed ground truth to the fitting initializer, solver,
 acceptance rule or stopping criteria. All diagnostics run on the requested
 model device; old projection is measured, never used as a solver fallback.
 """
 
+from dataclasses import replace
+
 import torch
 
-from ..fitting.batched_jacobian import fp32_geometry_batch, residual_fp32_batch
+from ..fitting.batched_jacobian import batch_jacobian, fp32_geometry_batch, residual_fp32_batch
 from ..fitting.levenberg_marquardt import StageCoordinates, bound_mask, square_root_blocks
 from ..fitting.observations import prepare_observations
 from ..fitting.parameters import FittingParameters, TensorState
-from ..fitting.square_root import square_root_step
+from ..fitting.square_root import SquareRootBlocks, square_root_step
+from ..fitting.losses import evaluate_objective
 from .dataset import camera_from_record
 from .model import project_dfl
 
@@ -25,6 +28,53 @@ def _stats(error, mask):
             "landmark_rms_px": float(distances.square().mean().sqrt()),
             "maximum_absolute_coordinate_px": float(coordinates.abs().max()),
             "eligible_landmarks": int(mask.sum())}
+
+
+def _probe(data, parameters, layout, point, *, absolute=False):
+    config = parameters.config
+    if absolute:
+        residuals, jacobians = [], []
+        for start in range(0, len(data), config.batch_size):
+            stop = min(len(data), start + config.batch_size)
+            r, j = batch_jacobian(data, parameters, layout, point, start, stop, legacy_absolute=True)
+            residuals.append(r); jacobians.append(j)
+        system = SquareRootBlocks.create(torch.cat(jacobians), torch.cat(residuals), point.identity.numel(), config.batch_size)
+    else:
+        system = square_root_blocks(data, parameters, layout, point)
+    scales = system.scales(config.lm.diagonal_floor)
+    fixed = bound_mask(point, system.gradient, layout.expression_slice(), config.expression_limit)
+    step, _ = square_root_step(system, scales, config.lm.minimum_damping, fixed)
+    gradient = torch.cat((2 * scales.identity * system.gradient.identity,
+        (2 * scales.local * system.gradient.local).masked_fill(fixed, 0).flatten()))
+    return {
+        "scaled_projected_gradient_norm": float(torch.linalg.vector_norm(gradient)),
+        "weighted_objective": float(system.residual.square().sum()),
+        "minimum_damping": config.lm.minimum_damping,
+        "predicted_reduction": system.predicted_reduction(step),
+        "identity_step_rmse": float(step.identity.square().mean().sqrt()),
+        "identity_step_max_abs": float(step.identity.abs().max()),
+        "identity_step": step.identity.tolist(),
+        "local_step_rmse": float(step.local.square().mean().sqrt()),
+        "local_coordinate_names": list(layout.names),
+        "interpretation": "One linearized correction at the reference state, not a bound or recovered fit",
+    }
+
+
+def _camera_roundtrip(model, initial, cameras):
+    def stack(items, name):
+        return torch.stack([getattr(c, name).to(device=model.reference.device, dtype=torch.float32) for c in items])
+    t0, t = stack(initial, "translation"), stack(cameras, "translation")
+    f0, f = stack(initial, "focal_length"), stack(cameras, "focal_length")
+    z0 = t0[:, 2:]
+    xy = t0[:, :2] + ((t[:, :2] - t0[:, :2]) / z0) * z0
+    z = z0 * (t[:, 2:] / z0).log().exp()
+    restored = f0 * (f / f0).log().exp()
+    error = torch.cat((xy, z), -1) - t
+    return {"translation_rms_m": float(error.square().mean().sqrt()),
+            "translation_max_abs_m": float(error.abs().max()),
+            "focal_max_abs_px": float((restored - f).abs().max()),
+            "focal_max_relative": float(((restored - f) / f).abs().max()),
+            "coordinate_origin": "original cold-start camera; FP32 log/exp round trip"}
 
 
 @torch.no_grad()
@@ -85,13 +135,25 @@ def reference_precision(model, dataset, subject, observations, fit):
     up = torch.nextafter(clean, torch.full_like(clean, float("inf"))) - clean
     down = clean - torch.nextafter(clean, torch.full_like(clean, -float("inf")))
     half_ulp = torch.maximum(up, down) * 0.5
-    system = square_root_blocks(data, parameters, layout, point)
-    scales = system.scales(config.lm.diagonal_floor)
-    fixed = bound_mask(point, system.gradient, layout.expression_slice(), config.expression_limit)
-    step, _ = square_root_step(system, scales, config.lm.minimum_damping, fixed)
-    # Diagnostic step only: never commit it or use it to change fitting.
-    scaled_gradient = torch.cat((2 * scales.identity * system.gradient.identity,
-        (2 * scales.local * system.gradient.local).masked_fill(fixed, 0).flatten()))
+    active_probe = _probe(data, parameters, layout, point)
+    legacy_config = replace(config, lm=replace(config.lm, fp32_forward="projection"))
+    legacy_data = prepare_observations(tuple(replace(obs, pixel_low=None) for obs in observations),
+                                      model.reference, legacy_config)
+    legacy = FittingParameters(model, legacy_data, state, fit.selection, legacy_config)
+    legacy_layout = StageCoordinates.from_parameters(legacy, legacy_config.stages[-1].groups)
+    legacy_point = legacy_layout.pack(legacy.values(), model.reference, len(data))
+    legacy_absolute = _probe(legacy_data, legacy, legacy_layout, legacy_point, absolute=True)
+    legacy_compensated = (_probe(legacy_data, legacy, legacy_layout, legacy_point)
+                          if config.lm.fp32_forward != "projection" else active_probe)
+    final_objective = None
+    if fit.final is not None:
+        from ..fitting.observability import _state
+        final_state = _state(model, data, config, fit.selection, None, fit, "final")
+        final_parameters = FittingParameters(model, data, final_state, fit.selection, config)
+        final_objective = evaluate_objective(model, data, final_parameters, least_squares=True)[0].total
+    target_low = torch.zeros_like(clean) if data.pixel_low is None else data.pixel_low
+    if "pixel_low" in arrays and not torch.equal(model.tensor(arrays["pixel_low"]), target_low):
+        raise ValueError("Oracle low pixels differ from the fitted observations")
     return {
         "status": "evaluated", "used_for_fitting": False,
         "device": str(model.reference.device), "dtype": str(model.reference.dtype),
@@ -104,15 +166,15 @@ def reference_precision(model, dataset, subject, observations, fit):
         "compensated_minus_archive": _stats(precise, mask),
         "compensated_minus_absolute_residual": _stats(precise - (batched - clean), mask),
         "stored_pixel_half_ulp_envelope": _stats(half_ulp, mask),
-        "truth_linearization": {
-            "scaled_projected_gradient_norm": float(torch.linalg.vector_norm(scaled_gradient)),
-            "weighted_objective": float(system.residual.square().sum()),
-            "minimum_damping": config.lm.minimum_damping,
-            "predicted_reduction": system.predicted_reduction(step),
-            "identity_step_rmse": float(step.identity.square().mean().sqrt()),
-            "identity_step_max_abs": float(step.identity.abs().max()),
-            "identity_step": step.identity.tolist(),
-            "local_step_rmse": float(step.local.square().mean().sqrt()),
-            "interpretation": "One linearized correction at the reference state, not a bound or recovered fit",
-        },
+        "truth_linearization": active_probe,
+        "forward_mode": config.lm.fp32_forward,
+        "native_and_sparse_projection_comparisons_target": "high raster component only",
+        "compensated_residual_target": "high plus low components" if data.pixel_low is not None else "high raster component only",
+        "target_representation": "raster-fp32" if data.pixel_low is None else "compensated-fp32-high-low-v1",
+        "legacy_absolute_truth_linearization": legacy_absolute,
+        "legacy_projection_compensated_truth_linearization": legacy_compensated,
+        "legacy_probe_target": "high raster component only; original logarithmic camera coordinates",
+        "legacy_camera_roundtrip": _camera_roundtrip(model, fit.initial.cameras, cameras),
+        "archived_low_component": _stats(target_low, mask),
+        "final_objective_recomputed_from_physical_snapshot": final_objective,
     }

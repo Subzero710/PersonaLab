@@ -22,7 +22,7 @@ from .model import MODEL_SHA256, load_benchmark_model
 from .residual_precision import reference_precision
 from .scalability_cases import BASE_COMMIT, SCHEMA_VERSION, STUDY, case_matrix
 from .scalability_data import (
-    REFERENCE_SCHEMA, SCHEDULE, generate_parent, load_parent, verified_subset, verify_fitter_input,
+    REFERENCE_SCHEMA, PRECISION_REFERENCE_SCHEMA, SCHEDULE, generate_parent, load_parent, verified_subset, verify_fitter_input,
 )
 from .scalability_monitoring import CaseMeasurements, environment
 from .storage import json_bytes, read_json, write_json
@@ -312,19 +312,28 @@ def _run_subprocess(job, cases_path):
 
 
 def _references(args, output, seeds, *, model_available, device_error):
-    root = args.scalability_datasets_in or args.scalability_datasets_out or output / "datasets"
+    root = args.scalability_datasets_in or args.scalability_datasets_out
+    if root is None:
+        raise ValueError("An explicit persistent reference directory is required")
     root = root.resolve()
     index_path = root / "reference.json"
     if args.scalability_datasets_in is not None:
         try:
             reference = read_json(index_path)
-            if (reference.get("schema") != REFERENCE_SCHEMA or reference.get("focal_schedule") != list(SCHEDULE)
+            if reference.get("schema") == PRECISION_REFERENCE_SCHEMA and not args.scalability_precision_forward:
+                raise ValueError("High/low references require --scalability-precision-forward")
+            if (reference.get("schema") not in (REFERENCE_SCHEMA, PRECISION_REFERENCE_SCHEMA) or reference.get("focal_schedule") != list(SCHEDULE)
                     or reference.get("model_asset_sha256") != MODEL_SHA256
                     or not isinstance(reference.get("parents"), dict)):
                 raise ValueError("V6 reference index has incompatible schema, focal schedule or model asset")
         except (OSError, ValueError) as error:
             return root, {}, {seed: _failure("invalid_dataset", "dataset_loading", error) for seed in seeds}
         parents = reference["parents"]
+        for seed in seeds:
+            entry = parents.get(str(seed))
+            if isinstance(entry, dict) and ((entry.get("pixel_representation") == "compensated-fp32-high-low-v1")
+                    != (reference["schema"] == PRECISION_REFERENCE_SCHEMA)):
+                return root, {}, {s: _failure("invalid_dataset", "dataset_loading", "Reference index/parent representation mismatch") for s in seeds}
         return root, parents, {
             seed: _failure("invalid_dataset", "dataset_loading", f"Reference dataset for seed {seed} is missing")
             for seed in seeds if not isinstance(parents.get(str(seed)), dict)
@@ -406,15 +415,18 @@ def run(args, config_for, write_reports):
         "requested_device": args.device, "dtype": args.dtype, "model_asset_sha256": MODEL_SHA256,
         "seeds": args.seeds, "observation_counts": args.scalability_counts,
         "primary_batch_size": args.scalability_batch_size, "spectra_requested": args.spectra,
+        "precision_forward": args.scalability_precision_forward,
         "primary_only": args.scalability_primary_only, "kernel_profiling_requested": args.scalability_profile_kernels,
         "preflight": {"model_file_exists": model_available, "device_error": device_error,
                       "reference_errors": {str(seed): error for seed, error in reference_errors.items()}},
+        "implementation_patch_base_commit": "3bce6df71a94d285e84ade27f61a77772b75757b",
         "reference_directory": str(root), "reference_parents": parents, "focal_schedule": SCHEDULE,
         "batch_semantics": {
             "configurable": ["pose grid initialization", "sparse objective", "observation Jacobians", "local QR elimination"],
             "observation_jacobians": "independent batched view coordinates; bounded autograd residual-row batches",
             "schur": "square-root local QR elimination and shared residual QR; no normal equations",
-            "residual": "compensated homogeneous perspective FP32; immutable V6 raster observations",
+            "residual": ("compensated GNM and perspective high/low FP32; native translation/focal coordinates"
+                         if args.scalability_precision_forward else "compensated homogeneous perspective FP32; immutable V6 raster observations"),
         },
         "device_transfers": [
             "Dataset archives are loaded and validated on CPU. The verified model starts on CPU and moves to the requested device once.",

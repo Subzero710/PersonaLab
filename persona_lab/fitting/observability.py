@@ -98,7 +98,7 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
     expression = layout.expression_slice()
     locals_ = dict(layout.columns())
     pose = locals_.get("pose")
-    depth_column = locals_["camera_delta"].start + 2
+    depth_column = locals_["camera_native" if parameters.config.lm.fp32_forward == "compensated" else "camera_delta"].start + 2
     depth_rows, distinct_focals, raw_focal_norms = [], [], []
     active_blocks = []
     rows = 0
@@ -193,7 +193,7 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
     focal_names = ["shared_log_focal"] if layout.shared_focal else list(data.ids)
     local_priors = {}
     for name, _ in layout.columns():
-        if name == "local_log_focal":
+        if name in ("local_log_focal", "local_focal"):
             continue
         weight = getattr(parameters.config, f"{PARAMETER_GROUPS[name]}_weight")
         local_priors[name] = weight / getattr(parameters, name).numel()
@@ -202,6 +202,8 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
         **{name: _describe(matrix, rows, threshold, rtol, svdvals) for name, matrix in identity_blocks.items()},
         "joint_identity_and_focal": joint_record, "conditional_focal": conditional_record,
         "focal_coordinate_names": focal_names,
+        **({"camera_coordinate_units": {"camera_native": "m", "local_focal": "px"}}
+           if parameters.config.lm.fp32_forward == "compensated" else {}),
         "fixed_nuisance_focal_column_l2": [math.hypot(*raw_focal_norms)] if layout.shared_focal else raw_focal_norms,
         "local_prior_jtj_diagonal": local_priors, "focal_prior_jtj_diagonal": 0.0,
     }

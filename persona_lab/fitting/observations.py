@@ -23,6 +23,7 @@ class FittingObservations:
     short_edges: Tensor
     weight_sum: Tensor
     counts: Tensor
+    pixel_low: Tensor | None = None
 
     @property
     def ids(self):
@@ -43,7 +44,10 @@ def prepare_observations(observations, reference: Tensor, config: FitConfig) -> 
     if len(set(identifiers)) != len(identifiers):
         raise ValueError("Fitting observation IDs must be unique")
 
-    pixels, indices, weights, masks, edges = [], [], [], [], []
+    pixels, indices, weights, masks, edges, lows = [], [], [], [], [], []
+    has_low = tuple(obs.pixel_low is not None for obs in observations)
+    if any(has_low) and (not all(has_low) or config.lm.fp32_forward != "compensated"):
+        raise ValueError("High/low targets require the explicit compensated FP32 forward for every view")
     for obs in observations:
         target = obs.aligned_pixels()
         _validate_tensor(target, f"{obs.observation_id} landmarks", (DFL_LANDMARK_COUNT, 2),
@@ -58,6 +62,9 @@ def prepare_observations(observations, reference: Tensor, config: FitConfig) -> 
             raise ValueError(f"{obs.observation_id} has no eligible fitting landmarks")
         masks.append(mask)
         pixels.append(target.detach())
+        if obs.pixel_low is not None:
+            _validate_tensor(obs.pixel_low, f"{obs.observation_id} pixel low", (DFL_LANDMARK_COUNT, 2), like=reference)
+            lows.append(obs.pixel_low.detach())
         weights.append(obs.weights.detach().masked_fill(~mask, 0))
         indices.append([
             entry.gnm_index if entry.supported else 0 for entry in obs.correspondences.entries
@@ -74,4 +81,5 @@ def prepare_observations(observations, reference: Tensor, config: FitConfig) -> 
         observations, torch.stack(pixels),
         torch.tensor(indices, dtype=torch.long, device=reference.device),
         weight_tensor, eligible, short_edges, weight_sum, eligible.sum(dim=1),
+        torch.stack(lows) if lows else None,
     )
