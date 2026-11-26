@@ -1,7 +1,7 @@
 """Structured fitting results and safe, versioned local interchange."""
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
 
 import numpy as np
@@ -17,11 +17,11 @@ from ..correspondences import DFL_LANDMARK_COUNT
 from .configuration import FitConfig
 from .initialization import InitializationChoice
 from .losses import LossValues, PixelStatistics, Reprojection
-from .monitoring import OptimizationDiagnostics, OptimizationUpdate, Trial
+from .monitoring import Linearization, OptimizationDiagnostics, OptimizationUpdate, Trial
 from .parameters import ParameterSelection, TensorState, copy_camera, resolve_selection, validate_model
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FAILED_STATUSES = ("failed", "numerical_failure", "no_acceptable_step")
 STATUSES = ("budget_exhausted", "converged", "stopped", *FAILED_STATUSES)
 ARRAY_FIELDS = ("identity", "expression", "rotations", "translation")
@@ -46,6 +46,7 @@ class StageSummary:
     status: str
     initial_loss: float
     final_loss: float
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -190,8 +191,12 @@ def save_result(path, result: FitResult):
         _write_result(stage, result)
 
 
-def _fields(cls, value):
-    require_keys(value, {field.name for field in fields(cls)}, cls.__name__)
+def _fields(cls, value, *, legacy=False):
+    declared = fields(cls)
+    if legacy and isinstance(value, dict):
+        defaults = {field.name: field.default for field in declared if field.default is not MISSING}
+        value = defaults | value
+    require_keys(value, {field.name for field in declared}, cls.__name__)
     return value
 
 
@@ -241,16 +246,22 @@ def _decode_cameras(records, ids, dtype, config):
     return tuple(cameras)
 
 
-def _decode_optimization(record, config):
+def _decode_optimization(record, config, *, legacy):
     if record is None:
         return None
-    options = dict(_fields(OptimizationDiagnostics, record))
+    options = dict(_fields(OptimizationDiagnostics, record, legacy=legacy))
     for name in ("initial_objective", "final_objective"):
         value = options[name]
         if value is not None:
             options[name] = LossValues(**_fields(LossValues, value))
-    updates = tuple(OptimizationUpdate(**_fields(OptimizationUpdate, item)) for item in options["updates"])
-    trials = tuple(Trial(**_fields(Trial, item)) for item in options["trials"])
+    updates = tuple(
+        OptimizationUpdate(**_fields(OptimizationUpdate, item, legacy=legacy))
+        for item in options["updates"]
+    )
+    trials = tuple(Trial(**_fields(Trial, item, legacy=legacy)) for item in options["trials"])
+    linearizations = tuple(
+        Linearization(**_fields(Linearization, item)) for item in options["linearizations"]
+    )
     names = {stage.name for stage in config.stages}
     for count in ("objective_evaluations", "jacobian_evaluations", "accepted_updates", "rejected_trials"):
         if type(options[count]) is not int or options[count] < 0:
@@ -258,13 +269,16 @@ def _decode_optimization(record, config):
     if (
         options["accepted_updates"] != len(updates)
         or options["rejected_trials"] != sum(not trial.accepted for trial in trials)
-        or any(item.stage not in names for item in (*updates, *trials))
+        or len(linearizations) > options["jacobian_evaluations"]
+        or any(item.stage not in names for item in (*updates, *trials, *linearizations))
         or any(type(trial.accepted) is not bool for trial in trials)
         or config.solver == "adam" and (trials or options["jacobian_evaluations"])
         or config.solver == "levenberg-marquardt" and sum(trial.accepted for trial in trials) != len(updates)
     ):
         raise ValueError("Optimization diagnostics disagree with the fitting schedule or solver")
-    return OptimizationDiagnostics(**(options | {"updates": updates, "trials": trials}))
+    return OptimizationDiagnostics(**(options | {
+        "updates": updates, "trials": trials, "linearizations": linearizations,
+    }))
 
 
 def load_result(path, *, model) -> FitResult:
@@ -281,14 +295,14 @@ def _load_result(path, model):
     # Also rejects finite-looking literals that overflow the JSON decoder's float.
     json_bytes(manifest)
     version = manifest.get("schema_version")
-    if type(version) is not int or version not in (1, SCHEMA_VERSION):
+    if type(version) is not int or version not in (1, 2, SCHEMA_VERSION):
         raise ValueError("Unsupported fitting result schema")
     keys = {
         "schema_version", "model", "dtype", "device", "config", "selection", "gauge", "observation_ids",
         "initialization", "initial_cameras", "final_cameras", "initial_reprojection",
         "final_reprojection", "history", "stages", "status", "reason", "runtime",
     }
-    if version == SCHEMA_VERSION:
+    if version >= 2:
         keys.add("optimization")
     require_keys(manifest, keys, "Fitting result")
     if manifest["model"] != model.metadata:
@@ -308,11 +322,14 @@ def _load_result(path, model):
     ):
         raise ValueError("Fitting result requires unique observation IDs")
 
-    config = FitConfig.from_dict(manifest["config"])
+    options = manifest["config"]
+    if version == 1 and isinstance(options, dict):
+        options = {"solver": "adam"} | options
+    config = FitConfig.from_dict(options)
     if version == 1 and (config.solver != "adam" or "lm" in manifest["config"]):
         raise ValueError("Version 1 fitting results require the original Adam configuration")
-    if version == SCHEMA_VERSION and not {"solver", "lm"} <= manifest["config"].keys():
-        raise ValueError("Version 2 fitting results require explicit solver configuration")
+    if version >= 2 and not {"solver", "lm"} <= manifest["config"].keys():
+        raise ValueError("Fitting results since version 2 require explicit solver configuration")
     selection = resolve_selection(model, config)
     if json_bytes(asdict(selection)) != json_bytes(manifest["selection"]):
         raise ValueError("Saved native parameter selections disagree with the configuration")
@@ -375,7 +392,9 @@ def _load_result(path, model):
         entry["reprojection"] = PixelStatistics(**_fields(PixelStatistics, entry["reprojection"]))
         history.append(Iteration(**entry))
     stages = tuple(
-        StageSummary(**(_fields(StageSummary, item) | {"active_groups": tuple(item["active_groups"])}))
+        StageSummary(**(_fields(StageSummary, item, legacy=version < 3) | {
+            "active_groups": tuple(item["active_groups"]),
+        }))
         for item in manifest["stages"]
     )
     if not isinstance(manifest["runtime"], dict):
@@ -386,7 +405,7 @@ def _load_result(path, model):
         _decode_reprojection(manifest["initial_reprojection"], len(ids)),
         _decode_reprojection(manifest["final_reprojection"], len(ids)),
         tuple(history), stages, status, reason, manifest["runtime"],
-        _decode_optimization(manifest.get("optimization"), config),
+        _decode_optimization(manifest.get("optimization"), config, legacy=version < 3),
     )
     if json_bytes(result.gauge) != json_bytes(manifest["gauge"]):
         raise ValueError("Saved parameter gauge disagrees with the fitting configuration")

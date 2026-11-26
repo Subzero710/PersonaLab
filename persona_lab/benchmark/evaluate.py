@@ -4,14 +4,15 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
+from gnm.shape import gnm_utils
 import numpy as np
 
 from ..camera import PerspectiveCamera
 from .configuration import torch_options
 from .dataset import camera_from_record, camera_to_record, load_dataset
 from .metrics import (
-    coefficient_errors, reprojection_errors, rotation_errors_deg, summarize_pixels,
-    translation_error, vertex_errors,
+    METRIC_UNITS, grouped_coefficient_errors, neutral_geometry_errors, pool_coefficient_errors,
+    reprojection_errors, rotation_errors_deg, summarize_pixels, translation_error,
 )
 from .model import load_benchmark_model, project_dfl
 from .predictions import read_predictions
@@ -91,7 +92,8 @@ def _pose_errors(item, truth, index, joint_names):
     }
 
 
-def _score_observation(model, dataset, truth, index, identity, prediction, mode, *, compare_camera_gauges=False):
+def _score_observation(model, dataset, truth, index, identity, prediction, mode, *,
+                       compare_camera_gauges=False, trainable_expression=None):
     item = truth.observations[index]
     key = item["id"]
     arrays = truth.arrays
@@ -126,9 +128,11 @@ def _score_observation(model, dataset, truth, index, identity, prediction, mode,
     if estimate is not None:
         pose_recovery = _pose_errors(estimate, arrays, index, model.metadata["joint_names"])
         if estimate.expression is not None:
-            expression_recovery = {"status": "evaluated"} | coefficient_errors(
-                estimate.expression, arrays["expression"][index],
+            groups = grouped_coefficient_errors(
+                estimate.expression, arrays["expression"][index], model.metadata["expression_names"],
+                trainable=trainable_expression,
             )
+            expression_recovery = {"status": "evaluated"} | groups["global"] | groups
     valid = arrays["validity"][index]
     return {
         "id": key, "view": item["view"], "expression_preset": item["expression"],
@@ -155,16 +159,24 @@ def _pool_reprojection(observations):
     return result
 
 
+def _pool_expression(observations):
+    scored = [item["expression_recovery"] for item in observations
+              if item["expression_recovery"]["status"] == "evaluated"]
+    return {
+        key: pool_coefficient_errors(item[key] for item in scored)
+        for key in ("global", "trainable", "fixed") if scored and key in scored[0]
+    }
+
+
 def _pool_reconstruction(records):
     identities = [record["identity"] for record in records]
     geometry = [record["neutral_geometry"] for record in records]
     # Both vector lengths and mesh vertex counts are constant across a dataset.
     return {
-        "identity": {
-            "mae": float(np.mean([item["mae"] for item in identities])),
-            "rmse": float(np.sqrt(np.mean([item["rmse"] ** 2 for item in identities]))),
-            "max_absolute": max(item["max_absolute"] for item in identities),
-            "coefficient_count": sum(item["coefficient_count"] for item in identities),
+        "identity": pool_coefficient_errors(identities),
+        "identity_groups": {
+            name: pool_coefficient_errors(record["identity_groups"][name] for record in records)
+            for name in records[0]["identity_groups"]
         },
         "neutral_geometry": {
             "mean_m": float(np.mean([item["mean_m"] for item in geometry])),
@@ -194,6 +206,7 @@ def evaluate_predictions(dataset, predictions, *, mode, model_file=None, device=
         raise ValueError("Active model, parameter ordering, topology or landmarks differ from the benchmark")
     records = []
     pooled = []
+    identity_regions = gnm_utils.identity_regions_indices(model.head)
     for key in selected:
         truth = dataset.ground_truth(key)
         prediction = incoming[key]
@@ -204,10 +217,15 @@ def evaluate_predictions(dataset, predictions, *, mode, model_file=None, device=
                 for index in range(len(truth.observations))
             ]
             pooled.extend(observations)
+        identity = grouped_coefficient_errors(
+            prediction.identity, truth.arrays["identity"], model.metadata["identity_names"],
+            regions=identity_regions,
+        )
         record = {
             "id": key, "observation_count": len(truth.observations),
-            "identity": coefficient_errors(prediction.identity, truth.arrays["identity"]),
-            "neutral_geometry": vertex_errors(model.neutral(prediction.identity), truth.arrays["neutral_vertices"]),
+            "identity": identity["global"], "identity_groups": identity,
+            **neutral_geometry_errors(model, prediction.identity, truth.arrays["neutral_vertices"]),
+            "expression_recovery": _pool_expression(observations),
             "reprojection": _pool_reprojection(observations) if observations else None,
             "observations": observations,
         }
@@ -222,9 +240,11 @@ def evaluate_predictions(dataset, predictions, *, mode, model_file=None, device=
         "source_dataset_id": dataset.source_dataset_id, "evaluation_dataset_id": dataset.dataset_id,
         "model_asset_sha256": model.metadata["asset_sha256"],
         "mode": mode, "dtype": dataset.config.dtype, "evaluation_device": str(model.reference.device),
+        "metric_units": METRIC_UNITS, "geometry_aligned": False,
         "omitted_subject_ids": [key for key in all_subjects if key not in selected],
         "subjects": records, "subject_count": len(records), "scored_observation_count": len(pooled),
         "aggregate": _pool_reconstruction(records) | {
+            "expression_recovery": _pool_expression(pooled),
             "reprojection": _pool_reprojection(pooled) if pooled else None,
             "reprojection_by_noise_profile": {
                 name: _pool_reprojection([item for item in pooled if item["noise_profile"] == name])

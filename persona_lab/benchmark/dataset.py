@@ -344,6 +344,17 @@ def _read_dataset(path, manifest):
         raise ValueError("Dataset must preserve the fully resolved generation configuration")
     model = manifest["model"]
     _validate_model(model)
+    fixed_identity = []
+    if config.identity_selection is not None:
+        names = model["identity_names"]
+        # Native component metadata uses "<region>_<index>" names.
+        selected = [
+            name for name in names
+            if config.identity_selection == "full" or name.rpartition("_")[0] == "head"
+        ]
+        if not selected or manifest["generator"].get("identity_coefficient_names") != selected:
+            raise ValueError("Dataset identity selection differs from its native coefficient provenance")
+        fixed_identity = [i for i, name in enumerate(names) if name not in selected]
     mapping = _load_mapping(manifest["correspondences"])
     topology = read_arrays(
         path / "topology.npz", {"triangles": (np.dtype("int32"), (model["triangle_count"], 3))},
@@ -364,6 +375,8 @@ def _read_dataset(path, manifest):
         if record["id"] != subject_id(index):
             raise ValueError("Invalid, duplicate or out-of-order subject identifier")
         arrays = read_arrays(path / f"{record['id']}.npz", _subject_specs(config, model))
+        if np.any(arrays["identity"][fixed_identity] != 0):
+            raise ValueError("Unselected synthetic identity coefficients must be exactly zero")
         if digest_arrays(arrays) != record["arrays_sha256"]:
             raise ValueError(f"Inconsistent arrays for {record['id']}")
         fingerprint = digest_arrays({"identity": arrays["identity"]})

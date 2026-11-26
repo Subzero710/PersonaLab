@@ -16,6 +16,7 @@ class OptimizationUpdate:
     stage: str
     stage_iteration: int
     parameter_update_norm: float
+    scaled_parameter_update_norm: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,20 @@ class Trial:
     actual_reduction: float | None
     acceptance_ratio: float | None
     conditioning: dict[str, float | None]
+    scaled_parameter_update_norm: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Linearization:
+    stage: str
+    stage_iteration: int
+    objective: float
+    damping: float
+    projected_gradient_norm: float
+    scaled_gradient_norm: float
+    active_expression_bounds: int
+    minimum_damping_probe_native_norm: float | None
+    minimum_damping_probe_scaled_norm: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +59,7 @@ class OptimizationDiagnostics:
     rejected_trials: int
     updates: tuple[OptimizationUpdate, ...]
     trials: tuple[Trial, ...]
+    linearizations: tuple[Linearization, ...] = ()
 
 
 def finite_norm(*values):
@@ -72,6 +88,7 @@ class FitMeasurements:
         self.seconds = dict.fromkeys(("objective", "jacobian", "linear_solve"), 0.0)
         self.updates = []
         self.trials = []
+        self.linearizations = []
 
     @contextmanager
     def time(self, phase):
@@ -95,4 +112,5 @@ class FitMeasurements:
             self.initial_objective, self.last_objective, self.objective_evaluations,
             self.jacobian_evaluations, len(self.updates),
             sum(not trial.accepted for trial in self.trials), tuple(self.updates), tuple(self.trials),
+            tuple(self.linearizations),
         )

@@ -88,6 +88,7 @@ def _synthesize(model, *, camera_kind="both", include_cameras=True, varied=True,
 
 def _config(**overrides):
     defaults = {
+        "solver": "adam",
         "train_identity": ("head_000",), "train_expression": ("lower_face_region_000",),
         "pose_initializer": "neutral", "identity_weight": 0, "expression_weight": 0,
         "stages": (Stage("fit", 1, ("identity", "expression", "pose", "camera"), 0.005),),
@@ -100,6 +101,23 @@ def _parameters(model, observations, config, initial=None):
     selection = resolve_selection(model, config)
     state, choices = initialize(model, data, config, FitInitialization() if initial is None else initial)
     return data, FittingParameters(model, data, state, selection, config), choices
+
+
+def test_solver_defaults_and_explicit_adam():
+    from persona_lab.fit import _config as cli_config, _parser
+
+    assert FitConfig().solver == FitConfig.from_dict({}).solver == "levenberg-marquardt"
+    arguments = ["--benchmark", "synthetic", "--output", "fit"]
+    assert cli_config(_parser().parse_args(arguments)).solver == "levenberg-marquardt"
+    assert cli_config(_parser().parse_args([*arguments, "--solver", "adam"])).solver == "adam"
+    with pytest.raises(ValueError, match="supported solver"):
+        FitConfig(solver="other")
+
+
+@pytest.mark.parametrize("name", ["native_step_tolerance", "scaled_step_tolerance"])
+def test_lm_displacement_tolerances_validate(name):
+    with pytest.raises(ValueError, match=name):
+        LevenbergMarquardtConfig(**{name: -1})
 
 
 def test_validate_model_checks_flat_unhashable_gnm_tensors(model):
@@ -455,6 +473,51 @@ def test_local_observability_separates_identity_and_expression(model):
     assert report["after_expression"] == report["after_all_nuisance"]
 
 
+def test_observability_accounts_for_wide_jacobian(model):
+    observations, *_ = _synthesize(model, varied=False, count=1)
+    config = FitConfig()
+    report = identity_observability(model, observations, config)
+    for name in ("fixed_nuisance", "after_expression", "after_all_nuisance"):
+        spectrum = report[name]
+        assert spectrum["identity_parameter_count"] == len(spectrum["singular_values"]) == 170
+        assert spectrum["implicit_zero_singular_values"] >= 34
+        assert spectrum["rank"] + spectrum["nullity"] == 170
+        assert spectrum["condition_number"] is None
+        assert spectrum["effective_condition_number"] >= 1
+
+
+def test_final_observability_uses_fit_snapshot_without_reinitializing(model, monkeypatch):
+    from persona_lab.fitting import observability
+
+    observations, *_ = _synthesize(model, camera_kind="perspective", include_cameras=False, count=2)
+    config = _lm_config(camera_mode="estimated", camera_model="perspective", stages=(
+        Stage("joint", 3, ("identity", "expression", "pose", "camera"), 0.022),
+    ))
+    fit = fit_identity(model, observations, config)
+    assert fit.final is not None, fit.reason
+    original = observability.observation_jacobian
+
+    def forbidden(*args):
+        raise AssertionError("Fitted-state observability must use the saved snapshot")
+
+    def check(data, params, layout, base, position, index):
+        state = params.state(index, index + 1)
+        np.testing.assert_array_equal(state.identity.detach().numpy(), fit.final.identity)
+        np.testing.assert_array_equal(state.expression.detach().numpy()[0], fit.final.expression[index])
+        np.testing.assert_array_equal(state.rotations.detach().numpy()[0], fit.final.rotations[index])
+        assert camera_to_record(state.cameras[0]) == camera_to_record(fit.final.cameras[index])
+        return original(data, params, layout, base, position, index)
+
+    initialized = identity_observability(model, observations, config, fit=fit)
+    monkeypatch.setattr(observability, "initialize", forbidden)
+    monkeypatch.setattr(observability, "observation_jacobian", check)
+    fitted = identity_observability(model, observations, config, fit=fit, at="final")
+    assert fitted["state"] == "final"
+    assert fitted["fixed_nuisance"]["singular_values"] != initialized["fixed_nuisance"]["singular_values"]
+    with pytest.raises(ValueError, match="ordered observations"):
+        identity_observability(model, observations[::-1], config, fit=fit, at="final")
+
+
 def test_known_camera_cli_reproducible_across_processes(model, asset, benchmark_path, tmp_path):
     dataset = load_dataset(benchmark_path)
     subject, = dataset.subject_ids
@@ -529,8 +592,10 @@ def _lm_config(**overrides):
 ])
 def test_lm_residuals_match_all_objective_terms_and_view_derivatives(model, mode, kind, root):
     from persona_lab.fitting.levenberg_marquardt import (
-        StageCoordinates, normal_blocks, observation_jacobian, observation_residual,
+        StageCoordinates, normal_blocks, observation_jacobian,
     )
+    from persona_lab.fitting.losses import weighted_landmark_residuals
+    from persona_lab.fitting.schur import BlockVector
 
     observations, *_ = _synthesize(model, camera_kind=kind, include_cameras=mode == "known", count=2)
     first, second = observations
@@ -558,14 +623,21 @@ def test_lm_residuals_match_all_objective_terms_and_view_derivatives(model, mode
     blocks = normal_blocks(model, data, params, layout, base, position)
     data_curvature, data_gradient = 0.0, 0.0
     for index in range(len(data)):
-        residual, jacobian = observation_jacobian(model, data, params, layout, base, position, index)
+        residual, jacobian = observation_jacobian(data, params, layout, base, position, index)
         point = torch.cat((position.identity, position.local[index]))
         epsilon = 1e-6
+
+        def full_mesh_residual(point):
+            width = position.identity.numel()
+            values = layout.unpack(base.batch(index, index + 1), BlockVector(point[:width], point[None, width:]))
+            state = params.state(index, index + 1, values)
+            projected = project_batch(model, state, (data.ids[index],))
+            return weighted_landmark_residuals(projected, data, index, index + 1)
+
         with torch.no_grad():
+            torch.testing.assert_close(residual, full_mesh_residual(point), atol=1e-14, rtol=1e-12)
             numeric = torch.stack([
-                (observation_residual(model, data, params, layout, base, position, index, point + direction)
-                 - observation_residual(model, data, params, layout, base, position, index, point - direction))
-                / (2 * epsilon)
+                (full_mesh_residual(point + direction) - full_mesh_residual(point - direction)) / (2 * epsilon)
                 for direction in epsilon * torch.eye(point.numel(), dtype=point.dtype)
             ], dim=1)
         torch.testing.assert_close(jacobian, numeric, atol=2e-8, rtol=3e-5)
@@ -577,6 +649,19 @@ def test_lm_residuals_match_all_objective_terms_and_view_derivatives(model, mode
     torch.testing.assert_close(
         blocks.gradient.identity[0], data_gradient + config.identity_weight * position.identity[0],
     )
+
+    zero_config = replace(config, identity_weight=0.0, expression_weight=0.0)
+    by_solver = []
+    for least_squares in (False, True):
+        by_batch = []
+        for size in (1, 2):
+            params.config = replace(zero_config, batch_size=size)
+            score, _ = evaluate_objective(model, data, params, least_squares=least_squares)
+            assert score.identity == score.expression == 0.0
+            by_batch.append(score.total)
+        assert by_batch[0] == pytest.approx(by_batch[1], abs=1e-14)
+        by_solver.append(by_batch[0])
+    assert by_solver[0] == pytest.approx(by_solver[1], abs=1e-14)
 
 
 def test_lm_recovers_controlled_neutral_identity_and_round_trips(model, tmp_path):
@@ -675,12 +760,42 @@ def test_lm_rejects_invalid_geometry_without_committing_trial(model, monkeypatch
         assert result.optimization.accepted_updates == 1
     else:
         assert result.status == "no_acceptable_step" and result.final is None
+        expected = "damping limit reached" if limit == "damping" else "trial-step budget exhausted"
+        assert expected in result.stages[-1].reason
+        assert result.stages[-1].reason in result.reason
         assert result.optimization.final_objective == result.optimization.initial_objective
         assert result.optimization.rejected_trials == (2 if limit == "trials" else 1)
         path = tmp_path / "rejected"
         save_result(path, result)
         with pytest.raises(ValueError, match="failed"):
             load_result(path, model=model).to_prediction()
+
+
+def test_lm_small_gradient_can_hide_large_native_step(model, monkeypatch):
+    from persona_lab.fitting import levenberg_marquardt as lm
+    from persona_lab.fitting.schur import BlockVector, NormalBlocks
+
+    observations, *_ = _synthesize(model, varied=False, count=1)
+    config = _lm_config(
+        train_identity=("head_000", "head_001"), train_expression=(), train_head=False,
+        stages=(Stage("identity", 1, ("identity",), 0.01),),
+    )
+    ref = model.reference
+    normal = NormalBlocks(
+        ref.new_tensor([[1, 1 - 1e-9], [1 - 1e-9, 1]]), ref.new_empty((1, 2, 0)),
+        ref.new_empty((1, 0, 0)), BlockVector(ref.new_tensor([1e-11, -1e-11]), ref.new_empty((1, 0))),
+    )
+    monkeypatch.setattr(lm, "normal_blocks", lambda *args: normal)
+    original = fit_identity(model, observations, config)
+    assert original.status == "converged" and not original.optimization.updates
+    guarded = fit_identity(model, observations, replace(config, lm=replace(
+        config.lm, minimum_damping=1e-12, native_step_tolerance=1e-4, max_trials=1,
+    )))
+    linearization, = guarded.optimization.linearizations
+    assert linearization.scaled_gradient_norm < config.lm.scaled_gradient_tolerance
+    assert linearization.minimum_damping_probe_native_norm > 0.01
+    assert guarded.status in ("budget_exhausted", "no_acceptable_step")
+    assert len(guarded.optimization.trials) == 1
 
 
 @pytest.mark.parametrize("failure", ["residual", "Jacobian", "factorization"])
@@ -846,6 +961,81 @@ def test_study_pairs_preserve_observation_order_and_comparison_controls(monkeypa
             assert adam["budget"] == "profiling_only"
             assert [stage["iterations"] for stage in lm["config"]["stages"]] == [1, 1, 1]
     assert {item["observations"] for item in adam_cases if item["experiment"] == "H"} == {50, 100, 300, 600}
+
+
+def test_corrected_study_plans_nested_counts_and_independent_weight_sweeps(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from persona_lab.benchmark import fitting_study
+
+    generated = {}
+
+    def generate(path, config, **kwargs):
+        assert str(path) not in generated
+        generated[str(path)] = config
+
+    monkeypatch.setattr(fitting_study, "generate_dataset", generate)
+    args = SimpleNamespace(
+        output=tmp_path, device="cpu", dtype="float64", model_file=None, spectra=False, seeds=(42, 43),
+        identity_studies=fitting_study.IDENTITY_STUDIES, lm_iterations=(0, 0, 7),
+        noise_levels=(0.5, 2.0), identity_weights=(0.0, 1e-6), expression_weights=(0.0, 2e-5),
+    )
+    jobs = list(fitting_study._corrected_jobs(args))
+    for seed in args.seeds:
+        by_seed = [job for job in jobs if job["seed"] == seed]
+        counts = [job for job in by_seed if job["identity_studies"] == ["count"]]
+        assert tuple(job["observations"] for job in counts) == fitting_study.COUNTS
+        source, = {job["dataset"] for job in counts}
+        assert generated[source].observations_per_subject == 100
+        assert counts[0]["spectra"]
+        for job in by_seed:
+            cfg = FitConfig.from_dict(json.loads(json.dumps(job["config"])))
+            assert cfg.solver == "levenberg-marquardt" and cfg.camera_mode == "known"
+            assert cfg.train_identity == ("head",) and len(cfg.train_expression) == 24
+            assert [stage.iterations for stage in cfg.stages] == [0, 0, 7]
+            assert not job["known_pose_diagnostic"]
+            assert generated[job["dataset"]].identity_selection == "head"
+        robust = [job for job in by_seed if job["identity_studies"] == ["robustness"]]
+        actual = {
+            (generated[job["dataset"]].gaussian_noise_px, job["config"]["identity_weight"],
+             job["config"]["expression_weight"]) for job in robust
+        }
+        assert actual == {(n, i, e) for n in args.noise_levels for i in args.identity_weights
+                          for e in args.expression_weights}
+        sensitivity = [job for job in by_seed if "convergence" in job["identity_studies"]]
+        assert len(sensitivity) == 4 and all(job["spectra"] and job["final_spectra"] for job in sensitivity)
+        assert {job["config"]["lm"]["minimum_damping"] for job in sensitivity} == {1e-8, 1e-12}
+
+
+def test_corrected_study_scores_holdout_and_freezes_identity_exactly(asset, tmp_path):
+    from dataclasses import asdict
+    from persona_lab.benchmark import fitting_study
+
+    path = tmp_path / "held-out-source"
+    generate_dataset(path, resolve_config("C", identity_selection="head", observations_per_subject=18),
+                     model_file=asset)
+    config = fitting_study._fit_config("levenberg-marquardt", (0, 0, 1), {
+        "identity_weight": 0.0, "expression_weight": 0.0,
+    })
+    record = fitting_study._run_job({
+        "config": asdict(config), "dataset": str(path), "observations": 9, "case": "held-out",
+        "experiment": "corrected-identity", "seed": 42, "dtype": "float64", "device": "cpu",
+        "model_file": asset, "known_pose_diagnostic": False, "spectra": False, "budget": "fit",
+        "held_out_dataset": str(path), "held_out_start": 9, "identity_studies": ["held-out"],
+        "convergence_settings": "original",
+    })
+    assert record["compatibility"]["fully_representable"]
+    assert record["final"]["fixed_identity_preserved"]
+    assert record["final"]["identity"]["fixed"]["rmse"] == 0.0
+    assert record["final"]["identity"]["trainable"]["coefficient_count"] == 170
+    held = record["held_out"]
+    assert held["frozen_identity_exact"]
+    assert not set(held["observation_ids"]) & set(record["observation_ids"])
+    assert held["conditional_ground_truth_nuisance"]["diagnostic"] == "oracle_ground_truth_nuisance"
+    estimate = held["estimated_expression_and_pose"]
+    assert estimate["expression"]["global"]["coefficient_count"] == 9 * 383
+    assert estimate["expression"]["trainable"]["coefficient_count"] == 9 * 24
+    assert estimate["expression"]["fixed"]["rmse"] == 0.0
+    assert json.loads(json.dumps(record, allow_nan=False))["source_dataset_id"] == record["source_dataset_id"]
 
 
 @pytest.mark.parametrize("changes,shared_root,mismatches", [

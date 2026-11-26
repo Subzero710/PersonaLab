@@ -149,7 +149,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             names = tuple(name for name in stage.groups if groups[name])
             start_loss = values.total
             if not stage.iterations or not names:
-                stages.append(StageSummary(stage.name, names, 0, "skipped", start_loss, start_loss))
+                skip_reason = "zero iteration budget" if not stage.iterations else "no active parameter groups"
+                stages.append(StageSummary(stage.name, names, 0, "skipped", start_loss, start_loss, skip_reason))
                 continue
 
             before = len(run.updates)
@@ -162,9 +163,9 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
                 values, current_stats, status, reason = fit_lm_stage(
                     model, data, parameters, stage, names, values, current_stats, run, record,
                 )
-            reason = f"{stage.name}: {reason}"
             steps = len(run.updates) - before
-            stages.append(StageSummary(stage.name, names, steps, status, start_loss, values.total))
+            stages.append(StageSummary(stage.name, names, steps, status, start_loss, values.total, reason))
+            reason = f"{stage.name}: {reason}"
             running_stage = None
             record(stage.name, steps, values, current_stats, {})
             if status in FAILED_STATUSES:
@@ -180,7 +181,7 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         if running_stage is not None:
             stage, names, before, start_loss = running_stage
             stages.append(StageSummary(
-                stage.name, names, len(run.updates) - before, status, start_loss, run.last_objective.total,
+                stage.name, names, len(run.updates) - before, status, start_loss, run.last_objective.total, str(error),
             ))
 
     elapsed = perf_counter() - started

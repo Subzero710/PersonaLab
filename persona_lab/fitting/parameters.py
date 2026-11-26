@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 
 from gnm.shape import gnm_utils
 import torch
@@ -11,6 +12,7 @@ from ..benchmark.dataset import _validate_model
 from ..benchmark.model import BenchmarkModel
 from ..camera import Camera, PerspectiveCamera, WeakPerspectiveCamera, _camera_batch
 from ..coordinates import _validate_tensor
+from ..gnm_geometry import SparseHeadLandmarks
 from .configuration import FitConfig
 
 
@@ -133,11 +135,15 @@ def _select(names, regions, train, fixed):
     return tuple(names[index] for index in indices)
 
 
+def resolve_identity_coefficients(head, train, fixed=()):
+    """Resolve identity coefficients or native regions in model order."""
+    return _select(list(head.identity_names), gnm_utils.identity_regions_indices(head), train, fixed)
+
+
 def resolve_selection(model, config: FitConfig) -> ParameterSelection:
     head = model.head
     identity_names, expression_names = list(head.identity_names), list(head.expression_names)
-    identity = _select(identity_names, gnm_utils.identity_regions_indices(head),
-                       config.train_identity, config.fixed_identity)
+    identity = resolve_identity_coefficients(head, config.train_identity, config.fixed_identity)
     expression = _select(expression_names, gnm_utils.expression_regions_indices(head),
                          config.train_expression, config.fixed_expression)
     if len(expression) == head.expression_dim and config.expression_weight == 0:
@@ -229,6 +235,11 @@ class FittingParameters:
             nn.Parameter(reference.new_zeros((len(observations), 3)))
             if config.camera_mode == "estimated" else None
         )
+        self._head = head
+
+    @cached_property
+    def landmark_geometry(self):
+        return SparseHeadLandmarks(self._head)
 
     @staticmethod
     def _parameter(values):
@@ -293,13 +304,17 @@ class FittingParameters:
         zero = self.initial.identity.new_zeros(())
         terms = {}
         for group in ("identity", "expression", "pose", "camera"):
+            strength = getattr(self.config, f"{group}_weight")
+            if strength == 0:
+                terms[group] = zero
+                continue
             squares = [
                 self.penalty_delta(name, value).square().mean()
                 for name, parent in PARAMETER_GROUPS.items()
                 if group == parent and (value := getattr(values, name)) is not None
             ]
             total = sum(squares[1:], squares[0]) if squares else zero
-            terms[group] = total * getattr(self.config, f"{group}_weight")
+            terms[group] = total * strength
         return tuple(terms.values())
 
 

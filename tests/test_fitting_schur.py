@@ -105,14 +105,16 @@ def test_acceptance_uses_projected_step_in_the_model_dtype():
         assert candidate.expression.item() == 1.0
         return SimpleNamespace(total=(candidate.expression.item() - target) ** 2), None
 
-    result, reason, (norm, predicted, actual, ratio) = _trial_step(
-        None, None, parameters, base, position, layout, blocks, step, slice(0, 1),
+    scales = BlockVector(step.identity, step.local.new_full((1, 1), 2))
+    result, reason, (norm, scaled, predicted, actual, ratio) = _trial_step(
+        None, None, parameters, base, position, layout, blocks, scales, step, slice(0, 1),
         (old_coordinate - target) ** 2, SimpleNamespace(evaluate=evaluate),
     )
     expected = 1.0 - old_coordinate
     assert result is not None and reason == "accepted"
     assert float(base.expression[0, 0]) == old_coordinate
     assert norm == expected
+    assert scaled == expected / 2
     assert predicted == pytest.approx(10 * expected - expected ** 2)
     assert actual == pytest.approx(predicted)
     assert ratio == pytest.approx(1)

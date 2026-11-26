@@ -6,6 +6,13 @@ from scipy.spatial.transform import Rotation
 from ..correspondences import DFL_LANDMARK_COUNT
 
 
+REGION_THRESHOLD = 1e-4
+NEUTRAL_REGIONS = {
+    "exterior_skin": "skin_exterior", "facial": "hockey_mask", "eyes": "eyes", "teeth": "teeth",
+}
+METRIC_UNITS = {"coefficients": "native", "geometry": "m", "reprojection": "px", "rotation": "deg"}
+
+
 def _finite_float(values, name):
     array = np.asarray(values)
     if array.dtype.kind != "f" or not np.isfinite(array).all():
@@ -50,6 +57,49 @@ def coefficient_errors(estimated, ground_truth, *, estimated_names=None, ground_
     }
 
 
+def grouped_coefficient_errors(estimated, ground_truth, names, *, trainable=None, regions=None):
+    """Score native coefficient groups, with empty selections represented by null."""
+    estimated, ground_truth = np.asarray(estimated), np.asarray(ground_truth)
+    metrics = {"global": coefficient_errors(
+        estimated, ground_truth, estimated_names=names, ground_truth_names=names,
+    )}
+    groups = dict(regions or {})
+    if trainable is not None:
+        if len(set(trainable)) != len(trainable) or not set(trainable) <= set(names):
+            raise ValueError("Trainable coefficients must be unique native names")
+        mask = np.isin(names, trainable)
+        groups.update(trainable=np.flatnonzero(mask), fixed=np.flatnonzero(~mask))
+    for name, indices in groups.items():
+        metrics[name] = coefficient_errors(estimated[indices], ground_truth[indices]) if len(indices) else None
+    return metrics
+
+
+def pool_coefficient_errors(metrics):
+    """Pool MAE and squared error using the actual number of coefficients."""
+    metrics = [item for item in metrics if item is not None]
+    count = sum(item["coefficient_count"] for item in metrics)
+    if not count:
+        return None
+    return {
+        "coefficient_count": count,
+        "mae": sum(item["coefficient_count"] * item["mae"] for item in metrics) / count,
+        "rmse": float(np.sqrt(sum(item["coefficient_count"] * item["rmse"] ** 2 for item in metrics) / count)),
+        "max_absolute": max(item["max_absolute"] for item in metrics),
+    }
+
+
+def fixed_coefficient_error(initial, truth, names, trainable):
+    """Return mismatched fixed coefficient names and their full-native RMSE floor."""
+    delta = _difference(initial, truth)
+    if delta.shape != (len(names),):
+        raise ValueError("Fixed-coefficient analysis requires a full native vector")
+    fixed = ~np.isin(names, trainable)
+    return {
+        "differing_coefficients": [name for name, value in zip(names, delta * fixed, strict=True) if value != 0],
+        "full_native_rmse_floor": _rms(delta * fixed),
+    }
+
+
 def vertex_errors(estimated, ground_truth):
     """Compare matching (V, 3) positions in meters without any alignment."""
     if np.ndim(estimated) != 2 or np.shape(estimated)[-1] != 3 or len(estimated) == 0:
@@ -58,6 +108,23 @@ def vertex_errors(estimated, ground_truth):
     return {
         "mean_m": float(np.mean(distances)), "rms_m": _rms(distances),
         "max_m": float(np.max(distances)), "vertex_count": len(distances),
+    }
+
+
+def neutral_geometry_errors(model, identity, truth):
+    """Score unaligned meshes in meters and expose the native anatomical regions."""
+    vertices = model.neutral(identity)
+    weights = model.head.vertex_groups.detach().cpu().numpy()
+    groups = {}
+    for name, values in zip(model.head.vertex_group_names, weights, strict=True):
+        mask = values > REGION_THRESHOLD
+        if mask.any():
+            groups[name] = vertex_errors(vertices[mask], truth[mask])
+    return {
+        "neutral_geometry": vertex_errors(vertices, truth),
+        "neutral_geometry_regions": {name: groups[region] for name, region in NEUTRAL_REGIONS.items()},
+        "vertex_groups": groups,
+        "vertex_group_weight_threshold": REGION_THRESHOLD,
     }
 
 

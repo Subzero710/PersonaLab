@@ -5,8 +5,8 @@ import math
 
 import torch
 
-from .losses import project_batch, regularization_residual, weighted_landmark_residuals
-from .monitoring import OptimizationUpdate, Trial, finite_norm
+from .losses import project_landmarks, regularization_residual, weighted_landmark_residuals
+from .monitoring import Linearization, OptimizationUpdate, Trial, finite_norm
 from .parameters import InvalidGeometry, PARAMETER_GROUPS
 from .schur import BlockVector, NormalBlocks, column_scales, damped_schur_step
 
@@ -58,18 +58,19 @@ class StageCoordinates:
             getattr(parameters, name).copy_(point.local[:, columns])
 
 
-def observation_residual(model, data, parameters, layout, base, position, index, point):
+def observation_residual(data, parameters, layout, base, position, index, point):
     p = position.identity.numel()
     batch = layout.unpack(base.batch(index, index + 1), BlockVector(point[:p], point[None, p:]))
     state = parameters.state(index, index + 1, batch)
-    projected = project_batch(model, state, (data.observations[index].observation_id,))
+    landmarks = parameters.landmark_geometry(state.identity, state.expression, state.rotations, state.translation)
+    projected = project_landmarks(landmarks, state.cameras, (data.ids[index],))
     return weighted_landmark_residuals(projected, data, index, index + 1)
 
 
 @torch.enable_grad()
-def observation_jacobian(model, data, parameters, layout, base, position, index):
+def observation_jacobian(data, parameters, layout, base, position, index):
     point = torch.cat((position.identity, position.local[index])).detach().requires_grad_()
-    residual = observation_residual(model, data, parameters, layout, base, position, index, point)
+    residual = observation_residual(data, parameters, layout, base, position, index, point)
     if not torch.isfinite(residual).all():
         raise FloatingPointError("Nonfinite landmark residual at the accepted state")
     count = residual.numel()
@@ -108,7 +109,7 @@ def normal_blocks(model, data, parameters, layout, base, position):
     gradient_b = ref.new_empty((n, q), dtype=torch.float64)
 
     for index in range(n):
-        residual, jacobian = observation_jacobian(model, data, parameters, layout, base, position, index)
+        residual, jacobian = observation_jacobian(data, parameters, layout, base, position, index)
         hessian = jacobian.mT @ jacobian
         gradient = jacobian.mT @ residual
         identity.add_(hessian[:p, :p])
@@ -162,22 +163,33 @@ def _candidate(position, step, expression_slice, limit):
     return BlockVector(identity, local)
 
 
-def _trial_step(model, data, parameters, base, position, layout, system, step,
+def _effective_step(position, point):
+    return BlockVector(
+        point.identity.double() - position.identity.double(),
+        point.local.double() - position.local.double(),
+    )
+
+
+def _step_norms(effective, scales):
+    return (
+        finite_norm(effective.identity, effective.local),
+        finite_norm(effective.identity / scales.identity, effective.local / scales.local),
+    )
+
+
+def _trial_step(model, data, parameters, base, position, layout, system, scales, step,
                 expression_slice, current_loss, measurements):
-    norm, predicted, actual, ratio = None, None, None, None
+    norm = scaled = predicted = actual = ratio = None
     try:
         point = _candidate(position, step, expression_slice, parameters.config.expression_limit)
-        effective = BlockVector(
-            point.identity.double() - position.identity.double(),
-            point.local.double() - position.local.double(),
-        )
-        norm = finite_norm(effective.identity, effective.local)
+        effective = _effective_step(position, point)
+        norm, scaled = _step_norms(effective, scales)
         reduction = system.predicted_reduction(effective)
         if not math.isfinite(reduction):
             raise FloatingPointError("Nonfinite predicted reduction")
         predicted = reduction
         if predicted <= 0:
-            return None, "nonpositive_predicted_reduction", (norm, predicted, actual, ratio)
+            return None, "nonpositive_predicted_reduction", (norm, scaled, predicted, actual, ratio)
         values, stats = measurements.evaluate(
             model, data, parameters, candidate=layout.unpack(base, point), least_squares=True,
         )
@@ -187,12 +199,12 @@ def _trial_step(model, data, parameters, base, position, layout, system, step,
             raise FloatingPointError("Nonfinite acceptance ratio")
         ratio = gain
         if actual <= 0 or ratio < parameters.config.lm.acceptance_threshold:
-            return None, "insufficient_reduction", (norm, predicted, actual, ratio)
+            return None, "insufficient_reduction", (norm, scaled, predicted, actual, ratio)
     except InvalidGeometry as error:
-        return None, f"invalid_geometry: {error}", (norm, predicted, actual, ratio)
+        return None, f"invalid_geometry: {error}", (norm, scaled, predicted, actual, ratio)
     except FloatingPointError as error:
-        return None, f"nonfinite_trial: {error}", (norm, predicted, actual, ratio)
-    return (point, values, stats), "accepted", (norm, predicted, actual, ratio)
+        return None, f"nonfinite_trial: {error}", (norm, scaled, predicted, actual, ratio)
+    return (point, values, stats), "accepted", (norm, scaled, predicted, actual, ratio)
 
 
 @torch.no_grad()
@@ -217,12 +229,34 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
             2 * (scales.local * gradient.local).masked_fill(fixed_local, 0),
         )
         norms = gradient_norms(layout, gradient, fixed_local)
+        projected_norm = math.hypot(*norms.values())
+        gradient_ready = scaled_norm <= options.scaled_gradient_tolerance and (
+            config.gradient_tolerance is None or projected_norm <= config.gradient_tolerance
+        )
+        probe_norms = (None, None)
+        step_tolerances = (options.native_step_tolerance, options.scaled_step_tolerance)
+        check_step = any(tolerance is not None for tolerance in step_tolerances)
+        if gradient_ready and check_step:
+            # Strong damping can make a large unresolved displacement appear small.
+            # Probe at the configured floor without evaluating or accepting a trial.
+            with measurements.time("linear_solve"):
+                probe, _ = damped_schur_step(system, scales, options.minimum_damping, fixed_local)
+            point = _candidate(position, probe, expression_slice, config.expression_limit)
+            probe_norms = _step_norms(_effective_step(position, point), scales)
+        measurements.linearizations.append(Linearization(
+            stage.name, index, values.total, damping, projected_norm, scaled_norm,
+            int(fixed_local.sum()), *probe_norms,
+        ))
         if index == 0 or len(measurements.updates) % config.log_every == 0:
             record(stage.name, index, values, stats, norms)
-        if scaled_norm <= options.scaled_gradient_tolerance or (
-            config.gradient_tolerance is not None and math.hypot(*norms.values()) <= config.gradient_tolerance
+        if gradient_ready and all(
+            tolerance is None or norm <= tolerance
+            for norm, tolerance in zip(probe_norms, step_tolerances, strict=True)
         ):
-            return values, stats, "converged", "projected gradient tolerance reached"
+            reason = "scaled projected gradient and displacement tolerances reached" if check_step else (
+                "scaled projected gradient tolerance reached"
+            )
+            return values, stats, "converged", reason
 
         trial = 0
         while trial < options.max_trials:
@@ -237,19 +271,21 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
                 ))
                 raise
             candidate, reason, reductions = _trial_step(
-                model, data, parameters, base, position, layout, system, step,
+                model, data, parameters, base, position, layout, system, scales, step,
                 expression_slice, values.total, measurements,
             )
+            native_step, scaled_step, predicted, actual, ratio = reductions
             measurements.trials.append(Trial(
                 stage.name, index, trial, damping, candidate is not None, reason, scaled_norm,
-                *reductions, condition,
+                native_step, predicted, actual, ratio, condition, scaled_step,
             ))
             if candidate is not None:
                 position, values, stats = candidate
                 layout.commit(parameters, position)
                 measurements.last_objective = values
-                measurements.updates.append(OptimizationUpdate(stage.name, index + 1, reductions[0]))
-                ratio = reductions[-1]
+                measurements.updates.append(OptimizationUpdate(
+                    stage.name, index + 1, native_step, scaled_step,
+                ))
                 if ratio > 0.75:
                     damping = max(options.minimum_damping, damping / 3)
                 elif ratio < 0.25:

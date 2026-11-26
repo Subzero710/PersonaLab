@@ -43,7 +43,7 @@ def _parser():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--config", type=Path, help="JSON FitConfig")
-    parser.add_argument("--solver", choices=SOLVERS, help="fitting solver (default: adam)")
+    parser.add_argument("--solver", choices=SOLVERS, help="fitting solver (default: Levenberg–Marquardt)")
     parser.add_argument("--camera-mode", choices=("known", "estimated"))
     parser.add_argument("--camera", choices=("weak-perspective", "perspective"))
     parser.add_argument("--batch-size", type=_positive_int)

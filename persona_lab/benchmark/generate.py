@@ -13,7 +13,8 @@ import torch
 from ..camera import PerspectiveCamera, WeakPerspectiveCamera
 from ..coordinates import ImageSize
 from ..correspondences import DFL_TO_GNM
-from .configuration import STREAMS, VIEW_AXES, resolve_config, rng, torch_options
+from ..fitting.parameters import resolve_identity_coefficients
+from .configuration import IDENTITY_SELECTIONS, STREAMS, VIEW_AXES, resolve_config, rng, torch_options
 from .dataset import (
     SubjectGroundTruth, camera_to_record, observation_id, subject_id, write_dataset,
 )
@@ -125,13 +126,20 @@ def _camera(model, config, kind, subject, index):
     )
 
 
-def _generate_subject(model, config, mapping, presets, subject, controlled_identity=None):
+def _sample_identity(model, config, subject, sampled):
+    # Draw in native order even in head mode to preserve the seeded full-native stream.
+    identity = rng(config.seed, "identity", subject).uniform(
+        -config.identity_half_range, config.identity_half_range, size=model.head.identity_dim,
+    ).astype(model.numpy_dtype)
+    identity[~sampled] = 0
+    return identity
+
+
+def _generate_subject(model, config, mapping, presets, subject, sampled, controlled_identity):
     identifier = subject_id(subject)
     identity = controlled_identity
     if identity is None:
-        identity = rng(config.seed, "identity", subject).uniform(
-            -config.identity_half_range, config.identity_half_range, size=model.head.identity_dim,
-        ).astype(model.numpy_dtype)
+        identity = _sample_identity(model, config, subject, sampled)
     if not np.any(identity):
         raise ValueError(f"Identity sampling produced a neutral coefficient vector for {identifier}")
     neutral = model.neutral(identity)
@@ -197,25 +205,34 @@ def generate_dataset(destination, config, *, model_file=None, correspondences=DF
     config = resolve_config(**config.metadata())
     dtype, device = torch_options(config.dtype, config.device)
     model = load_benchmark_model(model_file, dtype=dtype, device=device)
+    names = model.metadata["identity_names"]
+    selected = (
+        resolve_identity_coefficients(model.head, ("head",))
+        if config.identity_selection == "head" else tuple(names)
+    )
+    sampled = np.isin(names, selected)
     identity = None
-    provenance = {}
+    provenance = (
+        {"identity_coefficient_names": selected} if config.identity_selection is not None else {}
+    )
     if identity_coefficients is not None:
         from .configuration import finite_number
 
-        names = model.metadata["identity_names"]
         if (
             config.subjects != 1 or not isinstance(identity_coefficients, dict)
             or not identity_coefficients or not identity_coefficients.keys() <= set(names)
         ):
             raise ValueError("A controlled synthetic identity requires one subject and named native coefficients")
+        if not identity_coefficients.keys() <= set(selected):
+            raise ValueError("Controlled coefficients must belong to the configured identity selection")
         coefficients = {name: finite_number(value, name) for name, value in identity_coefficients.items()}
         if max(map(abs, coefficients.values())) > config.identity_half_range:
             raise ValueError("Controlled coefficients must be within the configured identity range")
         identity = np.asarray([coefficients.get(name, 0.0) for name in names], dtype=model.numpy_dtype)
-        provenance = {"controlled_identity_coefficients": coefficients}
+        provenance["controlled_identity_coefficients"] = coefficients
     presets = _preset_vectors(model, config)
     subjects = (
-        _generate_subject(model, config, correspondences, presets, index, identity)
+        _generate_subject(model, config, correspondences, presets, index, sampled, identity)
         for index in range(config.subjects)
     )
     return write_dataset(
@@ -252,6 +269,9 @@ def main(argv: Sequence[str] | None = None):
     parser.add_argument("--camera", choices=("perspective", "weak-perspective", "both"))
     parser.add_argument("--image-size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--identity-half-range", type=float)
+    parser.add_argument("--identity-selection", choices=IDENTITY_SELECTIONS,
+                        help="sample the full native basis or only the native head coefficients")
+    parser.add_argument("--gaussian-noise-px", type=float, help="uniform Scenario C Gaussian deviation in pixels")
     parser.add_argument("--dtype", choices=("float32", "float64"))
     parser.add_argument("--device")
     args = parser.parse_args(argv)

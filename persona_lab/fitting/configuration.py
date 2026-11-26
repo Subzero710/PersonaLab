@@ -10,6 +10,7 @@ from ..correspondences import DFL_LANDMARK_COUNT
 GROUPS = ("identity", "expression", "pose", "camera")
 CAMERA_MODELS = ("weak-perspective", "perspective")
 SOLVERS = ("adam", "levenberg-marquardt")
+DEFAULT_SOLVER = "levenberg-marquardt"
 
 # These low-order components cover the mouth and eyelid/brow motions
 # independently probed by the existing benchmark, with room for nearby modes.
@@ -98,6 +99,8 @@ class LevenbergMarquardtConfig:
     diagonal_floor: float = 1e-12
     scaled_gradient_tolerance: float = 1e-10
     jacobian_rows: int = 8
+    native_step_tolerance: float | None = None
+    scaled_step_tolerance: float | None = None
 
     def __post_init__(self):
         for name in ("max_trials", "jacobian_rows"):
@@ -113,6 +116,13 @@ class LevenbergMarquardtConfig:
             raise ValueError("LM acceptance_threshold must be in [0, 1)")
         if not 0 < self.diagonal_floor <= 1 or self.scaled_gradient_tolerance < 0:
             raise ValueError("LM diagonal_floor must be in (0, 1] and gradient tolerance nonnegative")
+        for name in ("native_step_tolerance", "scaled_step_tolerance"):
+            value = getattr(self, name)
+            if value is not None:
+                value = finite_number(value, name)
+                if value < 0:
+                    raise ValueError(f"{name} must be nonnegative")
+                object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +153,7 @@ class FitConfig:
     patience: int = 10
     divergence_factor: float = 100.0
     stages: tuple[Stage, ...] = field(default_factory=default_stages)
-    solver: str = "adam"
+    solver: str = DEFAULT_SOLVER
     lm: LevenbergMarquardtConfig = field(default_factory=LevenbergMarquardtConfig)
 
     def __post_init__(self):

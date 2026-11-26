@@ -816,7 +816,7 @@ and elapsed time.
 
 The result distinguishes gradient-tolerance convergence, an improvement
 plateau after configured patience, an exhausted iteration budget, and
-failure. Tolerance-based stopping is opt-in. The default divergence check
+failure. Adam's tolerance-based stopping is opt-in. The default divergence check
 fails a stage if its objective exceeds 100 times the stage-entry loss,
 with a floor of `1e-12` on the reference loss. Missing or nonfinite
 gradients, invalid projections, and nonfinite parameters or Adam state
@@ -825,9 +825,10 @@ results have no final parameters, mesh, overlays, or predictions.
 
 ### Levenberg–Marquardt
 
-Select `--solver levenberg-marquardt` or
-`FitConfig(solver="levenberg-marquardt")`. The default is `adam`. A selection
-applies to the entire fitting schedule. Both solvers use the same parameter
+Levenberg–Marquardt with a Schur complement is the default in `FitConfig` and
+the fitting CLI. Select `--solver adam` or `FitConfig(solver="adam")` for
+historical comparisons. The selection applies to the entire fitting schedule.
+Both solvers use the same parameter
 groups, starting values, observation masks, and objective. Adam uses the
 existing learning rates and divergence check. Levenberg–Marquardt (LM) uses a
 stage's groups and accepted-update budget. Stage learning rates are Adam
@@ -865,8 +866,11 @@ reduced system
 ```
 
 The algorithm back-substitutes the local updates and maps them to native
-coordinates. It uses a single observation graph and bounded groups of
-reverse-mode derivative rows. A value of `jacobian_rows=1` selects scalar
+coordinates. The Jacobian evaluates the vertices used by the official
+landmarks with the native GNM basis, joint regressors, pose correctives and
+skinning operations. Trial objectives still evaluate full mesh geometry.
+Differentiation uses one observation graph and bounded groups of reverse-mode
+rows. A value of `jacobian_rows=1` selects scalar
 reverse-mode derivatives. The retained matrices take
 `O(p² + N(pq + q²))` storage for local width `q`. Trial scoring uses
 `batch_size`. Jacobian blocks are accumulated, scaled, and factored in
@@ -963,7 +967,7 @@ replacement from accepted observations and preserves their importer order.
 The result directory must be new. `result.json` records the verified model
 and parameter order, selection, camera gauge, observation IDs, cameras,
 configuration, initialization, history, and termination status.
-`result.json` version 2 adds an `optimization` record with objective terms
+`result.json` includes an `optimization` record with objective terms
 at initialization and the last valid state, objective and Jacobian evaluation
 counts, updates and their norms, and LM trials with damping, reductions,
 acceptance ratio, and factor diagnostics. Runtime metadata includes
@@ -975,7 +979,7 @@ is an attempted full scoring pass. On CUDA these timings synchronize the
 requested device. RSS and CUDA allocated-byte peaks are process high-water
 marks. Model loading is timed by the CLI. It is unavailable to
 `fit_identity` when the caller supplies a loaded model. `load_result` also
-reads version 1 Adam results.
+reads version 1 Adam and version 2 solver-explicit results.
 `parameters.npz` contains the initial and final arrays and loads with
 `allow_pickle=False`. `neutral.obj` uses fitted identity with zero
 expressions, rotations, and translation. `--no-neutral-mesh` disables
@@ -1103,6 +1107,147 @@ fitting, comparative reconstruction, and scalability. Run the private
 DeepFaceLab experiment only after the relevant synthetic validations pass.
 The local fit command can then use an explicitly chosen camera model,
 approximately 50 observations, overlays, and a neutral mesh.
+
+### Corrected identity recovery
+
+The original variable-expression study sampled all 253 native identity
+coefficients while fitting the 170 head coefficients. That left 83 fixed eye
+and teeth coefficients with a nonzero global coefficient error floor. Uniform
+L2 penalties also changed the optimum. In the nine-view seed-42 variable
+expression study, the trainable identity RMSE was 0.240809 with the production
+weights, 2.764496 with only the identity penalty disabled, and 0.010869 with
+both penalties disabled. The local rank was 170 in the nine-view diagnostic.
+Small singular values still permit substantial displacement at a small
+projected gradient.
+
+Set `--identity-selection head` in the generator to sample the native head
+group and leave the eye and teeth coefficients exactly zero. The vector still
+has 253 entries in native order. `--identity-selection full` explicitly samples
+the historical full-native stream and records the selection. Omitting the
+option reproduces the original manifest and numeric stream. The corrected
+study uses the default 24 expression coefficients, known cameras, float64 and
+explicitly zero identity and expression weights for clean diagnostics.
+Production fitting retains its independent regularization weights. The noisy
+study crosses identity and expression weights at each Gaussian deviation.
+`--gaussian-noise-px` creates a uniform Gaussian profile in Scenario C with
+the same observation schedule and independently seeded noise.
+
+```sh
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies exact convergence held-out \
+  --model-file /app/models/gnm_head.npz --seeds 42 43 44 \
+  --output outputs/identity-recovery
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies count \
+  --model-file /app/models/gnm_head.npz --seeds 42 43 44 \
+  --output outputs/identity-count
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies robustness \
+  --model-file /app/models/gnm_head.npz --seeds 42 43 44 \
+  --noise-levels 0.5 2.0 --identity-weights 0 1e-6 --expression-weights 0 2e-6 2e-5 \
+  --output outputs/identity-noise
+```
+
+The nine-view exact cases cover neutral and varied expressions. The
+corrected protocol uses a single joint stage with a default budget of 30
+updates. The convergence comparison uses the same data and budget for each
+setting. The stricter experiment uses a scaled gradient tolerance and
+damping floor of `1e-12`,
+plus native and scaled displacement tolerances of `1e-6` and `1e-10`.
+When displacement tolerances are set, LM tests a projected step at the damping
+floor before reporting convergence. Each stage records its termination reason.
+Accepted updates and rejected trials have separate records. Count cases use
+nested prefixes, and the single-view case reports its rank and nullity.
+Held-out cases reserve separate observations and report oracle reprojection
+with true local parameters and reprojection with estimated expression and
+pose. Both held-out scores use known cameras and the frozen fitted identity.
+
+Fit result schema 3 adds stage reasons, native and scaled step norms, and
+linearization diagnostics. Versions 1 and 2 remain readable. Study report
+schema 2 adds the protocol, coefficient splits, model regions, numeric
+representability, and proposed target checks. All geometry is in meters
+without alignment. A fixed-coefficient RMSE floor applies to the full native
+coefficient metric. Geometry and reprojection have independent errors.
+External predictions report full-native and anatomical group scores.
+Fitting studies also score trainable and fixed groups using the recorded
+configuration. Existing external evaluation metric keys remain readable in
+the expanded report.
+
+Observability reports data-only spectra at initialization and at actual
+fitted states. The report lists the rank thresholds, observable condition
+number, and implicit zeros for wide Jacobians. Full-space condition numbers
+are null for rank-deficient Jacobians. The separately reported prior
+curvature is excluded from those spectra. Use `--spectra` to measure both
+states for other corrected cases. Proposed clean targets appear alongside
+actual measured errors. The clean targets describe known-camera synthetic
+recovery. A single 68-point image has at most 136 data rows, and the joint
+rank can be lower after removing nuisance directions. The noise sweep
+measures sensitivity to its supplied levels and weights. Production weight
+selection and estimated-camera recovery require their own validation.
+
+#### Full-native identity and estimated cameras
+
+Select `full-native-camera` explicitly to run the V5 diagnostic. Each primary
+case uses nine clean Scenario C observations, a single joint stage with strict
+LM, and zero identity and expression regularization. The fitter optimizes
+170 identity and 24 expression coefficients. The other 83 identity
+coefficients stay at their normal initialized values.
+
+| Condition | Ground-truth identity | Cameras |
+| --- | --- | --- |
+| A | Full native | Known |
+| B | Full native | Estimated |
+| C | Head only | Estimated |
+| D | Head only | Known |
+
+Each seed and projection model shares one source dataset between the known
+and estimated runs for each identity mode. The two identity modes keep the
+head draws, expressions, poses, cameras and ordering identical. The historical
+reference uses the original nine-view mixed-camera generator configuration
+for seed 42. The report checks its source dataset ID and compares its metrics
+with V2 when the ID matches. The schedule and convergence settings both
+changed since V2.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies full-native-camera \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --lm-iterations 0 0 30 --spectra \
+  --output outputs/identity-study-v5
+```
+
+The command runs 24 primary cases and one historical case.
+`outputs/identity-study-v5/report.json` retains the full per-case diagnostics
+and `outputs/identity-study-v5/summary.json` links to them and summarizes the
+matched comparisons. Paired deltas subtract the first condition from the
+second. Geometry errors use unaligned native vertices in meters. The fixed
+coefficient floor describes full-native coefficient RMSE. Geometry error
+depends on how the deformation bases interact.
+
+Estimated cameras use the observed landmarks and the production
+initialization. Perspective focal length is fixed at the prescribed
+initialization value. A focal mismatch makes raw metric camera translation
+incomparable. Weak-perspective scale comparisons use native model units, and
+estimated weak-perspective observations leave absolute metric scale
+ambiguous. The report records nulls with reasons for incompatible camera
+comparisons. The head-only known-camera control uses the established clean
+targets. The other cases compare against those values as numerical references.
+
+Execution, convergence, representability, and observability appear as
+separate fields. The expected fixed identity discrepancy leaves the case
+incompatible without marking its execution as failed. Nonconverged runs
+retain their final metrics when the solver returns a final state.
+The report measures the projected gradient at that state independently of
+the solver's iteration trace. Estimated-camera gradients use offsets from
+the final camera, as in final-state observability.
+
+The detailed report can be compressed losslessly while keeping the
+original available for the summary's references.
+
+```sh
+gzip -k outputs/identity-study-v5/report.json
+```
 
 ## GNM Ecosystem Packages
 

@@ -9,26 +9,45 @@ import subprocess
 import sys
 from time import perf_counter
 
+from gnm.shape import gnm_utils
 import numpy as np
 
+from ..camera import PerspectiveCamera
 from ..fitting import FitConfig, FitInitialization, ObservationInitialization, Stage, fit_identity
-from ..fitting.configuration import SOLVERS
+from ..fitting.configuration import SOLVERS, LevenbergMarquardtConfig
+from ..fitting.monitoring import peak_rss_bytes
 from ..fitting.observability import identity_observability
+from ..fitting.results import FAILED_STATUSES
 from .configuration import resolve_config
-from .dataset import load_dataset
-from .evaluate import _pool_reprojection, _score_observation
+from .dataset import camera_from_record, camera_to_record, load_dataset
+from .evaluate import _pool_expression, _pool_reprojection, _score_observation
+from .full_native_camera import (
+    STUDY as CAMERA_STUDY,
+    add_observation_details, camera_protocol, case_matrix, classify_compatibility, coefficient_floor,
+    final_gradient, fitted_camera_prediction, historical_comparison, summarize as summarize_camera_study,
+)
 from .generate import generate_dataset
-from .metrics import coefficient_errors, vertex_errors
+from .metrics import (
+    METRIC_UNITS, fixed_coefficient_error, grouped_coefficient_errors, neutral_geometry_errors,
+)
 from .model import load_benchmark_model
 from .predictions import SubjectPrediction
 from .storage import json_bytes, read_json, write_json
 
 
 COUNTS = (1, 5, 10, 25, 50, 100)
+IDENTITY_STUDIES = ("exact", "convergence", "count", "held-out", "robustness")
+STRICT_LM = LevenbergMarquardtConfig(
+    scaled_gradient_tolerance=1e-12, minimum_damping=1e-12,
+    native_step_tolerance=1e-6, scaled_step_tolerance=1e-10,
+)
+IDENTITY_TARGETS = {
+    "trainable_identity_rmse": 1e-4, "neutral_mesh_rms_m": 1e-6,
+    "facial_region_rms_m": 1e-6, "reprojection_rms_px": 1e-4,
+}
 SCALING_COUNTS = (50, 100, 300, 600)
 REFERENCE_ID = "d9ed77a6e5f39022b4dedd371749642ed626cb1b68ee008b21f5763920d7832f"
 CONTROLLED = {"head_000": 0.42, "head_001": -0.25, "head_002": 0.16}
-REGION_THRESHOLD = 1e-4
 
 
 def _fit_config(solver, budget, overrides, *, original_adam_rates=False):
@@ -44,36 +63,90 @@ def _fit_config(solver, budget, overrides, *, original_adam_rates=False):
     return replace(default, solver=solver, stages=stages, **overrides)
 
 
-def _scoring_geometry(model, state, truth, selection, names):
-    target = truth.arrays["identity"]
-    truth_vertices = truth.arrays["neutral_vertices"]
-    vertices = model.neutral(state.identity)
-    region_weights = model.head.vertex_groups.detach().cpu().numpy()
-    regions = {}
-    for name, weights in zip(model.head.vertex_group_names, region_weights, strict=True):
-        mask = weights > REGION_THRESHOLD
-        if mask.any():
-            regions[name] = vertex_errors(vertices[mask], truth_vertices[mask])
-    indices = {name: index for index, name in enumerate(names)}
-    score = {"global": coefficient_errors(state.identity, target)}
-    for name, group in (("trainable", selection.identity), ("fixed", selection.fixed_identity)):
-        columns = [indices[coefficient] for coefficient in group]
-        score[name] = coefficient_errors(state.identity[columns], target[columns]) if columns else None
+def _scoring_geometry(model, state, truth, trainable):
     return {
-        "identity": score, "neutral_geometry": vertex_errors(vertices, truth_vertices),
-        "vertex_groups": regions, "vertex_group_weight_threshold": REGION_THRESHOLD,
+        "identity": grouped_coefficient_errors(
+            state.identity, truth.arrays["identity"], model.metadata["identity_names"],
+            trainable=trainable, regions=gnm_utils.identity_regions_indices(model.head),
+        ),
+        **neutral_geometry_errors(model, state.identity, truth.arrays["neutral_vertices"]),
     }
 
 
-def _score_observations(model, dataset, truth, prediction, mode):
+def _active_groups(config):
+    return {group for stage in config.stages if stage.iterations for group in stage.groups}
+
+
+def _compatibility(model, truth, fit, groups):
+    initial, arrays = fit.initial, truth.arrays
+    identity = fixed_coefficient_error(
+        initial.identity, arrays["identity"], model.metadata["identity_names"],
+        fit.selection.identity if "identity" in groups else (),
+    )
+    train_expression = fit.selection.expression if "expression" in groups else ()
+    expression_names = model.metadata["expression_names"]
+    train_columns = np.isin(expression_names, train_expression)
+    fixed_joints = np.isin(
+        model.metadata["joint_names"], fit.selection.fixed_joints if "pose" in groups
+        else model.metadata["joint_names"],
+    )
+    root_free = fit.selection.root_translation and "pose" in groups
+    camera_free = fit.config.camera_mode == "estimated" and "camera" in groups
+    observations = []
+    for i, camera in enumerate(initial.cameras):
+        item = truth.observations[i]
+        target = camera_to_record(camera_from_record(
+            item["camera"], dtype=camera.rotation.dtype, device=camera.rotation.device,
+        ))
+        actual = camera_to_record(camera)
+        if not camera_free or target["type"] != actual["type"]:
+            fields = actual.keys() | target.keys()
+        else:
+            fields = ("type", "image_size", "rotation")
+            if isinstance(camera, PerspectiveCamera):
+                fields += ("focal_length", "principal_point")
+        mismatched_camera = sorted(key for key in fields if actual.get(key) != target.get(key))
+        expression = fixed_coefficient_error(
+            initial.expression[i], arrays["expression"][i], expression_names, train_expression,
+        )
+        outside = np.abs(arrays["expression"][i]) > fit.config.expression_limit
+        bounded = [name for name, mask in zip(expression_names, outside & train_columns, strict=True) if mask]
+        joints = [
+            name for name, fixed, a, b in zip(
+                model.metadata["joint_names"], fixed_joints, initial.rotations[i], arrays["rotations"][i], strict=True,
+            )
+            if fixed and not np.array_equal(a, b)
+        ]
+        root = not root_free and not np.array_equal(initial.translation[i], arrays["translation"][i])
+        observations.append({
+            "id": item["id"], "expression": expression, "expression_outside_bounds": bounded,
+            "differing_fixed_joints": joints, "differing_fixed_root": root,
+            "differing_fixed_camera_fields": mismatched_camera,
+            "representable": not (expression["differing_coefficients"] or bounded or joints or root or mismatched_camera),
+        })
+    return {
+        "fully_representable": not identity["differing_coefficients"] and all(
+            item["representable"] for item in observations
+        ),
+        "identity": identity, "observations": observations,
+        "full_native_expression_rmse_floor": float(np.sqrt(np.mean([
+            item["expression"]["full_native_rmse_floor"] ** 2 for item in observations
+        ]))),
+    }
+
+
+def _score_observations(model, dataset, truth, prediction, mode, *, trainable_expression=None):
     observations = [
         _score_observation(
             model, dataset, truth, index, prediction.identity, prediction, mode,
-            compare_camera_gauges=mode == "complete",
+            compare_camera_gauges=mode == "complete", trainable_expression=trainable_expression,
         )
         for index in range(len(truth.observations))
     ]
-    return {"aggregate": _pool_reprojection(observations), "observations": observations}
+    return {
+        "aggregate": _pool_reprojection(observations), "expression": _pool_expression(observations),
+        "observations": observations,
+    }
 
 
 def _held_out(model, job, config, fit, training_truth):
@@ -81,7 +154,10 @@ def _held_out(model, job, config, fit, training_truth):
         return {"status": "training_fit_failed"}
     parent = load_dataset(job["held_out_dataset"])
     subject, = parent.subject_ids
-    ids = parent.observation_ids(subject)[100:]
+    start = job.get("held_out_start", 100)
+    ids = parent.observation_ids(subject)[start:]
+    if not ids:
+        raise ValueError("Held-out dataset contains no reserved observations")
     held = parent.select_observations(subject, ids)
     truth = held.ground_truth(subject)
     if set(ids) & set(fit.observation_ids) or not np.array_equal(
@@ -98,15 +174,21 @@ def _held_out(model, job, config, fit, training_truth):
     ))
     nuisance_fit = fit_identity(model, observations, nuisance_config, initial=initial)
     conditional = _score_observations(model, held, truth, SubjectPrediction(fit.final.identity), "conditional")
+    conditional["diagnostic"] = "oracle_ground_truth_nuisance"
     estimated = None
     if nuisance_fit.final is not None:
         if not np.array_equal(nuisance_fit.final.identity, fit.final.identity):
             raise ValueError("Held-out nuisance fit changed the frozen identity")
-        estimated = _score_observations(model, held, truth, nuisance_fit.to_prediction(), "known-camera")
+        estimated = _score_observations(
+            model, held, truth, nuisance_fit.to_prediction(), "known-camera",
+            trainable_expression=nuisance_fit.selection.expression,
+        )
+        estimated["diagnostic"] = "estimated_expression_and_pose"
     return {
         "status": nuisance_fit.status, "reason": nuisance_fit.reason,
         "source_dataset_id": held.source_dataset_id, "evaluation_dataset_id": held.dataset_id,
         "observation_ids": ids, "camera_parameters": "known for both held-out diagnostics",
+        "frozen_identity_exact": True if nuisance_fit.final is not None else None,
         "conditional_ground_truth_nuisance": conditional,
         "estimated_expression_and_pose": estimated,
         "runtime": nuisance_fit.runtime, "config": asdict(nuisance_config),
@@ -114,7 +196,9 @@ def _held_out(model, job, config, fit, training_truth):
 
 
 def _run_job(job):
+    case_started = perf_counter()
     config = FitConfig.from_dict(job["config"])
+    camera_case = job.get(CAMERA_STUDY)
     parent = load_dataset(job["dataset"])
     subject, = parent.subject_ids
     ids = parent.observation_ids(subject)[:job["observations"]]
@@ -132,6 +216,8 @@ def _run_job(job):
     )
     initial = None
     if job["known_pose_diagnostic"]:
+        if camera_case:
+            raise ValueError("The full-native camera study requires the normal pose initializer")
         diagnostic = dataset.ground_truth(subject)
         initial = FitInitialization(observations={
             key: ObservationInitialization(rotations=model.tensor(rotation))
@@ -139,7 +225,10 @@ def _run_job(job):
         })
     fit = fit_identity(model, observations, config, initial=initial)
     truth = dataset.ground_truth(subject)
-    score_initial = _scoring_geometry(model, fit.initial, truth, fit.selection, model.metadata["identity_names"])
+    groups = _active_groups(config)
+    train_identity = fit.selection.identity if "identity" in groups else ()
+    train_expression = fit.selection.expression if "expression" in groups else ()
+    score_initial = _scoring_geometry(model, fit.initial, truth, train_identity)
     record = {
         "case": job["case"], "experiment": job["experiment"], "generation": parent.config.metadata(),
         "seed": job["seed"], "solver": config.solver, "config": asdict(config),
@@ -148,6 +237,7 @@ def _run_job(job):
         "model_asset_sha256": model.metadata["asset_sha256"], "geometry_aligned": False,
         "budget": job["budget"], "known_pose_diagnostic": job["known_pose_diagnostic"],
         "selection": asdict(fit.selection), "gauge": fit.gauge,
+        "compatibility": _compatibility(model, truth, fit, groups), "metric_units": METRIC_UNITS,
         "initial": score_initial | {
             "reprojection": asdict(fit.initial_reprojection) if fit.initial_reprojection else None,
         },
@@ -156,17 +246,21 @@ def _run_job(job):
     }
     if fit.final is not None:
         estimated = config.camera_mode == "estimated"
-        score_final = _scoring_geometry(model, fit.final, truth, fit.selection, model.metadata["identity_names"])
-        fixed_names = set(fit.selection.fixed_identity)
+        score_final = _scoring_geometry(model, fit.final, truth, train_identity)
+        fixed_names = set(model.metadata["identity_names"]) - set(train_identity)
         fixed = [name in fixed_names for name in model.metadata["identity_names"]]
         score_final["fixed_identity_preserved"] = bool(
             np.array_equal(fit.initial.identity[fixed], fit.final.identity[fixed]),
         )
+        prediction = fitted_camera_prediction(fit) if camera_case else fit.to_prediction()
         training = _score_observations(
-            model, dataset, truth, fit.to_prediction(), "complete" if estimated else "known-camera",
+            model, dataset, truth, prediction, "complete" if estimated or camera_case else "known-camera",
+            trainable_expression=train_expression,
         )
         score_final["training_reprojection_and_nuisance_recovery"] = training
-        if estimated:
+        if camera_case:
+            record["camera_comparison"] = add_observation_details(training, truth, fit)
+        elif estimated:
             comparable = sum(
                 item["camera_recovery"]["translation_comparability"]["status"] == "comparable"
                 for item in training["observations"]
@@ -176,16 +270,187 @@ def _run_job(job):
                 "non_comparable_translation_observations": len(training["observations"]) - comparable,
             }
         record["final"] = score_final
-    if job["spectra"] and fit.selection.identity:
-        spectrum = identity_observability(model, observations, config, initial=initial)
-        for name in ("fixed_nuisance", "after_expression", "after_all_nuisance"):
-            group = spectrum[name]
-            values = group["singular_values"]
-            group["condition_number"] = values[0] / values[-1] if values[-1] > 0 else None
-        record["initial_identity_observability"] = spectrum
+    diagnostic_started = perf_counter()
+    spectra_requested = (job["spectra"] and bool(fit.selection.identity), job.get("final_spectra", False))
+    spectra_status = {}
+    for at, requested in zip(("initial", "final"), spectra_requested, strict=True):
+        if not requested:
+            continue
+        key = f"{at}_identity_observability"
+        record[key] = None
+        if getattr(fit, at) is None:
+            spectra_status[at] = {"status": "unavailable", "reason": fit.reason}
+            continue
+        try:
+            record[key] = identity_observability(model, observations, config, fit=fit, at=at)
+        except (ArithmeticError, RuntimeError, ValueError) as error:
+            if not camera_case:
+                raise
+            spectra_status[at] = {"status": "failed", "reason": str(error)}
+        else:
+            spectra_status[at] = {"status": "evaluated", "reason": None}
+    if job["spectra"] or job.get("final_spectra"):
+        record["runtime"]["observability_seconds"] = perf_counter() - diagnostic_started
+    if camera_case:
+        record["observability_status"] = spectra_status
+        record["optimization"]["final_gradient"] = final_gradient(model, observations, fit, config.stages[-1].groups)
+        _camera_study_result(record, camera_case, model, fit)
     if job["held_out_dataset"] is not None:
         record["held_out"] = _held_out(model, job, config, fit, truth)
+    if "identity_studies" in job:
+        record.update(
+            identity_studies=job["identity_studies"], convergence_settings=job["convergence_settings"],
+            mono_image_underdetermined=len(ids) == 1,
+        )
+        if set(job["identity_studies"]) & {"exact", "convergence"}:
+            record["validation_targets"] = _judge_targets(record["final"])
+        record["runtime"].update(
+            case_elapsed_seconds=perf_counter() - case_started,
+            case_peak_process_rss_bytes=peak_rss_bytes(),
+        )
     return record
+
+
+def _judge_targets(final):
+    actual = {} if final is None else {
+        "trainable_identity_rmse": final["identity"]["trainable"]["rmse"],
+        "neutral_mesh_rms_m": final["neutral_geometry"]["rms_m"],
+        "facial_region_rms_m": final["neutral_geometry_regions"]["facial"]["rms_m"],
+        "reprojection_rms_px": final["training_reprojection_and_nuisance_recovery"]["aggregate"]["clean"]["rms_px"],
+    }
+    scores = {
+        name: {"maximum": maximum, "actual": actual.get(name),
+               "met": actual[name] <= maximum if name in actual and actual[name] is not None else None}
+        for name, maximum in IDENTITY_TARGETS.items()
+    }
+    scores["fixed_identity_preserved"] = {
+        "required": True, "met": final["fixed_identity_preserved"] if final is not None else None,
+    }
+    return scores
+
+
+def _camera_study_result(record, case, model, fit):
+    compatibility = record["compatibility"]
+    native_names = model.metadata["identity_names"]
+    regions = gnm_utils.identity_regions_indices(model.head)
+    eye_and_teeth_names = [native_names[i] for group in ("eyes", "teeth") for i in regions[group]]
+    classification = classify_compatibility(compatibility, case, eye_and_teeth_names)
+    final = record["final"]
+    floor = coefficient_floor(
+        record["initial"]["identity"], final["identity"] if final is not None else None,
+        compatibility["identity"]["differing_coefficients"],
+    )
+    targets = _judge_targets(final)
+    head_target = targets["trainable_identity_rmse"]
+    all_targets_met = all(item["met"] for item in targets.values()) if final is not None else None
+    spectrum = record.get("final_identity_observability")
+    record.update({
+        CAMERA_STUDY: case,
+        "execution_status": "failed" if fit.status in FAILED_STATUSES else "completed",
+        "converged": fit.status == "converged",
+        "representability_status": classification["status"],
+        "representability_details": classification,
+        "identity_error_floor": floor,
+        "scientific_validation": {
+            "trainable_identity_matches_known_camera_tolerance": head_target["met"],
+            "known_camera_reference_trainable_rmse_maximum": head_target["maximum"],
+            "matches_known_camera_recovery_targets": all_targets_met,
+            "full_native_identity_representable": not floor["incompatible_fixed_count"],
+            "full_native_recovery_at_known_camera_tolerances": (
+                False if floor["incompatible_fixed_count"] else all_targets_met
+            ),
+            "final_effective_identity_jacobian_rank_deficient": (
+                spectrum["after_all_nuisance"]["nullity"] > 0 if spectrum is not None else None
+            ),
+        },
+    })
+    if "camera_comparison" not in record:
+        record["camera_comparison"] = camera_protocol(fit)
+    if case["condition"] == "D":
+        record["validation_targets"] = targets
+    if case["condition"] == "historical":
+        record["historical_comparison"] = historical_comparison(record)
+
+
+def _corrected_jobs(args):
+    sources = {}
+
+    def source(scenario, seed, count, noise=0.0, *, camera="both", identity_selection="head"):
+        key = (scenario, seed, count, noise, camera, identity_selection)
+        if key not in sources:
+            suffix = f"head-gaussian-{noise!r}" if camera == "both" and identity_selection == "head" else (
+                f"{camera}-{identity_selection or 'legacy'}"
+            )
+            path = args.output / "datasets" / f"{scenario}-{seed}-{count}-{suffix}"
+            options = {"gaussian_noise_px": noise} if noise else {}
+            if identity_selection is not None:
+                options.update(identity_selection=identity_selection, dtype=args.dtype, device=args.device)
+            config = resolve_config(
+                scenario, seed=seed, observations_per_subject=count, camera=camera, **options,
+            )
+            generate_dataset(path, config, model_file=args.model_file)
+            sources[key] = str(path)
+        return sources[key]
+
+    def job(name, studies, dataset, seed, count, *, strict=True, held_out=False,
+            identity_weight=0.0, expression_weight=0.0, camera_mode="known", camera_model=None):
+        config = _fit_config("levenberg-marquardt", args.lm_iterations, {
+            "camera_mode": camera_mode, "camera_model": camera_model, "train_identity": ("head",),
+            "identity_weight": identity_weight, "expression_weight": expression_weight,
+            "lm": STRICT_LM if strict else LevenbergMarquardtConfig(),
+        })
+        both_spectra = args.spectra or "convergence" in studies
+        return {
+            "case": name, "experiment": "corrected-identity", "identity_studies": studies,
+            "convergence_settings": "strict" if strict else "original", "dataset": dataset,
+            "seed": seed, "observations": count, "config": asdict(config),
+            "known_pose_diagnostic": False, "device": args.device, "dtype": args.dtype,
+            "model_file": args.model_file, "budget": "fit",
+            "held_out_dataset": dataset if held_out else None, "held_out_start": count,
+            "spectra": both_spectra or count == 1, "final_spectra": both_spectra,
+        }
+
+    selected = set(args.identity_studies)
+    for seed in args.seeds:
+        exact = [name for name in ("exact", "convergence") if name in selected]
+        if exact:
+            for scenario in ("B", "C"):
+                path = source(scenario, seed, 9)
+                yield job(f"exact-{scenario}-{seed}-strict", exact, path, seed, 9)
+                if "convergence" in selected:
+                    yield job(f"convergence-{scenario}-{seed}-original", ["convergence"], path, seed, 9, strict=False)
+        if "count" in selected:
+            path = source("C", seed, max(COUNTS))
+            for count in COUNTS:
+                yield job(f"count-C-{seed}-{count:03}", ["count"], path, seed, count)
+        if "held-out" in selected:
+            path = source("C", seed, 18)
+            yield job(f"held-out-C-{seed}", ["held-out"], path, seed, 9, held_out=True)
+        if "robustness" in selected:
+            for noise_index, noise in enumerate(args.noise_levels):
+                path = source("C", seed, 9, noise)
+                for id_index, identity_weight in enumerate(args.identity_weights):
+                    for expr_index, expression_weight in enumerate(args.expression_weights):
+                        yield job(
+                            f"robustness-C-{seed}-{noise_index}-{id_index}-{expr_index}", ["robustness"],
+                            path, seed, 9, strict=False, identity_weight=identity_weight,
+                            expression_weight=expression_weight,
+                        )
+    if CAMERA_STUDY in selected:
+        for case in case_matrix(args.seeds):
+            condition, seed = case["condition"], case["seed"]
+            camera, mode = case["camera_model"], case["camera_mode"]
+            if condition == "historical":
+                name = f"{CAMERA_STUDY}-historical"
+                selection = None
+            else:
+                name = f"{CAMERA_STUDY}-{condition}-{seed}-{camera}"
+                selection = "head" if case["identity_ground_truth"] == "head-only" else "full"
+            path = source("C", seed, 9, camera=camera, identity_selection=selection)
+            yield job(
+                name, [CAMERA_STUDY], path, seed, 9,
+                camera_mode=mode, camera_model=camera if mode == "estimated" else None,
+            ) | {CAMERA_STUDY: case}
 
 
 def _jobs(args):
@@ -272,11 +537,12 @@ def _jobs(args):
             yield from paired("H", f"H-{count:03}", source, 42, count, profiling=not args.scaling_full)
 
 
-def _summarize_counts(records):
+def _summarize_counts(records, *, corrected=False):
     cohorts = defaultdict(list)
     curves = defaultdict(list)
     for item in records:
-        if item["experiment"] != "E" or "generation" not in item:
+        included = "count" in item.get("identity_studies", ()) if corrected else item["experiment"] == "E"
+        if not included or "generation" not in item:
             continue
         scenario, solver, count = item["generation"]["scenario"], item["solver"], item["observations"]
         cohorts[(scenario, solver, count)].append(item)
@@ -293,6 +559,10 @@ def _summarize_counts(records):
             ],
             "optimization_seconds": [item["runtime"]["optimization_seconds"] for item in fits],
         }
+        if corrected:
+            distributions["trainable_identity_rmse"] = [
+                item["final"]["identity"]["trainable"]["rmse"] for item in completed
+            ]
         aggregates.append({
             "scenario": scenario, "solver": solver, "observations": count, "runs": len(fits),
             "statuses": {status: sum(item["status"] == status for item in fits)
@@ -361,12 +631,18 @@ def main(argv=None):
     parser.add_argument("--model-file")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
-    parser.add_argument("--experiments", choices=tuple("ABCDEFGH"), nargs="+", default=tuple("ABCDEFGH"))
+    parser.add_argument("--protocol", choices=("historical", "corrected-identity"), default="historical")
+    parser.add_argument("--experiments", choices=tuple("ABCDEFGH"), nargs="+")
+    parser.add_argument("--identity-studies", choices=IDENTITY_STUDIES + (CAMERA_STUDY,), nargs="+")
+    parser.add_argument("--noise-levels", type=float, nargs="+", metavar="PX")
+    parser.add_argument("--identity-weights", type=float, nargs="+")
+    parser.add_argument("--expression-weights", type=float, nargs="+")
     parser.add_argument("--seeds", type=int, nargs="+", default=(42, 43, 44))
-    parser.add_argument("--adam-iterations", type=int, nargs=3, default=(30, 70, 900))
-    parser.add_argument("--lm-iterations", type=int, nargs=3, default=(10, 12, 30))
+    parser.add_argument("--adam-iterations", type=int, nargs=3)
+    parser.add_argument("--lm-iterations", type=int, nargs=3, metavar=("POSE", "IDENTITY", "JOINT"))
     parser.add_argument("--scaling-full", action="store_true")
-    parser.add_argument("--spectra", action="store_true", help="initial local SVDs for experiments A–C")
+    parser.add_argument("--spectra", action="store_true",
+                        help="initial spectra for A–C or both states in corrected studies")
     parser.add_argument("--historical-report", type=Path, help="the original count-study-v2.json")
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -378,11 +654,52 @@ def main(argv=None):
         parser.error("--output is required")
     if args.model_file is None or not Path(args.model_file).is_file():
         parser.error("--model-file must identify the existing pinned GNM asset")
+    corrected = args.protocol == "corrected-identity"
+    if corrected and args.adam_iterations is not None:
+        parser.error("--adam-iterations requires the historical protocol")
+    args.adam_iterations = args.adam_iterations or (30, 70, 900)
+    if args.lm_iterations is None:
+        args.lm_iterations = (0, 0, 30) if corrected else (10, 12, 30)
+    if corrected and any(args.lm_iterations[:2]):
+        parser.error("corrected identity recovery uses a joint stage, requiring --lm-iterations 0 0 JOINT")
     if any(min(counts) < 0 or not counts[-1] for counts in (args.adam_iterations, args.lm_iterations)):
         parser.error("stage budgets must be nonnegative with a positive joint budget")
     if len(set(args.seeds)) != len(args.seeds) or any(not 0 <= seed < 2**64 for seed in args.seeds):
         parser.error("study seeds must be unique unsigned 64-bit integers")
-    if set(args.experiments) & {"E", "F"} and (len(args.seeds) < 2 or 42 not in args.seeds):
+    if corrected:
+        if args.experiments is not None or args.historical_report is not None or args.scaling_full:
+            parser.error("historical experiment options require the historical protocol")
+        if args.dtype != "float64":
+            parser.error("corrected identity recovery requires float64")
+        args.identity_studies = args.identity_studies or IDENTITY_STUDIES
+        if len(set(args.identity_studies)) != len(args.identity_studies):
+            parser.error("select each identity study once")
+        if CAMERA_STUDY in args.identity_studies and args.lm_iterations[-1] > 30:
+            parser.error(f"{CAMERA_STUDY} allows at most 30 joint LM iterations")
+        if len(args.seeds) < 2 and set(args.identity_studies) & {"count", "robustness"}:
+            parser.error("corrected count and robustness studies require multiple seeds")
+        if "robustness" in args.identity_studies:
+            args.noise_levels = args.noise_levels or (0.5, 2.0)
+            args.identity_weights = args.identity_weights or (0.0, 1e-6)
+            args.expression_weights = args.expression_weights or (0.0, 2e-6, 2e-5)
+            for name, values in (
+                ("noise levels", args.noise_levels), ("identity weights", args.identity_weights),
+                ("expression weights", args.expression_weights),
+            ):
+                if len(set(values)) != len(values) or len(values) < 2 or any(
+                    not np.isfinite(value) or value < 0 for value in values
+                ):
+                    parser.error(f"robustness {name} require multiple distinct nonnegative finite values")
+            if 0 in args.noise_levels or 0 not in args.identity_weights or 0 not in args.expression_weights:
+                parser.error("robustness requires positive noise levels and zero baselines for both weights")
+    elif args.identity_studies is not None:
+        parser.error("--identity-studies requires --protocol corrected-identity")
+    if not (corrected and "robustness" in args.identity_studies) and any(
+        values is not None for values in (args.noise_levels, args.identity_weights, args.expression_weights)
+    ):
+        parser.error("noise and weight sweep options require the corrected robustness study")
+    args.experiments = args.experiments or tuple("ABCDEFGH")
+    if not corrected and set(args.experiments) & {"E", "F"} and (len(args.seeds) < 2 or 42 not in args.seeds):
         parser.error("count studies require seed 42 and at least one additional identity seed")
     args.output = args.output.resolve()
     reference = _reference_results(args.historical_report)
@@ -390,14 +707,23 @@ def main(argv=None):
     jobs_path = args.output / "cases"
     jobs_path.mkdir()
     report = {
-        "schema_version": 1, "reference_seed_42_scenario_c_source_id": REFERENCE_ID,
-        "requested_experiments": args.experiments, "device": args.device, "dtype": args.dtype,
+        "schema_version": 2, "reference_seed_42_scenario_c_source_id": REFERENCE_ID,
+        "protocol": args.protocol, "requested_experiments": () if corrected else args.experiments,
+        "device": args.device, "dtype": args.dtype, "metric_units": METRIC_UNITS,
         "seeds": args.seeds, "adam_iterations": args.adam_iterations, "lm_iterations": args.lm_iterations,
         "cases": [],
     }
+    if corrected:
+        report["requested_identity_studies"] = args.identity_studies
+        if "robustness" in args.identity_studies:
+            report["robustness_grid"] = {
+                "gaussian_noise_px": args.noise_levels, "identity_weights": args.identity_weights,
+                "expression_weights": args.expression_weights,
+            }
     report_path = args.output / "report.json"
+    summary_path = args.output / "summary.json"
     failed = False
-    for job in _jobs(args):
+    for job in (_corrected_jobs(args) if corrected else _jobs(args)):
         path = jobs_path / (job["case"] + ".json")
         job["result"] = str(jobs_path / (job["case"] + ".result.json"))
         write_json(path, job)
@@ -407,15 +733,47 @@ def main(argv=None):
             failed = True
             result = {"case": job["case"], "experiment": job["experiment"], "status": "worker_failed",
                       "return_code": process.returncode}
+            if CAMERA_STUDY in job:
+                reason = f"Fitting worker exited with status {process.returncode}"
+                result.update({
+                    CAMERA_STUDY: job[CAMERA_STUDY], "reason": reason,
+                    "execution_status": "failed", "converged": None, "final": None,
+                    "representability_status": "unavailable",
+                    "observability_status": {
+                        at: {"status": "unavailable", "reason": reason} for at in ("initial", "final")
+                    } if job["spectra"] else {},
+                })
         else:
             result = read_json(Path(job["result"]))
             if result["experiment"] == "E" and result["generation"]["scenario"] == "C" and result["seed"] == 42:
                 _compare_reference(result, reference.get(result["observations"]))
+            if CAMERA_STUDY in result:
+                if (
+                    result["execution_status"] == "failed"
+                    or result["representability_status"] == "unexpected_incompatibility"
+                    or result["optimization"]["final_gradient"]["status"] == "failed"
+                    or any(item["status"] == "failed" for item in result["observability_status"].values())
+                    or (result.get("historical_comparison") or {}).get("matches_source_dataset_id") is False
+                    or (result["final"] is not None and (
+                        not result["final"]["fixed_identity_preserved"]
+                        or not result["identity_error_floor"]["decomposition"]["valid"]
+                    ))
+                ):
+                    failed = True
+            elif corrected and (
+                result["status"] in FAILED_STATUSES or not result["compatibility"]["fully_representable"]
+                or (result.get("held_out") or {}).get("status") in FAILED_STATUSES
+            ):
+                failed = True
         report["cases"].append(result)
-        report["count_study"] = _summarize_counts(report["cases"])
+        report["count_study"] = _summarize_counts(report["cases"], corrected=corrected)
         temporary = report_path.with_suffix(".tmp")
         write_json(temporary, report)
         temporary.replace(report_path)
+        if CAMERA_STUDY in result:
+            temporary = summary_path.with_suffix(".tmp")
+            write_json(temporary, summarize_camera_study(report["cases"]))
+            temporary.replace(summary_path)
     return int(failed)
 
 

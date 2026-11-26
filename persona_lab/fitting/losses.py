@@ -46,15 +46,19 @@ def project_batch(model, state, observation_ids, *, check_geometry=False):
         raise InvalidGeometry("Nonfinite GNM vertex coordinates")
     if check_geometry and not torch.isfinite(landmarks).all():
         raise InvalidGeometry("Nonfinite GNM landmark coordinates")
+    return project_landmarks(landmarks, state.cameras, observation_ids)
+
+
+def project_landmarks(landmarks, cameras, observation_ids):
     axes = gnm_to_frontal_axes(landmarks)
     groups = defaultdict(list)
-    for index, camera in enumerate(state.cameras):
+    for index, camera in enumerate(cameras):
         groups[type(camera), camera.image_size].append(index)
     rows = [None] * len(axes)
     for indices in groups.values():
-        cameras = stack_cameras([state.cameras[index] for index in indices])
+        camera_batch = stack_cameras([cameras[index] for index in indices])
         try:
-            projected = project(axes[indices], cameras)
+            projected = project(axes[indices], camera_batch)
         except ValueError as error:
             identifiers = ", ".join(observation_ids[index] for index in indices)
             raise InvalidGeometry(f"Invalid projection in batch [{identifiers}]: {error}") from error
@@ -95,6 +99,8 @@ def regularization_residual(parameters, name, value, start=0, stop=None):
     """Return the residual and diagonal slope for one selected coordinate group."""
     group = PARAMETER_GROUPS[name]
     strength = getattr(parameters.config, f"{group}_weight")
+    if strength == 0:
+        return torch.zeros_like(value, dtype=torch.float64), 0.0
     slope = math.sqrt(strength / getattr(parameters, name).numel())
     delta = parameters.penalty_delta(name, value, start, stop)
     return delta.double() * slope, slope
