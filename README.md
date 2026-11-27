@@ -1792,12 +1792,13 @@ identity/expression priors are 1e-6/2e-5; pose and camera priors are zero.
 Focal coordinates have no additional prior. The real fit has no ground-truth
 identity; a low reprojection error alone does not establish 3D accuracy.
 
-Choose the actual local DFL dataset path under the mounted datasets directory
-(`datasets/studio_light.zip` is an example, not a tracked dataset):
+The measured pilot used `datasets/light.zip`. Supply the actual local DFL
+dataset path under the mounted datasets directory; private datasets are not
+tracked by Git.
 
 ```sh
-DFL_INPUT=datasets/studio_light.zip
-test -e "$DFL_INPUT" && docker compose --profile cuda run --rm personalab-cuda \
+DFL_INPUT=datasets/light.zip
+docker compose --profile cuda run --rm personalab-cuda \
   python -m persona_lab.fit --input "$DFL_INPUT" --max-images 50 --require-images 50 \
   --selection sample --seed 42 --model-file /cache/gnm/v3_0/gnm_head.npz \
   --device cuda --dtype float64 --solver levenberg-marquardt --fp64-qr \
@@ -1814,3 +1815,50 @@ No automatic retry is performed. Inspect `result.json`, `parameters.npz`,
 `neutral.obj` and the before/after overlays. Budget exhaustion is not
 convergence. The official-asset tests and the real pilot are distinct from
 the asset-free algebra tests; run them on the selected target device.
+
+#### Issue #5 validation evidence and limitations
+
+The native FP64 V6.6 campaign (commit
+`7674a1d9fc2fb66f6700d88371a865e3252f252b`) covered seeds 42, 43 and 44,
+50, 100, 300 and 600 observations on CPU and CUDA, and the batch-size
+1/4/16/32 comparison at seed 42 with 100 observations. All 30 distinct
+fits, including the two initial pilots, met the clean recovery targets.
+The maximum trainable identity RMSE was approximately 2.12e-8, and the
+maximum neutral geometry RMS error was approximately 3.94e-11 m.
+The comparisons passed the original numerical and spectral tolerances.
+These are clean head-only, zero-prior, joint-stage results, not real-world
+accuracy measurements or evidence of recovery of arbitrary full-native
+identities.
+
+The initial real-data test used V7 (commit
+`0c64226c8fea9043d0f653fc7ce3d4904abad73b`) with the command above,
+50 selected observations from 300 accepted JPEGs, seed 42, CUDA FP64
+and 3,400 eligible landmarks. All three stages converged, with 57
+accepted updates in total. RMS reprojection decreased from 22.1763 to
+2.3993 pixels. Optimization took 13.114 seconds on the tested hardware.
+All three stages reported zero normal-equation storage. The result,
+parameter archive, neutral OBJ and 12 initial/final overlay pairs were
+produced. This verifies real-data pipeline operation, not identity accuracy.
+
+The real fit exhibited visibly implausible neutral geometry and excessive
+identity coefficients (approximately -9.71 to +7.50, with 58 of 170
+selected coefficients outside the documented typical interval [-3, 3]).
+The typical range is not a hard validity bound or an anatomical guarantee.
+The configured native-coordinate L2 penalty is implemented, but its strength
+did not prevent excessive deformation in this pilot. Independently estimated
+focal lengths and depths are also strongly coupled and do not establish
+physical calibration. These limitations are not numerical solver failures.
+The existing fixed-focal and weak-perspective modes offer explicit camera
+gauges; none is selected automatically after a failed fit. Robustness,
+expression leakage and practical prior/camera tuning belong to Issue #6;
+held-out and cross-dataset quality evaluation belong to Issue #7. The
+observed shortcomings must not be treated as evidence that anatomical
+plausibility has been validated.
+
+Before closing Issue #5, run the complete test suite on both services with
+the pinned official model asset. The V7 pre-fix suite reported 447 passed,
+27 skipped and 2 failed on CPU; 474 passed and 2 failed on CUDA. Both failures
+were in the nonfinite-residual/Jacobian fault-injection test, whose wrapper
+did not accept the `dtype` keyword. The correction forwards keyword
+arguments without changing failure assertions or runtime fitting behavior.
+Passing post-fix runs are required before reporting a clean suite.

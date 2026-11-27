@@ -806,8 +806,8 @@ def test_lm_reports_nonfinite_linearization_or_factorization_failure(model, monk
     config = _lm_config(train_expression=(), train_head=False)
     original = lm.weighted_landmark_residuals
 
-    def corrupt(*args):
-        residual = original(*args)
+    def corrupt(*args, **kwargs):
+        residual = original(*args, **kwargs)
         if failure == "residual":
             return residual * float("nan")
         residual.register_hook(lambda gradient: gradient * float("nan"))
