@@ -195,6 +195,7 @@ class FitMeasurements:
         self.stage_damping = None
         self.operations = OperationTimings(device) if profile_operations else None
         self.normal_system = None
+        self.square_root_stages = []
         self.stage_trace_seconds = 0.0
 
     def trace_accepted_state(self, parameters, count, values):

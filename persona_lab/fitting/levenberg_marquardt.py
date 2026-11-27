@@ -179,7 +179,19 @@ def square_root_blocks(data, parameters, layout, position, *, operations=None):
             operations.counts["observation_jacobian"] += stop - start
         residuals.append(residual)
         jacobians.append(jacobian)
-    return SquareRootBlocks.create(torch.cat(jacobians), torch.cat(residuals), position.identity.numel(), batch)
+    options = {}
+    if parameters.config.lm.fp64_square_root:
+        prior = BlockVector(torch.zeros_like(position.identity), torch.zeros_like(position.local))
+        slopes = BlockVector(torch.zeros_like(position.identity), torch.zeros_like(position.local))
+        for name, columns in layout.shared_columns():
+            residual, slope = regularization_residual(parameters, name, position.identity[columns])
+            prior.identity[columns], slopes.identity[columns] = residual, slope
+        for name, columns in layout.columns():
+            residual, slope = regularization_residual(parameters, name, position.local[:, columns])
+            prior.local[:, columns], slopes.local[:, columns] = residual, slope
+        if bool(slopes.identity.any() | slopes.local.any()):
+            options = {"prior_residual": prior, "prior_slope": slopes}
+    return SquareRootBlocks.create(torch.cat(jacobians), torch.cat(residuals), position.identity.numel(), batch, **options)
 
 
 def bound_mask(position, gradient, expression_slice, limit):
@@ -311,6 +323,16 @@ def fit_stage(model, data, parameters, stage, groups, values, stats, measurement
                 system = square_root_blocks(data, parameters, layout, position, **profile_options)
             else:
                 system = normal_blocks(model, data, parameters, layout, base, position, **profile_options)
+        if options.fp64_square_root and index == 0:
+            measurements.square_root_stages.append({
+                "stage": stage.name, "representation": "square_root_qr", "dtype": str(system.shared.dtype),
+                "device": str(system.shared.device), "normal_equations_bytes": 0,
+                "shared_parameters": position.identity.numel(), "local_parameters_per_observation": position.local.shape[1],
+                "local_coordinate_widths": dict(zip(layout.names, layout.widths, strict=True)),
+                "landmark_residual_coordinates": 2 * int(data.counts.sum()),
+                "active_prior_coordinates": 0 if system.prior_slope is None else
+                    int(torch.count_nonzero(system.prior_slope.identity) + torch.count_nonzero(system.prior_slope.local)),
+            })
         if operations is None:
             scales = scale_columns(system, options.diagonal_floor)
         else:

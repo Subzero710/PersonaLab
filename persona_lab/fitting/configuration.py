@@ -177,12 +177,8 @@ class FitConfig:
     def __post_init__(self):
         if self.solver not in SOLVERS or not isinstance(self.lm, LevenbergMarquardtConfig):
             raise ValueError("Select a supported solver and a LevenbergMarquardtConfig")
-        if self.lm.fp64_square_root and (
-                (self.camera_mode, self.camera_model, self.focal_mode, self.solver) !=
-                ("estimated", "perspective", "per-observation", "levenberg-marquardt")
-                or self.train_root or not self.train_head
-                or any(getattr(self, f"{g}_weight") != 0 for g in GROUPS)):
-            raise ValueError("FP64 square-root requires explicit joint zero-prior estimated perspective fitting")
+        if self.lm.fp64_square_root and self.solver != "levenberg-marquardt":
+            raise ValueError("FP64 square-root requires Levenberg-Marquardt")
         if self.lm.fp32_forward == "compensated" and (
                 (self.camera_mode, self.camera_model, self.focal_mode, self.solver) !=
                 ("estimated", "perspective", "per-observation", "levenberg-marquardt")
@@ -252,8 +248,6 @@ class FitConfig:
             or len({stage.name for stage in stages}) != len(stages)
         ):
             raise ValueError("Stages require unique names and a positive iteration budget")
-        if self.lm.fp64_square_root and any(stage.iterations and set(stage.groups) != set(GROUPS) for stage in stages):
-            raise ValueError("FP64 square-root requires joint stages with all four parameter groups")
         object.__setattr__(self, "stages", stages)
 
     def to_dict(self):

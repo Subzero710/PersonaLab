@@ -50,18 +50,26 @@ def project_batch(model, state, observation_ids, *, check_geometry=False):
 
 
 def project_landmarks(landmarks, cameras, observation_ids):
-    axes = gnm_to_frontal_axes(landmarks)
     groups = defaultdict(list)
     for index, camera in enumerate(cameras):
         groups[type(camera), camera.image_size].append(index)
+    return project_landmark_batches(landmarks, (
+        (indices, stack_cameras([cameras[index] for index in indices]))
+        for indices in groups.values()
+    ), observation_ids)
+
+
+def project_landmark_batches(landmarks, batches, observation_ids):
+    axes = gnm_to_frontal_axes(landmarks)
     rows = [None] * len(axes)
-    for indices in groups.values():
-        camera_batch = stack_cameras([cameras[index] for index in indices])
+    for indices, camera_batch in batches:
         try:
-            projected = project(axes[indices], camera_batch)
+            projected = project(axes if len(indices) == len(axes) else axes[indices], camera_batch)
         except ValueError as error:
             identifiers = ", ".join(observation_ids[index] for index in indices)
             raise InvalidGeometry(f"Invalid projection in batch [{identifiers}]: {error}") from error
+        if len(indices) == len(axes):
+            return projected
         for index, row in zip(indices, projected.unbind(0), strict=True):
             rows[index] = row
     return torch.stack(rows)

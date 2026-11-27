@@ -36,6 +36,8 @@ def _parser():
     inputs.add_argument("--benchmark", type=Path, help="Issue #4 benchmark dataset directory")
     parser.add_argument("--subject", help="explicit benchmark subject ID")
     parser.add_argument("--max-images", type=_positive_int)
+    parser.add_argument("--require-images", type=_positive_int, help="reject unless exactly N observations are selected")
+    parser.add_argument("--require-convergence", action="store_true", help="return failure unless final stage converges; retain the result")
     parser.add_argument("--selection", choices=("first", "sample"), default="first")
     parser.add_argument("--observation-id", action="append", help="ordered benchmark observation ID; repeatable")
     parser.add_argument("--model-version", choices=("v3",), default="v3")
@@ -44,6 +46,8 @@ def _parser():
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--config", type=Path, help="JSON FitConfig")
     parser.add_argument("--solver", choices=SOLVERS, help="fitting solver (default: Levenberg–Marquardt)")
+    parser.add_argument("--fp64-qr", action="store_true", help="explicit native FP64 square-root LM with staged priors")
+    parser.add_argument("--jacobian-rows", type=_positive_int, help="LM residual rows per autograd batch")
     parser.add_argument("--camera-mode", choices=("known", "estimated"))
     parser.add_argument("--camera", choices=("weak-perspective", "perspective"))
     parser.add_argument("--focal-mode", choices=FOCAL_MODES)
@@ -79,7 +83,18 @@ def _config(args):
             values[name] = value
     if args.camera is not None:
         values["camera_model"] = args.camera
+    if args.fp64_qr or args.jacobian_rows is not None:
+        lm = values.get("lm", {})
+        if not isinstance(lm, dict):
+            raise ValueError("LM configuration must be a JSON object")
+        values["lm"] = dict(lm)
+        if args.fp64_qr:
+            values["lm"]["fp64_square_root"] = True
+        if args.jacobian_rows is not None:
+            values["lm"]["jacobian_rows"] = args.jacobian_rows
     config = FitConfig.from_dict(values)
+    if config.lm.fp64_square_root and args.dtype != "float64":
+        raise ValueError("FP64 square-root requires --dtype float64")
     if args.input and config.camera_mode != "estimated":
         raise ValueError("DeepFaceLab fitting requires estimated-camera mode")
     if config.camera_mode == "estimated" and config.camera_model is None:
@@ -173,6 +188,9 @@ def _run(args):
     if not observations:
         raise ValueError(f"No fitting observations were selected: {source_info}")
 
+    if args.require_images is not None and len(observations) != args.require_images:
+        raise ValueError(f"Expected exactly {args.require_images} observations, selected {len(observations)}")
+
     def log(item):
         print(f"{item.stage} step {item.stage_iteration} (total {item.iteration}) "
               f"loss={item.losses.total:.6g} RMS={item.reprojection.rms_px:.4f} px", flush=True)
@@ -191,6 +209,10 @@ def _run(args):
         _write_result(stage, result)
     if result.status in FAILED_STATUSES:
         print(f"Failed fit: {result.reason}", file=sys.stderr)
+        return 1
+
+    if args.require_convergence and result.status != "converged":
+        print(f"Convergence required: {result.status}: {result.reason}", file=sys.stderr)
         return 1
 
     if args.predictions:

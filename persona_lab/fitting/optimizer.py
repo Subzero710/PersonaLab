@@ -256,6 +256,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
             "operations": operations, "normal_system": run.normal_system,
             "stage_trace_seconds": run.stage_trace_seconds, "infrastructure_failure": failure,
         }
+    if config.lm.fp64_square_root:
+        instrumentation["square_root_stages"] = run.square_root_stages
     elapsed = perf_counter() - started
     return FitResult(
         model=deepcopy(model.metadata), dtype=model.numpy_dtype.name,

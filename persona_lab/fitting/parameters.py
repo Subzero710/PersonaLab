@@ -1,5 +1,6 @@
 """Native GNM selections and gauge-constrained fitting parameters."""
 
+from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
@@ -253,6 +254,7 @@ class FittingParameters:
         self.camera_native = nn.Parameter(torch.stack([c.translation for c in initial.cameras])) if precise else None
         self.local_focal = nn.Parameter(torch.stack([c.focal_length[:1] for c in initial.cameras])) if precise else None
         self._head = head
+        self._native_camera_batches = {}
 
     @cached_property
     def fp32_camera_batch(self):
@@ -281,38 +283,76 @@ class FittingParameters:
         }
         return {name: tuple(p for p in values if p is not None) for name, values in groups.items()}
 
-    def _camera(self, index, offsets, log_focal):
-        camera = self.initial.cameras[index]
+    @staticmethod
+    def _decode_camera(camera, offsets, log_focal, short_edges, identifiers):
+        """Decode the same physical camera coordinates for one view or a batch."""
         if offsets is None:
             return camera
         if isinstance(camera, WeakPerspectiveCamera):
             return replace(
-                camera, translation=camera.translation + offsets[:2] * self.short_edges[index],
-                scale=camera.scale * offsets[2].exp(),
+                camera, translation=camera.translation + offsets[..., :2] * short_edges[..., None],
+                scale=camera.scale * offsets[..., 2].exp(),
             )
-        initial_xy, initial_z = camera.translation[:2], camera.translation[2]
-        depth = initial_z * offsets[2].exp()
-        if not torch.isfinite(depth) or depth <= 0:
-            identifier = self.observation_ids[index]
-            raise InvalidGeometry(f"{identifier} has invalid estimated perspective translation Z")
-        translation = torch.cat((initial_xy + offsets[:2] * initial_z,
-                                 depth.unsqueeze(0)))
+        initial_xy, initial_z = camera.translation[..., :2], camera.translation[..., 2:]
+        depth = initial_z * offsets[..., 2:].exp()
+        if not bool(torch.isfinite(depth).all() & (depth > 0).all()):
+            raise InvalidGeometry(f"{identifiers} has invalid estimated perspective translation Z")
+        translation = torch.cat((initial_xy + offsets[..., :2] * initial_z, depth), dim=-1)
         if log_focal is None:
             return replace(camera, translation=translation)
         focal = camera.focal_length * log_focal.exp()
-        if not torch.isfinite(focal).all() or (focal <= 0).any():
-            raise InvalidGeometry(f"{self.observation_ids[index]} has invalid estimated perspective focal length")
+        if not bool(torch.isfinite(focal).all() & (focal > 0).all()):
+            raise InvalidGeometry(f"{identifiers} has invalid estimated perspective focal length")
         return replace(camera, translation=translation, focal_length=focal)
+
+    def _camera(self, index, offsets, log_focal):
+        return self._decode_camera(self.initial.cameras[index], offsets, log_focal,
+                                   self.short_edges[index], self.observation_ids[index])
+
+    def native_camera_batches(self, start, stop, values):
+        """Group by camera type/raster, retaining the original observation order.
+
+        Cache fixed camera tensors only; all optimized coordinates are decoded
+        afresh, in batches, for every residual evaluation.
+        """
+        if (start, stop) not in self._native_camera_batches:
+            groups = defaultdict(list)
+            for row, camera in enumerate(self.initial.cameras[start:stop]):
+                groups[type(camera), camera.image_size].append(row)
+            self._native_camera_batches[start, stop] = tuple(
+                (indices, stack_cameras([self.initial.cameras[start + i] for i in indices]))
+                for indices in groups.values()
+            )
+        for indices, camera in self._native_camera_batches[start, stop]:
+            offsets = values.camera_delta
+            focal = values.local_log_focal if values.local_log_focal is not None else values.shared_log_focal
+            # A shared scalar broadcasts; independent shared-coordinate copies
+            # (used for Jacobians) and per-view coordinates are gathered.
+            edges = self.short_edges[start:stop]
+            if len(indices) != stop - start:
+                if offsets is not None:
+                    offsets = offsets[indices]
+                if focal is not None and focal.ndim == 2:
+                    focal = focal[indices]
+                edges = edges[indices]
+            yield indices, self._decode_camera(
+                camera, offsets, focal, edges,
+                ", ".join(self.observation_ids[start + i] for i in indices),
+            )
 
     def values(self):
         return ParameterValues(*(getattr(self, name) for name in PARAMETER_GROUPS))
 
-    def state(self, start, stop, values=None):
-        if values is None:
-            values = self.values().batch(start, stop)
+    def geometry(self, start, stop, values, *, batched_identity=False):
         identity = self.initial.identity
         if values.identity is not None:
-            identity = identity.index_copy(0, self.identity_indices, values.identity)
+            # Independent copies of shared coordinates are used only during
+            # batched differentiation. Ordinary states retain one shared vector.
+            if batched_identity or values.identity.ndim == 2:
+                identity = identity.expand(stop - start, -1).index_copy(
+                    1, self.identity_indices, values.identity.expand(stop - start, -1))
+            else:
+                identity = identity.index_copy(0, self.identity_indices, values.identity)
         expression = self.initial.expression[start:stop]
         if values.expression is not None:
             expression = expression.index_copy(1, self.expression_indices, values.expression)
@@ -320,6 +360,12 @@ class FittingParameters:
         if values.pose is not None:
             rotations = rotations.index_copy(1, self.head_indices, values.pose[:, None, :])
         translation = self.initial.translation[start:stop] if values.root is None else values.root
+        return identity, expression, rotations, translation
+
+    def state(self, start, stop, values=None):
+        if values is None:
+            values = self.values().batch(start, stop)
+        identity, expression, rotations, translation = self.geometry(start, stop, values)
         if values.camera_native is not None:
             if values.local_focal is None or not bool(
                     torch.isfinite(values.camera_native).all() & torch.isfinite(values.local_focal).all()
@@ -332,7 +378,9 @@ class FittingParameters:
         cameras = tuple(
             self._camera(
                 index, None if values.camera_delta is None else values.camera_delta[row],
-                values.shared_log_focal if values.local_log_focal is None else values.local_log_focal[row],
+                (values.shared_log_focal[row] if values.shared_log_focal is not None
+                 and values.shared_log_focal.ndim == 2 else values.shared_log_focal)
+                if values.local_log_focal is None else values.local_log_focal[row],
             )
             for row, index in enumerate(range(start, stop))
         )

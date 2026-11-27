@@ -1727,9 +1727,10 @@ It uses the original logarithmic camera coordinates, FP64 parameter
 updates, and the same augmented local/shared QR without forming normal
 matrices. No compensated FP32 forward, precision change, solver fallback,
 truth initialization or relaxed stopping/acceptance/recovery threshold is
-used. This mode currently requires the joint, zero-prior, per-observation
-perspective protocol with a common raster size. Other fitting modes are
-unchanged; they are not a fallback from this protocol.
+used. The V6.6 benchmark selects the joint, zero-prior, per-observation
+perspective protocol. V7 extends the same FP64 QR to staged regularized
+fitting, as described below. Other fitting modes are explicitly selected;
+they are not a fallback from this protocol.
 
 FP32 observations (including high/low controls) are not native FP64
 reference observations. Promoting an archived FP32 raster to FP64 does
@@ -1766,6 +1767,50 @@ Use the existing `scalability_report` reader for the two native FP64 reports.
 The reader rejects mixed precision reports. The scientific and spectral
 comparison tolerances are unchanged. FP64 batch-32 primary and batching
 rows at seed 42/count 100 reuse one fit; no duplicate execution is needed.
-Official-asset CPU/CUDA integration, recovery and scalability still need
-measured validation. The full real-image regularized/staged QR protocol is
-not introduced by this experiment.
+### V7 staged native FP64 square-root fitting
+
+The opt-in `--fp64-qr --dtype float64` fit CLI uses the same native sparse
+GNM and grouped native camera projection for residuals and Jacobians.
+Camera groups preserve the input order and permit different raster sizes.
+Independent shared-coordinate copies exist only during differentiation.
+Local and shared priors are residual rows with the existing full-group
+normalization; the identity prior is included once, not once per image.
+Fixed-group priors remain constant in the full objective. LM acceptance,
+expression bounds, damping and convergence rules are unchanged. The
+reported `runtime.square_root_stages` describes each actual linearization
+layout, precision, device and active prior count. No normal equations,
+precision switching or automatic solver fallback are used in this mode.
+
+The first real pilot uses the existing 170 head identity coefficients and
+24 expression coefficients, all eligible DFL correspondences, positive
+logarithmic perspective focal/depth parameters, and the default three
+stages (30/70/100). The initial focal factor 1.5 is an explicit starting
+value, not known camera calibration. The aligned raster center is the
+chosen principal point; the estimated focal lengths are effective crop
+parameters, not measured original-camera intrinsics. The existing default
+identity/expression priors are 1e-6/2e-5; pose and camera priors are zero.
+Focal coordinates have no additional prior. The real fit has no ground-truth
+identity; a low reprojection error alone does not establish 3D accuracy.
+
+Choose the actual local DFL dataset path under the mounted datasets directory
+(`datasets/studio_light.zip` is an example, not a tracked dataset):
+
+```sh
+DFL_INPUT=datasets/studio_light.zip
+test -e "$DFL_INPUT" && docker compose --profile cuda run --rm personalab-cuda \
+  python -m persona_lab.fit --input "$DFL_INPUT" --max-images 50 --require-images 50 \
+  --selection sample --seed 42 --model-file /cache/gnm/v3_0/gnm_head.npz \
+  --device cuda --dtype float64 --solver levenberg-marquardt --fp64-qr \
+  --camera-mode estimated --camera perspective --focal-mode per-observation \
+  --initial-focal-factor 1.5 --batch-size 32 --jacobian-rows 32 --iterations 30 70 100 \
+  --identity-weight 1e-6 --expression-weight 2e-5 --pose-weight 0 --camera-weight 0 \
+  --train-identity head --overlays 12 --require-convergence --output outputs/v7-real-50-cuda
+```
+
+`--require-images` checks the selected count before fitting;
+`--require-convergence` returns nonzero for a final status other than
+converged, while retaining the explicitly labelled diagnostic result.
+No automatic retry is performed. Inspect `result.json`, `parameters.npz`,
+`neutral.obj` and the before/after overlays. Budget exhaustion is not
+convergence. The official-asset tests and the real pilot are distinct from
+the asset-free algebra tests; run them on the selected target device.

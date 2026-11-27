@@ -11,13 +11,15 @@ import torch
 from .precise_projection import perspective_residual
 from .parameters import InvalidGeometry
 from . import precision_geometry as pg
-from .losses import _landmark_residuals
-from ..camera import project
-from ..coordinates import gnm_to_frontal_axes
+from .losses import _landmark_residuals, project_landmark_batches
 
 
 def _require_supported(parameters, layout):
     config = parameters.config
+    if config.lm.fp64_square_root:
+        if config.solver != "levenberg-marquardt":
+            raise ValueError("FP64 square-root requires Levenberg-Marquardt")
+        return
     camera_names = ("camera_native", "local_focal") if config.lm.fp32_forward == "compensated" else ("camera_delta", "local_log_focal")
     if (not config.lm.uses_square_root or config.camera_mode != "estimated"
         or config.camera_model != "perspective" or config.focal_mode != "per-observation"
@@ -69,18 +71,14 @@ def residual_fp64_batch(data, parameters, start, stop, values):
     """Native GNM sparse forward and standard projection, wholly in FP64."""
     if not parameters.config.lm.fp64_square_root:
         raise ValueError("Select the FP64 square-root protocol explicitly")
-    args, camera, _ = _batched_inputs(parameters, start, stop, values)
-    if any(t.dtype != torch.float64 for t in (*args, camera.translation, camera.focal_length)):
-        raise ValueError("FP64 square-root requires FP64 geometry and camera coordinates")
-    if data.pixel_low is not None:
-        raise ValueError("FP64 square-root requires native raster observations, not FP32 high/low archives")
-    if not bool((camera.translation[:, 2] > 0).all()):
-        raise InvalidGeometry("Estimated perspective translation Z must be positive")
+    if data.pixels.dtype != torch.float64 or data.pixel_low is not None:
+        raise ValueError("FP64 square-root requires native FP64 raster observations")
+    args = parameters.geometry(start, stop, values, batched_identity=True)
+    if any(t.dtype != torch.float64 for t in args):
+        raise ValueError("FP64 square-root requires FP64 geometry")
     landmarks = parameters.landmark_geometry(*args)
-    try:
-        projected = project(gnm_to_frontal_axes(landmarks), camera)
-    except ValueError as error:
-        raise InvalidGeometry(str(error)) from error
+    projected = project_landmark_batches(landmarks, parameters.native_camera_batches(start, stop, values),
+                                         data.ids[start:stop])
     return _landmark_residuals(projected, data, start, stop)
 
 
@@ -130,7 +128,9 @@ def batch_jacobian(data, parameters, layout, position, start, stop, *, legacy_ab
     count = stop - start
     width = position.identity.numel()
     point = torch.cat((position.identity.expand(count, -1), position.local[start:stop]), dim=1).detach().requires_grad_()
-    values = replace(parameters.values().batch(start, stop), identity=point[:, :width], **{
+    values = replace(parameters.values().batch(start, stop), **{
+        name: point[:, :width][:, columns] for name, columns in layout.shared_columns()
+    }, **{
         name: point[:, width:][:, columns] for name, columns in layout.columns()
     })
     if parameters.config.lm.fp64_square_root:

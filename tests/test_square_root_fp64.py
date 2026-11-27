@@ -64,10 +64,11 @@ class SquareRootFP64Tests(unittest.TestCase):
         self.assertNotIn('fp64_square_root', FitConfig().to_dict()['lm'])
         with self.assertRaises(ValueError):
             replace(lm, arithmetic_dtype='float32')
+        regularized = replace(config, identity_weight=1e-6, expression_weight=2e-5,
+                              stages=FitConfig().stages)
+        self.assertEqual(FitConfig.from_dict(regularized.to_dict()), regularized)
         with self.assertRaises(ValueError):
-            replace(config, identity_weight=1e-6)
-        with self.assertRaises(ValueError):
-            replace(config, stages=(Stage('pose', 1, ('pose',), .02),))
+            replace(config, solver='adam')
 
     def test_batch32_primary_reuse(self):
         rows = case_matrix(seeds=(42,), counts=(100,), devices=('cpu',), batch_size=32, dtype='float64')
