@@ -13,6 +13,8 @@ from persona_lab.benchmark.dataset import load_dataset
 from persona_lab.benchmark.generate import generate_dataset
 from persona_lab.benchmark.model import MODEL_SHA256, load_benchmark_model
 from persona_lab.correspondences import CorrespondenceMap, DFL_TO_GNM
+from persona_lab.fitting.configuration import FitConfig
+from persona_lab.fitting.parameters import resolve_selection
 from persona_lab.gnm_geometry import load_sparse_landmarks
 
 
@@ -53,6 +55,7 @@ def test_model_metadata_neutral_mesh_and_independent_frontal_projection(datasets
     model = load_benchmark_model(asset)
     assert metadata == model.metadata
     np.testing.assert_array_equal(dataset.triangles, model.triangles)
+
     vertices = model.head(identity=model.tensor(truth.arrays["identity"])).detach().numpy()
     np.testing.assert_allclose(truth.arrays["neutral_vertices"], vertices, atol=1e-12, rtol=0)
     sparse = load_sparse_landmarks(model.head)
@@ -67,6 +70,41 @@ def test_model_metadata_neutral_mesh_and_independent_frontal_projection(datasets
     assert fitted.fitting_mask().tolist() == [True] * 68
     assert fitted.weights.tolist() == [1] * 68 and fitted.known_camera is not None
     np.testing.assert_array_equal(fitted.landmarks.numpy(), truth.arrays["observed"][0])
+
+
+def test_explicit_identity_selection_keeps_native_order_and_seed_stream(tmp_path, asset, datasets):
+    full = generate_dataset(tmp_path / "full", resolve_config("C", identity_selection="full"), model_file=asset)
+    head_config = resolve_config("C", identity_selection="head")
+    head = generate_dataset(tmp_path / "head", head_config, model_file=asset)
+    repeat = generate_dataset(tmp_path / "repeat", head_config, model_file=asset)
+    assert head.dataset_id == repeat.dataset_id
+    subject, = full.subject_ids
+    legacy = datasets["C"]
+    assert "identity_selection" not in legacy.config.metadata()
+    for name, array in full.ground_truth(subject).arrays.items():
+        np.testing.assert_array_equal(array, legacy.ground_truth(subject).arrays[name])
+
+    model = load_benchmark_model(asset)
+    selection = resolve_selection(model, FitConfig())
+    names = model.metadata["identity_names"]
+    sampled = np.isin(names, selection.identity)
+    assert sampled.sum() == 170 and len(names) == 253
+    head_arrays = head.ground_truth(subject).arrays
+    full_arrays = full.ground_truth(subject).arrays
+    np.testing.assert_array_equal(head_arrays["identity"][~sampled], np.zeros(83))
+    np.testing.assert_array_equal(head_arrays["identity"][sampled], full_arrays["identity"][sampled])
+    fixed_expression = np.isin(model.metadata["expression_names"], selection.fixed_expression)
+    assert not head_arrays["expression"][:, fixed_expression].any()
+    assert head.config.metadata()["identity_selection"] == "head"
+    for name in ("expression", "rotations", "translation"):
+        np.testing.assert_array_equal(head_arrays[name], full_arrays[name])
+    assert head.ground_truth(subject).observations == full.ground_truth(subject).observations
+
+
+@pytest.mark.parametrize("selection", [None, "", "eyes", ["head"]])
+def test_invalid_synthetic_identity_selection(selection):
+    with pytest.raises(ValueError, match="Identity selection"):
+        resolve_config("C", identity_selection=selection)
 
 
 def test_scenario_coverage_and_paired_clean_observations(datasets):

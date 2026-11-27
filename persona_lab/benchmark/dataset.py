@@ -23,6 +23,7 @@ from .storage import (
 
 
 SCHEMA_VERSION = 1
+PRECISION_SCHEMA_VERSION = 2
 MODEL_FIELDS = {
     "asset", "asset_sha256", "version", "variant", "identity_count", "identity_names",
     "expression_count", "expression_names", "joint_count", "joint_names", "vertex_count",
@@ -138,7 +139,7 @@ def _validate_model(metadata):
             raise ValueError(f"Invalid model {key}")
 
 
-def _subject_specs(config, model):
+def _subject_specs(config, model, *, precise=False):
     dtype = np.dtype(config.dtype)
     n = config.observations_per_subject
     slots = (n, DFL_LANDMARK_COUNT)
@@ -152,11 +153,20 @@ def _subject_specs(config, model):
         "observed": (dtype, (*slots, 2)),
         "offset_px": (dtype, (*slots, 2)),
         "weights": (dtype, slots),
+        **({"pixel_low": (np.dtype("float32"), (*slots, 2))} if precise else {}),
         **{name: (np.dtype(bool), slots) for name in MASKS},
     }
 
 
 def _validate_subject(record, arrays, config, mapping):
+    if "pixel_low" in arrays:
+        high, low = arrays["observed"], arrays["pixel_low"]
+        if (config.dtype != "float32" or not np.array_equal(high, arrays["clean"])
+                or np.any(low[~arrays["supported"]])
+                or np.any(np.abs(low) > 0.5 * np.maximum(
+                    np.nextafter(high, np.float32(np.inf)) - high,
+                    high - np.nextafter(high, np.float32(-np.inf))))):
+            raise ValueError("Invalid high/low clean pixel representation")
     items = record["observations"]
     size = ImageSize(*config.image_size)
     if not isinstance(items, list) or len(items) != config.observations_per_subject:
@@ -177,6 +187,10 @@ def _validate_subject(record, arrays, config, mapping):
         camera = camera_from_record(item["camera"], dtype=dtype, device=device, image_size=size)
         if isinstance(camera, PerspectiveCamera) != (kind == "perspective"):
             raise ValueError("Observation camera model does not match the configured schedule")
+        if config.perspective_focal_factors is not None:
+            expected = config.perspective_focal_factors[index] * min(size.width, size.height)
+            if not torch.equal(camera.focal_length, camera.focal_length.new_full((2,), expected)):
+                raise ValueError(f"Observation focal length does not match the schedule for {item['id']}")
         slot = {field: array[index] for field, array in arrays.items()
                 if field not in ("identity", "neutral_vertices")}
         calculated_frame = in_frame(
@@ -218,9 +232,10 @@ class SubjectGroundTruth:
 class BenchmarkDataset:
     """A validated dataset. Fitting only needs fitting_observations()."""
 
-    def __init__(self, manifest, config, triangles, mapping, subjects):
+    def __init__(self, manifest, config, triangles, mapping, subjects, *, source=None):
         self._manifest = manifest
         self._subjects = subjects
+        self._source = source
         self.config = config
         self.triangles = triangles
         self.correspondences = mapping
@@ -228,6 +243,18 @@ class BenchmarkDataset:
     @property
     def dataset_id(self):
         return self._manifest["dataset_id"]
+
+    @property
+    def has_precision_pixels(self):
+        return self._manifest["schema_version"] == PRECISION_SCHEMA_VERSION
+
+    @property
+    def precision_source_dataset_id(self):
+        return self._manifest["generator"].get("precision_source_dataset_id")
+
+    @property
+    def source_dataset_id(self):
+        return self.dataset_id if self._source is None else self._source.dataset_id
 
     @property
     def subject_ids(self):
@@ -249,27 +276,69 @@ class BenchmarkDataset:
         """Explicit evaluation access to clean coordinates, parameters and corruption."""
         return deepcopy(self._subject(subject))
 
-    def fitting_observations(self, subject, *, observation_ids=None, dtype="float64", device="cpu"):
-        """Return DFL-ordered observations with known cameras, masks and weights."""
+    def _observation_selection(self, subject, observation_ids):
+        all_ids = self.observation_ids(subject)
+        selected = all_ids if observation_ids is None else tuple(observation_ids)
+        known = set(all_ids)
+        if not selected:
+            raise ValueError("Select at least one observation ID")
+        if any(not isinstance(key, str) or key not in known for key in selected) or (
+            len(set(selected)) != len(selected)
+        ):
+            raise ValueError("Observation selection contains duplicate or unknown identifiers")
+        return all_ids, selected
+
+    def select_observations(self, subject, observation_ids=None):
+        """Keep the current dataset for its full order, otherwise select from its source."""
+        all_ids, selected = self._observation_selection(subject, observation_ids)
+        if selected == all_ids:
+            return self
+        if self._source is not None:
+            return self._source.select_observations(subject, selected)
+        truth = self._subject(subject)
+        positions = {key: index for index, key in enumerate(all_ids)}
+        indices = [positions[key] for key in selected]
+        arrays = {
+            name: values if name in ("identity", "neutral_vertices") else values[indices]
+            for name, values in truth.arrays.items()
+        }
+        records = tuple(truth.observations[index] for index in indices)
+        manifest = self._manifest | {"dataset_id": digest_json({
+            "source_dataset": self.dataset_id, "subject": subject, "observation_ids": selected,
+        })}
+        return BenchmarkDataset(
+            manifest, self.config, self.triangles, self.correspondences,
+            {subject: SubjectGroundTruth(subject, records, arrays)}, source=self,
+        )
+
+    def fitting_observations(
+        self, subject, *, observation_ids=None, dtype="float64", device="cpu",
+        include_known_cameras=True,
+    ):
+        """Return observed DFL landmarks, masks, weights, and explicitly requested cameras."""
+        if type(include_known_cameras) is not bool:
+            raise ValueError("include_known_cameras must be a boolean")
         truth = self._subject(subject)
         dtype, device = torch_options(dtype, device)
         size = ImageSize(*self.config.image_size)
         indices = {item["id"]: index for index, item in enumerate(truth.observations)}
-        selected = tuple(indices) if observation_ids is None else tuple(observation_ids)
-        if len(set(selected)) != len(selected) or any(key not in indices for key in selected):
-            raise ValueError("Observation selection contains duplicate or unknown identifiers")
+        _, selected = self._observation_selection(subject, observation_ids)
         result = []
         for key in selected:
             index = indices[key]
-            camera = camera_from_record(
-                truth.observations[index]["camera"], dtype=dtype, device=device, image_size=size,
-            )
+            camera = None
+            if include_known_cameras:
+                camera = camera_from_record(
+                    truth.observations[index]["camera"], dtype=dtype, device=device, image_size=size,
+                )
             result.append(LandmarkObservation(
                 observation_id=key, image_size=size, correspondences=self.correspondences,
                 landmarks=torch.tensor(truth.arrays["observed"][index], dtype=dtype, device=device),
                 validity=torch.tensor(truth.arrays["validity"][index], device=device),
                 weights=torch.tensor(truth.arrays["weights"][index], dtype=dtype, device=device),
                 known_camera=camera,
+                pixel_low=torch.tensor(truth.arrays["pixel_low"][index], dtype=dtype, device=device)
+                if "pixel_low" in truth.arrays else None,
             ))
         return tuple(result)
 
@@ -284,8 +353,16 @@ def _read_dataset(path, manifest):
         "schema_version", "dataset_id", "config", "model", "coordinates", "correspondences",
         "runtime", "generator", "subjects",
     }, "Dataset manifest")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] not in (SCHEMA_VERSION, PRECISION_SCHEMA_VERSION):
         raise ValueError("Unsupported benchmark dataset schema version")
+    precise = manifest["schema_version"] == PRECISION_SCHEMA_VERSION
+    if precise and (not isinstance(manifest["generator"], dict)
+            or manifest["generator"].get("pixel_representation") != "compensated-fp32-high-low-v1"
+            or not is_sha256(manifest["generator"].get("precision_source_dataset_id"))
+            or not isinstance(manifest["generator"].get("precision_source_files_sha256"), dict)
+            or set(manifest["generator"]["precision_source_files_sha256"]) != {"manifest.json", "subject_0000.npz", "topology.npz"}
+            or not all(is_sha256(v) for v in manifest["generator"]["precision_source_files_sha256"].values())):
+        raise ValueError("High/low dataset requires explicit generator provenance")
     if manifest["dataset_id"] != _manifest_id(manifest):
         raise ValueError("Benchmark manifest does not match its dataset identifier")
     if manifest["coordinates"] != COORDINATES or not isinstance(manifest["runtime"], dict) or (
@@ -297,8 +374,23 @@ def _read_dataset(path, manifest):
     config = resolve_config(**manifest["config"])
     if digest_json(config.metadata()) != digest_json(manifest["config"]):
         raise ValueError("Dataset must preserve the fully resolved generation configuration")
+    if config.perspective_focal_factors is not None and (
+        manifest["generator"].get("focal_per_short_edge_schedule") != list(config.perspective_focal_factors)
+    ):
+        raise ValueError("Dataset focal schedule differs from its generation provenance")
     model = manifest["model"]
     _validate_model(model)
+    fixed_identity = []
+    if config.identity_selection is not None:
+        names = model["identity_names"]
+        # Native component metadata uses "<region>_<index>" names.
+        selected = [
+            name for name in names
+            if config.identity_selection == "full" or name.rpartition("_")[0] == "head"
+        ]
+        if not selected or manifest["generator"].get("identity_coefficient_names") != selected:
+            raise ValueError("Dataset identity selection differs from its native coefficient provenance")
+        fixed_identity = [i for i, name in enumerate(names) if name not in selected]
     mapping = _load_mapping(manifest["correspondences"])
     topology = read_arrays(
         path / "topology.npz", {"triangles": (np.dtype("int32"), (model["triangle_count"], 3))},
@@ -318,7 +410,9 @@ def _read_dataset(path, manifest):
         require_keys(record, {"id", "observations", "arrays_sha256"}, "Subject record")
         if record["id"] != subject_id(index):
             raise ValueError("Invalid, duplicate or out-of-order subject identifier")
-        arrays = read_arrays(path / f"{record['id']}.npz", _subject_specs(config, model))
+        arrays = read_arrays(path / f"{record['id']}.npz", _subject_specs(config, model, precise=precise))
+        if np.any(arrays["identity"][fixed_identity] != 0):
+            raise ValueError("Unselected synthetic identity coefficients must be exactly zero")
         if digest_arrays(arrays) != record["arrays_sha256"]:
             raise ValueError(f"Inconsistent arrays for {record['id']}")
         fingerprint = digest_arrays({"identity": arrays["identity"]})
@@ -336,11 +430,11 @@ def load_dataset(path):
     return _read_dataset(path, read_json(path / "manifest.json"))
 
 
-def write_dataset(destination, *, config, model, subjects, mapping, runtime, generator):
+def write_dataset(destination, *, config, model, subjects, mapping, runtime, generator, precise=False):
     """Write verified numeric data, then publish the validated completion manifest."""
     records = []
     manifest = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": PRECISION_SCHEMA_VERSION if precise else SCHEMA_VERSION,
         "config": config.metadata(),
         "model": model.metadata,
         "coordinates": COORDINATES,
@@ -354,7 +448,7 @@ def write_dataset(destination, *, config, model, subjects, mapping, runtime, gen
         for index, subject in enumerate(subjects):
             if subject.subject_id != subject_id(index):
                 raise ValueError("Subjects must be supplied in stable identifier order")
-            validate_arrays(subject.arrays, _subject_specs(config, model.metadata), subject.subject_id)
+            validate_arrays(subject.arrays, _subject_specs(config, model.metadata, precise=precise), subject.subject_id)
             records.append({
                 "id": subject.subject_id,
                 "observations": list(subject.observations),

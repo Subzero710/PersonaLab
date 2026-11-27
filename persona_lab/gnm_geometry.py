@@ -1,6 +1,6 @@
 """Official GNM v3.0 Head landmarks and shared-identity batching."""
 
-from gnm.shape import gnm_landmarks, gnm_pytorch
+from gnm.shape import gnm_common, gnm_landmarks, gnm_pytorch
 import numpy as np
 import torch
 from torch import Tensor
@@ -44,6 +44,46 @@ def load_sparse_landmarks(
     if not np.allclose(weights.sum(axis=-1), 1, atol=BARYCENTRIC_ATOL, rtol=0):
         raise ValueError(f"GNM sparse head weights must sum to one within {BARYCENTRIC_ATOL}")
     return config
+
+
+class SparseHeadLandmarks:
+    """Evaluate the official landmark vertices with the native GNM operations."""
+
+    def __init__(self, head):
+        config = load_sparse_landmarks(head)
+        template = head.template_vertex_positions
+        vertices, triangles = np.unique(config.indices, return_inverse=True)
+        indices = torch.as_tensor(vertices, dtype=torch.long, device=template.device)
+        self.triangles = torch.as_tensor(
+            triangles.reshape(config.indices.shape), dtype=torch.long, device=template.device,
+        )
+        self.weights = torch.as_tensor(config.weights, dtype=template.dtype, device=template.device)
+        self.template = template.index_select(0, indices)
+        self.identity_basis = head.vertex_identity_basis.index_select(1, indices)
+        self.expression_basis = head.expression_basis.index_select(1, indices)
+        self.skinning_weights = head.skinning_weights.index_select(1, indices)
+        self.pose_regressor = head.pose_correctives_regressor
+        if self.pose_regressor is not None:
+            self.pose_regressor = self.pose_regressor.reshape(-1, head.num_vertices, 3).index_select(
+                1, indices,
+            ).flatten(1)
+        self.head = head
+
+    def __call__(self, identity, expression, rotations, translation):
+        identity = identity.expand(*expression.shape[:-1], self.head.identity_dim)
+        vertices = gnm_common.vertex_positions_bind_pose(
+            identity, expression, self.template, self.identity_basis, self.expression_basis,
+        )
+        joints = self.head.joint_positions_bind_pose(identity)
+        matrices = gnm_common.axis_angle_to_rotation_matrix(rotations)
+        corrective = gnm_common.compute_pose_correctives_from_rotation_matrices(
+            matrices, self.pose_regressor, self.template, self.head.num_joints, len(self.template),
+        )
+        posed = gnm_common.linear_blend_skinning_from_rotation_matrices(
+            vertices + corrective, joints, matrices, translation,
+            self.skinning_weights, self.head.joint_parent_indices,
+        )
+        return (posed[..., self.triangles, :] * self.weights[..., None]).sum(dim=-2)
 
 
 def extract_landmarks(

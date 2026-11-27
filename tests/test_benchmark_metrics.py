@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from persona_lab.benchmark.metrics import (
-    coefficient_errors, reprojection_errors, rotation_errors_deg, vertex_errors,
+    coefficient_errors, fixed_coefficient_error, grouped_coefficient_errors, pool_coefficient_errors,
+    reprojection_errors, rotation_errors_deg, vertex_errors,
 )
 from persona_lab.benchmark.model import in_frame, project_dfl
 from persona_lab.camera import PerspectiveCamera, WeakPerspectiveCamera
@@ -24,6 +25,30 @@ def test_coefficient_and_geometry_errors_have_independent_expected_values():
     assert geometry == {
         "mean_m": 8.5, "rms_m": pytest.approx(np.sqrt(84.5)), "max_m": 12.0,
         "vertex_count": 2,
+    }
+
+
+def test_native_groups_fixed_floor_and_expression_pooling():
+    names = ("head_000", "eyes_000", "head_001", "teeth_000")
+    target = np.zeros(4)
+    estimate = np.array([3.0, 2.0, 4.0, 1.0])
+    result = grouped_coefficient_errors(
+        estimate, target, names, trainable=("head_000", "head_001"),
+        regions={"head": [0, 2], "eyes": [1], "teeth": [3]},
+    )
+    assert result["trainable"] == result["head"]
+    assert result["eyes"]["rmse"] == 2.0 and result["teeth"]["rmse"] == 1.0
+    assert result["global"]["max_absolute"] == 4.0
+    assert result["fixed"]["rmse"] == pytest.approx(np.sqrt(5 / 2))
+    floor = fixed_coefficient_error(estimate, target, names, ("head_000", "head_001"))
+    assert floor == {
+        "differing_coefficients": ["eyes_000", "teeth_000"],
+        "full_native_rmse_floor": pytest.approx(np.sqrt(5 / 4)),
+    }
+    second = coefficient_errors(np.array([0.0, 1.0]), np.zeros(2))
+    assert pool_coefficient_errors([result["trainable"], second]) == {
+        "coefficient_count": 4, "mae": 2.0, "rmse": pytest.approx(np.sqrt(26 / 4)),
+        "max_absolute": 4.0,
     }
 
 

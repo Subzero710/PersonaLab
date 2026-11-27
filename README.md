@@ -699,6 +699,611 @@ for identity errors in the raster. Compare coefficient and geometry recovery
 alongside reprojection. Synthetic recovery establishes correctness under GNM's
 assumptions. Evaluating real photographs requires the separate real-data study.
 
+## Fit one identity from multiple observations
+
+The fitting API accepts `LandmarkObservation` objects from the DeepFaceLab
+importer or the Issue #4 benchmark. Each fit uses one verified GNM v3.0 Head
+model and one shared vector of 253 identity coefficients. Each observation
+has a 383-coefficient expression, four native axis-angle joint rotations,
+a root translation in meters, and its own camera. The model's buffers and
+the supplied landmark data stay fixed. Joint rotations follow GNM's
+`neck`, `head`, `left_eye`, `right_eye` order in radians.
+
+### Parameter selection and camera gauges
+
+The default identity selection is the 170-component `head` region. The
+pinned asset has nonzero head basis entries at the 186 positively weighted
+vertices of the official sparse landmarks. The `eyes` and `teeth` vertex
+bases are zero at those vertices. The teeth joint basis still affects the
+neck and head pivots, so pose can introduce indirect effects. Direct vertex
+support gives evidence of sensitivity and leaves independent recovery open.
+
+The default expression selection uses the first 12 `lower_face_region`
+coefficients and the first six coefficients in each `left_eye_region` and
+`right_eye_region`. The benchmark's anatomical probes exercise mouth,
+eyelid, and brow movements within these regions. Tongue and pupil
+expression bases have zero direct support at the sparse vertices. The
+initial subset limits how much each observation can explain with its own
+expression. Its size and regularization are configurable. The selected
+expression values are projected to the configured operating interval after
+each Adam update. The default interval is ±3, the typical range documented
+by GNM. It is an optimizer policy.
+
+Select native names such as `head_000` or regions such as `head` in
+`train_identity` and `train_expression`. The `fixed_identity` and
+`fixed_expression` lists remove explicitly fixed names or regions from
+those selections. The parameter arrays saved with a result contain every
+native coefficient. Only selected coordinates are stored in trainable
+tensors. The same representation preserves externally supplied fixed values
+when stages change. The default starting identity and expressions are the
+mean identity and neutral expressions, both represented by zero.
+
+| Camera mode | Optimized camera values | Fixed camera values | GNM degrees of freedom |
+| --- | --- | --- | --- |
+| Known, either projection | None | All supplied camera tensors | Head rotation, plus optional root translation with fixed perspective cameras |
+| Estimated weak perspective | Pixel XY offset and log scale ratio | Initial camera rotation | Head rotation with fixed root translation |
+| Estimated perspective | Metric XY offset and log distance ratio | Initial rotation, focal length and principal point | Head rotation with fixed root translation |
+
+The neck and eyes keep their initial rotations. Estimated weak perspective
+has no depth parameter. Estimated perspective uses the raster center as the
+principal point and a focal length of 1.5 times the shorter raster edge
+by default. This defines an artificial gauge for aligned crops. An explicit
+initial camera can set these fixed quantities. For estimated cameras the
+weak-perspective pixel offsets are scaled by the shorter edge and the
+perspective XY offsets by the initial Z. A positive initial scale or Z
+multiplied by the exponential of its corresponding change remains
+positive. Projection checks all 68 official landmark depths. Invalid
+depths terminate the fit. Focal length, depth, physical head size and
+orientation do not have independent calibration in this problem.
+
+### Initialization, objective, and optimization
+
+Initialization tests a deterministic set of 45 head rotations at yaw
+0°, ±40°, and ±75°, pitch 0° and ±25°, and roll 0° and ±20°. GNM
+receives the resulting axis-angle vectors from SciPy's extrinsic
+`yxz` conversion. Known or explicitly initialized cameras are used directly
+to score candidates. With an uncalibrated weak-perspective camera, weighted
+centroids and least-squares scale place each candidate in the image.
+Perspective initialization uses that scale at the weighted depth centroid
+and solves XY translation with the existing pinhole projector. The candidate
+with the lowest eligible weighted residual is selected from the candidates
+with valid camera geometry. The result records the strategy, selected index
+and admissible candidate count. `pose_initializer="neutral"` starts from
+the native zero pose. Passing explicit rotations overrides pose search for
+that observation. The fitting loop uses no randomness. The seed controls
+CLI sampling when `--selection sample` is used.
+
+For image \(i\) let \(s_i=\min(w_i,h_i)\) be its shorter raster edge and
+\(a_{ik}\) be the eligible landmark weight. The landmark term pools all
+eligible weights across the subject.
+
+```text
+L_landmark = Σ a_ik || (projected_ik - observed_ik) / s_i ||² / Σ a_ik
+L_total = L_landmark + L_identity + L_expression + L_pose + L_camera
+```
+
+All 68 supported correspondences, including the 17 contour landmarks, have
+unit weight and are enabled by default. An observation's mask and weights,
+disabled or unsupported correspondences, and an explicit subset determine
+eligibility. An observation with zero eligible pairs is rejected with its ID.
+Logging reports independent unweighted Euclidean mean and RMS in pixels.
+
+Identity regularization is the mean square of the selected native identity
+coefficients. Expression regularization is the mean square of the selected
+native expression coefficients over observations. Both are zero-centered
+penalties in the model's native scaling. Pose penalties, when enabled,
+measure squared changes from the initial head rotation and root translation.
+The camera penalty is the mean square of optimized camera coordinates in
+their normalized parameterization. The default strengths for identity,
+expression, pose and camera are `1e-6`, `2e-5`, `0` and `0`.
+The expression penalty and restricted subset are intended to limit
+identity-expression compensation. Benchmark evaluation can measure that trade-off.
+
+| Stage | Updates | Available groups | Default learning rates |
+| --- | ---: | --- | --- |
+| Pose and camera | 30 | Pose, camera | 0.018 |
+| Identity | 70 | Identity, pose, camera | Identity 0.045, pose 0.008, camera 0.006 |
+| Joint | 100 | Identity, expression, pose, camera | Identity and expression 0.022, pose 0.005, camera 0.004 |
+
+The stage budgets and rates are initial implementation settings. A JSON
+`FitConfig` can override the order, groups, step counts, and per-group rates.
+An Adam optimizer starts fresh for each stage and receives only the enabled
+groups. A global iteration accumulates normalized batch gradients and
+applies the subject's regularizers once before the Adam step. The default
+batch size is four. Only a batch of GNM graphs is live at a time. The
+fitting loop records losses, eligible counts, pixel errors, gradient norms,
+and elapsed time.
+
+The result distinguishes gradient-tolerance convergence, an improvement
+plateau after configured patience, an exhausted iteration budget, and
+failure. Adam's tolerance-based stopping is opt-in. The default divergence check
+fails a stage if its objective exceeds 100 times the stage-entry loss,
+with a floor of `1e-12` on the reference loss. Missing or nonfinite
+gradients, invalid projections, and nonfinite parameters or Adam state
+fail explicitly. History contains the last logged valid step. Failed
+results have no final parameters, mesh, overlays, or predictions.
+
+### Levenberg–Marquardt
+
+Levenberg–Marquardt with a Schur complement is the default in `FitConfig` and
+the fitting CLI. Select `--solver adam` or `FitConfig(solver="adam")` for
+historical comparisons. The selection applies to the entire fitting schedule.
+Both solvers use the same parameter
+groups, starting values, observation masks, and objective. Adam uses the
+existing learning rates and divergence check. Levenberg–Marquardt (LM) uses a
+stage's groups and accepted-update budget. Stage learning rates are Adam
+settings.
+
+Each eligible landmark contributes two residual coordinates,
+`sqrt(a_ik / Σ a) * (projected_ik - observed_ik) / s_i`. The weighted
+denominator spans the subject. Let `p` be the number of selected identity
+coefficients, `N` the number of observations, and `d` the width of one selected
+local coordinate group. The identity prior contributes
+`sqrt(identity_weight / p) * identity` once. For a local group, the prior
+contributes `sqrt(group_weight / (N * d)) * delta` per view. The head
+rotation and root translation use separate means centered on initialization.
+Expression and normalized camera coordinates are centered on zero.
+Configured groups frozen during a stage still contribute their constant
+penalties. The objective is the sum of squares of these residuals.
+
+At the accepted state, let `A_i` and `B_i` be the derivatives of the view
+residual with respect to shared identity and that view's local coordinates.
+The Gauss–Newton system has one shared block `U`, independent local blocks
+`V_i`, cross blocks `E_i`, and gradient `g = Jᵀr`. The shared block sums
+`A_iᵀA_i` and the single identity prior. Each cross block is `A_iᵀB_i`,
+and each local block is `B_iᵀB_i` plus local prior curvature. LM equilibrates
+columns with inverse square roots of the normal diagonals. Each block uses
+a relative diagonal floor and a positive machine-precision floor. It adds
+`λI` to the shared and local blocks in scaled coordinates.
+
+With `V_i = L_i L_iᵀ` after scaling and damping, the local triangular solves
+form `W_i = L_i⁻¹ E_iᵀ` and `v_i = L_i⁻¹ g_i`. Cholesky solves the
+reduced system
+
+```text
+(U - Σ W_iᵀ W_i) Δa = -g_a + Σ W_iᵀ v_i
+Δb_i = L_i⁻ᵀ (-v_i - W_i Δa)
+```
+
+The algorithm back-substitutes the local updates and maps them to native
+coordinates. The Jacobian evaluates the vertices used by the official
+landmarks with the native GNM basis, joint regressors, pose correctives and
+skinning operations. Trial objectives still evaluate full mesh geometry.
+Differentiation uses one observation graph and bounded groups of reverse-mode
+rows. A value of `jacobian_rows=1` selects scalar
+reverse-mode derivatives. The retained matrices take
+`O(p² + N(pq + q²))` storage for local width `q`. Trial scoring uses
+`batch_size`. Jacobian blocks are accumulated, scaled, and factored in
+float64 on the requested device. Forward projection and differentiation
+use the model's selected precision. Float32 can limit progress when a
+candidate rounds to the current coordinates. The diagonal ratios of the
+Cholesky factors are conditioning indicators.
+
+Coordinates at an expression bound with an outward descent direction are
+held for the linear solve. The trial then clips expressions and casts to
+the model dtype. For the resulting actual step `δ`, the predicted
+reduction in the undamped objective is `-2 gᵀδ - δᵀ (JᵀJ) δ`.
+The actual reduction is the old objective minus the trial objective. An
+accepted trial has positive actual reduction and meets the configured
+acceptance ratio. Damping is divided by three after an acceptance ratio
+above 0.75 and multiplied by four after a ratio below 0.25 or after a
+rejection, within its bounds. Each stage starts with its configured initial
+damping. Rejected trial coordinates are discarded. Existing camera gauges,
+positive scales and positive perspective landmark depths are checked, as is
+finite trial geometry.
+
+`LevenbergMarquardtConfig` is exported from `persona_lab.fitting` and
+serialized under `FitConfig.lm`. The defaults are listed below.
+
+| Key | Default | Role |
+| --- | ---: | --- |
+| `initial_damping` | `1e-3` | Damping at each stage entry |
+| `minimum_damping` | `1e-8` | Lower damping bound |
+| `maximum_damping` | `1e8` | Upper damping bound |
+| `max_trials` | `12` | Trials per linearization |
+| `acceptance_threshold` | `1e-4` | Minimum actual-to-predicted reduction ratio |
+| `diagonal_floor` | `1e-12` | Relative floor for each block's squared column norms |
+| `scaled_gradient_tolerance` | `1e-10` | Tolerance on the scaled projected objective gradient |
+| `jacobian_rows` | `8` | Output rows per reverse-mode call |
+
+LM also supports the common `gradient_tolerance` in native coordinates
+and `improvement_tolerance` with `patience`. `converged` records a
+gradient tolerance, `stopped` an objective plateau, and `budget_exhausted`
+the accepted-update budget. A failure to obtain an acceptable trial returns
+`no_acceptable_step` with the trial or damping limit in the reason.
+`numerical_failure` reports a bad linearization, failed factorization or
+other numerical error. Both failure statuses return a nonzero CLI exit
+and omit final parameters. Adam retains its `failed` status.
+
+### CLI and result files
+
+Commands below use the existing Docker service. They require local
+validation before using the fitting pipeline on private images.
+
+```sh
+docker compose run --rm personalab python -m persona_lab.fit \
+  --input datasets/light.zip --camera weak-perspective --max-images 50 \
+  --selection first --device cpu --batch-size 4 --overlays 6 \
+  --output outputs/fitting/first_identity
+
+docker compose run --rm personalab python -m persona_lab.fit \
+  --benchmark outputs/benchmarks/scenario-C --subject subject_0000 \
+  --solver levenberg-marquardt --camera-mode known --device cpu --batch-size 4 \
+  --output outputs/fitting/scenario-C --predictions outputs/predictions/scenario-C
+
+docker compose run --rm personalab python -m persona_lab.benchmark.evaluate \
+  --ground-truth outputs/benchmarks/scenario-C --predictions outputs/predictions/scenario-C \
+  --mode known-camera --subject subject_0000 --output outputs/reports/fitted-scenario-C
+```
+
+Use `--model-file models/gnm_head.npz` to provide the exact pinned asset or
+omit the flag to use the verified model cache. `--model-version v3`
+selects GNM v3.0 Head. `--device cpu` and `--dtype float64` are the
+defaults, and `--dtype float32` is supported. Request CUDA through
+`docker compose --profile cuda run --rm personalab-cuda` with `--device cuda`.
+An unavailable requested device raises an error. Other controls include
+`--batch-size`, `--iterations A B C`, `--learning-rate`, `--log-every`,
+`--seed`, the four penalty weights, and the trainable coefficient lists.
+`--learning-rate` overrides all Adam stage and group rates. `--config` accepts
+a JSON object with the fields of `FitConfig`. Each stage has `name`,
+`iterations`, `groups`, `learning_rate`, and optional `group_rates` fields.
+
+An LM configuration can set its bounds and trial budget in the same JSON.
+
+```json
+{
+  "solver": "levenberg-marquardt",
+  "lm": {
+    "initial_damping": 0.001,
+    "maximum_damping": 1000000,
+    "max_trials": 12
+  }
+}
+```
+
+The real input uses the stable importer order and records accepted,
+rejected, and selected counts. `--selection sample` selects without
+replacement from accepted observations and preserves their importer order.
+The result directory must be new. `result.json` records the verified model
+and parameter order, selection, camera gauge, observation IDs, cameras,
+configuration, initialization, history, and termination status.
+`result.json` includes an `optimization` record with objective terms
+at initialization and the last valid state, objective and Jacobian evaluation
+counts, updates and their norms, and LM trials with damping, reductions,
+acceptance ratio, and factor diagnostics. Runtime metadata includes
+initialization, objective, Jacobian and block-solve times, fitting time,
+process RSS and CUDA peak allocated bytes where available. Objective time for
+Adam includes the backwards pass. A Jacobian evaluation is an attempted
+full linearization, including block accumulation. An objective evaluation
+is an attempted full scoring pass. On CUDA these timings synchronize the
+requested device. RSS and CUDA allocated-byte peaks are process high-water
+marks. Model loading is timed by the CLI. It is unavailable to
+`fit_identity` when the caller supplies a loaded model. `load_result` also
+reads version 1 Adam and version 2 solver-explicit results.
+`parameters.npz` contains the initial and final arrays and loads with
+`allow_pickle=False`. `neutral.obj` uses fitted identity with zero
+expressions, rotations, and translation. `--no-neutral-mesh` disables
+that diagnostic. `--overlays N` writes initial and final pairs for the
+highest-RMS observation and a sample spaced across fitted head yaw. The
+overlays use the existing GNM wireframe and landmark diagnostic. Keep real
+results and overlays in the local outputs directory.
+
+### Python API and benchmark use
+
+```python
+from persona_lab.benchmark.dataset import load_dataset
+from persona_lab.benchmark.model import load_benchmark_model
+from persona_lab.benchmark.predictions import write_predictions
+from persona_lab.fitting import FitConfig, fit_identity, save_result
+
+model = load_benchmark_model(dtype="float64", device="cpu")
+dataset = load_dataset("outputs/benchmarks/scenario-C")
+subject = dataset.subject_ids[0]
+observations = dataset.fitting_observations(subject)
+result = fit_identity(model, observations, FitConfig())
+save_result("outputs/fitting/from_api", result)
+if result.final is not None:
+    write_predictions("outputs/predictions/from_api", dataset, {
+        subject: result.to_prediction(dtype=dataset.config.dtype),
+    })
+```
+
+For explicit inputs, pass a `FitInitialization` with a native identity
+tensor and `ObservationInitialization` records keyed by observation ID.
+The optional observation camera seed is `LandmarkObservation.camera_initialization`.
+`load_result(path, model=model)` checks archive shapes, dtype, camera
+fields, fixed coordinates, and the model asset and native ordering.
+
+For the neutral multiview experiment generate benchmark Scenario B and
+pass an empty `--train-expression` list. Scenario C covers multiple
+expressions and unknown poses with known cameras. Generate separate
+Scenario C datasets with `--camera weak-perspective` and `--camera perspective`
+for estimated-camera experiments. Fit with `--camera-mode estimated --camera`
+and the corresponding model. Estimated-camera input is built with
+`include_known_cameras=False`. It contains observed landmarks and fitting
+metadata. Independent evaluation uses `complete` mode for estimated cameras
+and `known-camera` mode for fixed cameras.
+
+For a count study generate one Scenario C dataset with 100 observations and
+use ordered prefixes of 1, 5, 10, 25, 50, and 100. In the Python API, pass
+the explicit prefix to `fitting_observations`. Evaluate subsets by creating
+`dataset.select_observations(subject, ids)` with the same IDs and order.
+Fitting and evaluation accept a repeated `--observation-id` with exactly one
+`--subject` for the same ordered subset. Fitting uses explicit IDs or
+`--max-images` and optional sampling. A complete selection in the subject's
+original order retains the source identifier and available subjects, just as
+an omitted selection does. A subset or reorder has an identifier derived
+from the source, subject, and ordered IDs. Predictions version 2 records
+both `source_dataset_id` and `dataset_id`, the evaluation binding.
+Version 1 predictions are readable when their dataset binding matches the
+current selection. Recreate a legacy full-selection prediction if it was
+written with a separate full-subset identifier. Evaluate the initial state using
+`result.to_prediction(initial=True)`. For several subjects, fit each
+separately and collect the resulting predictions by subject ID.
+
+Compare coefficient and neutral mesh errors against the mean-identity
+baseline. A reprojection improvement can coincide with a worse neutral
+mesh. Report full and selected coefficient errors and native neutral
+geometry before and after fitting. The `identity_observability` function
+in `persona_lab.fitting.observability` computes local weighted 2D
+Jacobian column norms and singular spectra with fixed nuisance parameters,
+after removing expression directions, and after removing all active
+nuisance directions. It uses one observation graph at a time.
+Fixed-nuisance rank is a conditional diagnostic. Joint identifiability
+depends on the views, camera gauge, and strength of nuisance compensation.
+
+### Reproduce the solver comparisons
+
+Use a new output directory and the existing pinned GNM asset. The study
+regenerates its synthetic datasets and writes case results and a consolidated
+`report.json`. Each fit runs in its own process for process RSS measurements.
+
+```sh
+docker compose build personalab
+docker compose run --rm -e PERSONALAB_GNM_MODEL_FILE=/app/models/gnm_head.npz \
+  personalab python -m pytest -v tests
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --model-file /app/models/gnm_head.npz --device cpu --dtype float64 \
+  --output outputs/issue5 --experiments A B C D E F G H --seeds 42 43 44 --spectra
+```
+
+Experiments A–C cover controlled sparse identity, neutral views, and variable
+expressions. A runs both a known-pose diagnostic and ordinary unknown-pose
+fitting. B and C include the two Adam stage-transition configurations with
+the original Adam rates. D changes one regularizer at a time in the paired
+comparisons. E uses nested prefixes of each 100-observation dataset and
+reports per-seed scores, distributions, and adjacent geometry changes.
+F adds the same held-out views for every prefix of an identity. It reports
+conditional projection with true nuisance parameters and projection after
+estimating expressions and poses with identity frozen. Cameras are known
+for both held-out diagnostics. G estimates weak-perspective and constrained
+perspective cameras from the observed landmarks. The perspective fit uses
+its configured focal length (1.5 times the short edge by default). The
+synthetic cameras use 1.4 times the short edge. G scores neutral geometry
+and reprojects with the fitted cameras. Camera rotation and perspective
+intrinsic differences are reported as fixed-parameter diagnostics. Direct
+camera translation error requires matching rotation and root translation,
+plus matching focal length and principal point for perspective. Other
+observations have a null translation error and list the mismatched
+fields in `translation_comparability`.
+
+H measures 50, 100, 300, and 600 observations. It uses one update per stage
+for throughput by default.
+Use `--scaling-full` to apply the fitting budgets to H.
+
+The protocol sets Adam budgets to 30/70/900 and divides the original Adam
+joint learning rates by ten for the main comparisons. The default LM
+budgets in the study are 10/12/30. `--adam-iterations` and
+`--lm-iterations` explicitly set other computational budgets. Compare
+elapsed time, evaluations, and reconstructed geometry across budgets.
+`--historical-report` accepts the original `count-study-v2.json` at its
+container path. The report verifies the source identifier and the exact
+observation order before calculating historical score deltas. For a CUDA
+study, use the existing CUDA Compose profile and pass `--device cuda`.
+
+The historical CPU Adam study is the available measured baseline. The
+second-pass implementation requires Docker verification of CPU and CUDA
+fitting, comparative reconstruction, and scalability. Run the private
+DeepFaceLab experiment only after the relevant synthetic validations pass.
+The local fit command can then use an explicitly chosen camera model,
+approximately 50 observations, overlays, and a neutral mesh.
+
+### Corrected identity recovery
+
+The original variable-expression study sampled all 253 native identity
+coefficients while fitting the 170 head coefficients. That left 83 fixed eye
+and teeth coefficients with a nonzero global coefficient error floor. Uniform
+L2 penalties also changed the optimum. In the nine-view seed-42 variable
+expression study, the trainable identity RMSE was 0.240809 with the production
+weights, 2.764496 with only the identity penalty disabled, and 0.010869 with
+both penalties disabled. The local rank was 170 in the nine-view diagnostic.
+Small singular values still permit substantial displacement at a small
+projected gradient.
+
+Set `--identity-selection head` in the generator to sample the native head
+group and leave the eye and teeth coefficients exactly zero. The vector still
+has 253 entries in native order. `--identity-selection full` explicitly samples
+the historical full-native stream and records the selection. Omitting the
+option reproduces the original manifest and numeric stream. The corrected
+study uses the default 24 expression coefficients, known cameras, float64 and
+explicitly zero identity and expression weights for clean diagnostics.
+Production fitting retains its independent regularization weights. The noisy
+study crosses identity and expression weights at each Gaussian deviation.
+`--gaussian-noise-px` creates a uniform Gaussian profile in Scenario C with
+the same observation schedule and independently seeded noise.
+
+```sh
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies exact convergence held-out \
+  --model-file /app/models/gnm_head.npz --seeds 42 43 44 \
+  --output outputs/identity-recovery
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies count \
+  --model-file /app/models/gnm_head.npz --seeds 42 43 44 \
+  --output outputs/identity-count
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies robustness \
+  --model-file /app/models/gnm_head.npz --seeds 42 43 44 \
+  --noise-levels 0.5 2.0 --identity-weights 0 1e-6 --expression-weights 0 2e-6 2e-5 \
+  --output outputs/identity-noise
+```
+
+The nine-view exact cases cover neutral and varied expressions. The
+corrected protocol uses a single joint stage with a default budget of 30
+updates. The convergence comparison uses the same data and budget for each
+setting. The stricter experiment uses a scaled gradient tolerance and
+damping floor of `1e-12`,
+plus native and scaled displacement tolerances of `1e-6` and `1e-10`.
+When displacement tolerances are set, LM tests a projected step at the damping
+floor before reporting convergence. Each stage records its termination reason.
+Accepted updates and rejected trials have separate records. Count cases use
+nested prefixes, and the single-view case reports its rank and nullity.
+Held-out cases reserve separate observations and report oracle reprojection
+with true local parameters and reprojection with estimated expression and
+pose. Both held-out scores use known cameras and the frozen fitted identity.
+
+Fit result schema 3 adds stage reasons, native and scaled step norms, and
+linearization diagnostics. Versions 1 and 2 remain readable. Study report
+schema 2 adds the protocol, coefficient splits, model regions, numeric
+representability, and proposed target checks. All geometry is in meters
+without alignment. A fixed-coefficient RMSE floor applies to the full native
+coefficient metric. Geometry and reprojection have independent errors.
+External predictions report full-native and anatomical group scores.
+Fitting studies also score trainable and fixed groups using the recorded
+configuration. Existing external evaluation metric keys remain readable in
+the expanded report.
+
+Observability reports data-only spectra at initialization and at actual
+fitted states. The report lists the rank thresholds, observable condition
+number, and implicit zeros for wide Jacobians. Full-space condition numbers
+are null for rank-deficient Jacobians. The separately reported prior
+curvature is excluded from those spectra. Use `--spectra` to measure both
+states for other corrected cases. Proposed clean targets appear alongside
+actual measured errors. The clean targets describe known-camera synthetic
+recovery. A single 68-point image has at most 136 data rows, and the joint
+rank can be lower after removing nuisance directions. The noise sweep
+measures sensitivity to its supplied levels and weights. Production weight
+selection and estimated-camera recovery require their own validation.
+
+#### Full-native identity and estimated cameras
+
+Select `full-native-camera` explicitly to run the V5 diagnostic. Each primary
+case uses nine clean Scenario C observations, a single joint stage with strict
+LM, and zero identity and expression regularization. The fitter optimizes
+170 identity and 24 expression coefficients. The other 83 identity
+coefficients stay at their normal initialized values.
+
+| Condition | Ground-truth identity | Cameras |
+| --- | --- | --- |
+| A | Full native | Known |
+| B | Full native | Estimated |
+| C | Head only | Estimated |
+| D | Head only | Known |
+
+Each seed and projection model shares one source dataset between the known
+and estimated runs for each identity mode. The two identity modes keep the
+head draws, expressions, poses, cameras and ordering identical. The historical
+reference uses the original nine-view mixed-camera generator configuration
+for seed 42. The report checks its source dataset ID and compares its metrics
+with V2 when the ID matches. The schedule and convergence settings both
+changed since V2.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies full-native-camera \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --lm-iterations 0 0 30 --spectra \
+  --output outputs/identity-study-v5
+```
+
+The command runs 24 primary cases and one historical case.
+`outputs/identity-study-v5/report.json` retains the full per-case diagnostics
+and `outputs/identity-study-v5/summary.json` links to them and summarizes the
+matched comparisons. Paired deltas subtract the first condition from the
+second. Geometry errors use unaligned native vertices in meters. The fixed
+coefficient floor describes full-native coefficient RMSE. Geometry error
+depends on how the deformation bases interact.
+
+Estimated cameras use the observed landmarks and the production
+initialization. Perspective focal length is fixed at the prescribed
+initialization value. A focal mismatch makes raw metric camera translation
+incomparable. Weak-perspective scale comparisons use native model units, and
+estimated weak-perspective observations leave absolute metric scale
+ambiguous. The report records nulls with reasons for incompatible camera
+comparisons. The head-only known-camera control uses the established clean
+targets. The other cases compare against those values as numerical references.
+
+Execution, convergence, representability, and observability appear as
+separate fields. The expected fixed identity discrepancy leaves the case
+incompatible without marking its execution as failed. Nonconverged runs
+retain their final metrics when the solver returns a final state.
+The report measures the projected gradient at that state independently of
+the solver's iteration trace. Estimated-camera gradients use offsets from
+the final camera, as in final-state observability.
+
+The detailed report can be compressed losslessly while keeping the
+original available for the summary's references.
+
+```sh
+gzip -k outputs/identity-study-v5/report.json
+```
+
+#### Camera calibration and convergence
+
+The V5.1 `camera-calibration` study uses nine clean, head-only Scenario C
+observations for each of seeds 42, 43 and 44. Each seed shares one dataset
+across the perspective cases and one across the weak-perspective cases.
+Each fit starts independently with the standard estimated-camera initializer.
+
+| Cases | Camera model | Fixed focal factor | Joint LM budgets |
+| --- | --- | ---: | --- |
+| A1, A2 | Estimated weak perspective | — | 60, 100 |
+| B1, B2 | Estimated perspective with calibrated intrinsics | 1.4 | 60, 100 |
+| C1, C2 | Estimated perspective with incorrect fixed intrinsics | 1.5 | 60, 100 |
+
+Perspective fits estimate camera translation with a prescribed focal length.
+For B1 and B2, the known focal factor is the only supplied calibration.
+The strict V5 joint LM criteria apply, with zero regularization for this
+diagnostic. Run from the repository root with the verified official asset
+at `.gnm-cache/v3_0/gnm_head.npz`.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies camera-calibration \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --camera-study-budgets 60 100 --spectra \
+  --output outputs/identity-study-v5.1
+```
+
+Select `camera-calibration` by itself and supply both budgets with
+`--camera-study-budgets`. The command writes 18 cases to
+`outputs/identity-study-v5.1/report.json` and one linked row per case to
+`outputs/identity-study-v5.1/summary.json`. The comparisons require verified
+source and evaluation dataset IDs, identical ordered observations and the
+same settings outside the varied factor or budget. Metric deltas subtract
+the first condition from the second. For a comparison with V5 condition C,
+check both dataset IDs, observation order and the recorded fit configuration
+with the joint budget omitted. B1 and B2 use a different focal factor from V5.
+
+The report preserves the complete available solver trace and snapshots at
+initialization and termination. Checkpoints at accepted updates 10, 20, 30,
+60 and 100 indicate which diagnostics and snapshot metrics are available.
+The budget comparisons check initial parameters and objectives, then the
+common prefixes of the accepted updates, trial records, linearizations and
+linearization-time iteration logs. Structural fields, integers, booleans and
+labels match exactly. Floats use relative tolerance `1e-10` and absolute
+tolerance `1e-15`. Elapsed times and budget-dependent stage-end rows are
+excluded from prefix checks.
+
+Convergence, execution status and the known-camera recovery references are
+reported independently. Budget exhaustion can retain final metrics. A solver
+failure keeps the original termination reason and available diagnostics.
+Geometry is scored in unaligned native meters. With `--spectra`, use the
+absolute singular values alongside local numerical ranks and condition numbers
+when comparing identity sensitivity.
+
 ## GNM Ecosystem Packages
 
 Here we list all the available GNM packages:
@@ -733,3 +1338,527 @@ and how we handle external contributions.
 ## License
 This project is licensed under the Apache License, Version 2.0. See the
 [LICENSE](LICENSE) file for details.
+
+#### Joint identity and focal length estimation
+
+`focal-estimation` is an opt-in CPU float64 corrected-identity study. It uses
+Scenario C, the official GNM v3.0 Head asset and seeds 42, 43 and 44. Each
+dataset has nine clean observations and head-only ground truth. The model and
+scoring retain all 253 identity and 383 expression coefficients, all 68 sparse
+landmarks, the existing correspondence mapping and the 17,821-vertex neutral
+mesh. The fits train 170 head identity and 24 expression coefficients. The 83
+remaining identity coefficients are fixed. The recovery claims apply to this
+head-only ground truth.
+
+| Condition | Reference intrinsics | Fitting camera | Initial normalized focal factor |
+| --- | --- | --- | ---: |
+| A1 | Uniform 1.4 | Fixed focal calibrated control | 1.4 |
+| A2 | Uniform 1.4 | Fixed focal incorrect control | 1.5 |
+| A3 | Uniform 1.4 | Shared focal | 1.5 |
+| A4 | Uniform 1.4 | Per-observation focal | 1.5 |
+| A5 | Uniform 1.4 | Shared focal | 1.0 |
+| A6 | Uniform 1.4 | Shared focal | 2.0 |
+| A7 | Uniform 1.4 | Per-observation focal | 1.0 |
+| A8 | Uniform 1.4 | Per-observation focal | 2.0 |
+| B1 | Heterogeneous | Fixed focal | 1.5 |
+| B2 | Heterogeneous | Shared focal | 1.5 |
+| B3 | Heterogeneous | Per-observation focal | 1.5 |
+| B4 | Heterogeneous | Known-camera control | Supplied cameras |
+
+The B schedule is `[1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 1.1, 1.5, 1.9]`
+in observation order. B2 tests the compatibility of a shared parameter with
+heterogeneous data. For each seed and experiment, the conditions share the
+same dataset and ordered observations. Each case uses ordinary deterministic
+initialization and one joint LM stage. A1 receives reference focal length in
+its configuration, B4 receives the known cameras, and all other fits receive
+landmarks and their explicit fitting settings.
+
+**Fitting configuration.** The default `focal_mode` is `fixed`, which uses
+`perspective_focal_per_short_edge` for the existing uncalibrated perspective
+initializer and preserves supplied known cameras. Select `shared` or
+`per-observation` with `camera_mode="estimated"`,
+`camera_model="perspective"`, the LM solver and a positive
+`initial_focal_factor`. The same controls are available in the fit CLI as
+`--focal-mode` and `--initial-focal-factor`. An explicit perspective camera
+seed supplies rotation, principal point and translation. Its focal length
+is initialized from fitting configuration in trainable focal modes.
+
+For a raster short edge $s_i$, initial focal factor $k_0$ and log
+coordinate $\delta_i$, both focal axes are $f_i=s_i k_0\exp(\delta_i)$.
+The coordinate starts at zero. Shared mode uses one $\delta$ across the
+dataset, and per-observation mode gives each view its own $\delta_i$.
+Cropping and resizing each image independently
+can change its effective normalized focal factor even when the physical
+camera is the same. Existing log-depth and lateral translation coordinates,
+camera rotation, principal point, root gauge and expression bounds still
+apply. The focal coordinate has zero prior curvature. The original
+`camera_weight` applies to the existing camera offset coordinates.
+Invalid trial intrinsics follow the LM invalid-geometry rejection path.
+
+**Schur system.** Let $A_i$ and $B_i$ be the Jacobians of the normalized,
+weighted residual for view $i$ with respect to shared and local coordinates.
+The shared block contains identity and the shared log focal when active.
+The independent blocks contain expression, pose and translation, plus a log
+focal in per-observation mode. The unscaled data curvature blocks are
+$H_{gg}=\sum_i A_i^\mathsf{T} A_i$,
+$H_{gi}=A_i^\mathsf{T}B_i$, and $H_{ii}=B_i^\mathsf{T}B_i$.
+For a projected pixel $u$ and principal point $c$, the isotropic log-focal
+derivative is $u-c$. The log-depth derivative is $-(u-c)t_z/Z$ for
+translation depth $t_z$ and projected landmark depth $Z$. Their near
+collinearity at similar landmark depths motivates the joint diagnostics.
+The solver accumulates the corresponding $J^\mathsf{T}r$ blocks and applies
+the existing priors, equilibration, active bounds and damping. In the resulting
+scaled system the shared solve eliminates the local blocks through
+$H_{gg}-\sum_i H_{gi}H_{ii}^{-1}H_{ig}$ with right-hand side
+$-g_g+\sum_i H_{gi}H_{ii}^{-1}g_i$. Back-substitution gives the view
+updates. The objective reduction and strict gradient and minimum-damping
+displacement checks include the active focal coordinates. Fit result schema 4
+records their mode and accepted focal trajectory. Fixed-focal results retain
+their established on-disk format.
+
+**Observability.** The spectra use the data Jacobian with the fitting residual
+weights. Local singular vectors above the recorded relative threshold define
+the nuisance projections. The rank threshold uses the largest singular value
+of the fixed-nuisance identity Jacobian. The joint shared-focal diagnostic
+streams reduced QR across views. The independent-focal diagnostic compresses
+each view to identity-only rows plus one row carrying its focal coordinate.
+The identity-only reductions keep a fixed-width factor. A complete
+independent-focal spectrum uses a compressed matrix of at most
+$(p+n)\times(p+n)$ for $p$ identity coefficients and $n$ views.
+The weak directions include the corresponding least-squares local log-depth
+compensation. Local rank measures sensitivity near the evaluated snapshot.
+Absolute calibration and uniqueness remain separate scientific questions.
+
+**Running the study.** Put the pinned model asset at
+`.gnm-cache/v3_0/gnm_head.npz` and use a fresh output directory.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-estimation \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --focal-study-budget 100 --spectra \
+  --output outputs/identity-study-v5.2
+```
+
+The command writes all 36 cases to `outputs/identity-study-v5.2/report.json`
+and linked case rows, matched comparisons and counts to `summary.json`.
+The budget is explicit and accepts 1 through 100 joint updates. Use
+`--v51-report outputs/identity-study-v5.1/report.json` to compare the A1
+and A2 controls with V5.1 B2 and C2 when both dataset identifiers, observation
+order, model asset, generation settings and fit settings match. The study
+keeps the strict LM stopping criteria and original exact-recovery targets.
+The focal experiment additionally uses a maximum relative error of
+`1e-5` as its recovery target. Reported comparable camera translation errors
+require matching raster, rotation, principal point and root frame, with
+matching fixed focal lengths or trainable focal lengths within the experimental
+relative tolerance. Fitted and reference depths are recorded with the gauge
+status. Solver failures give a nonzero command exit status, including in
+intentionally incompatible conditions. Reports preserve each case and its
+termination reason.
+
+#### Focal convergence and initialization stability
+
+The opt-in `focal-convergence` study reuses V5.2's six Scenario C datasets
+with nine clean perspective observations each. It runs the 21 compatible
+trainable-focal configurations at three explicit accepted-update schedules.
+
+| Strategy | Pose and camera | Identity | Joint |
+| --- | ---: | ---: | ---: |
+| J100 | 0 | 0 | 100 |
+| J200 | 0 | 0 | 200 |
+| P100 | 20 | 0 | 80 |
+
+Each fit starts from the ordinary deterministic initializer. P100 first
+fits pose, camera translation, depth and the selected focal coordinates.
+Identity and expression stay frozen until the joint stage. Both stages use
+the same parameter object and the original camera reference coordinates.
+The solver initializes LM damping from the configuration at each executed
+stage. Stage budgets are independent. A calibration stage that converges or
+exhausts its budget can proceed to the joint stage. A failed calibration ends
+the fit. The production focal mode is fixed and the production stage budgets
+are 30, 70 and 100.
+
+Put the pinned model asset at `.gnm-cache/v3_0/gnm_head.npz` and use a fresh
+output directory.
+
+```sh
+docker compose build personalab
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-convergence \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 42 43 44 --spectra --output outputs/identity-study-v5.3
+```
+
+The command runs all 63 cases. Select schedules explicitly with
+`--focal-strategies J100 J200`, for example. The reports include the ordered
+dataset identifiers, full optimizer histories, per-stage counters and the
+physical state and full objective on both sides of the P100 boundary.
+Boundary objective evaluations are counted separately from solver evaluations.
+P100's calibration metrics describe its frozen identity and expression state.
+With `--spectra`, the report includes both the active calibration spectrum
+and the prospective joint identity and focal spectra at that state.
+
+The dataset comparison uses independently regenerated V5.2 identifiers from
+the pinned source commit and checks observation order. Pass an archived
+detailed V5.2 report with `--v52-report` to compare matching J100
+configurations, snapshots and recorded trajectories. `summary.json` links
+each case to `report.json` and records matched comparisons, statuses and
+recovery targets. Solver failures retain their outcomes and give the study
+a nonzero exit status.
+
+### Issue #5 V6 CPU and CUDA scalability
+
+The explicit `corrected-identity` study `focal-scalability` uses float32 J200
+with estimated perspective cameras, one log focal coordinate per observation,
+and a starting focal factor of 1.5. It fits a head-only synthetic identity
+with the V5.3 native parameter selection and clean exact-recovery targets.
+Each case starts from the deterministic initializer. The default V6 matrix
+covers seeds 42–44 and 50, 100, 300, and 600 observations on each requested
+device. An additional study compares batch sizes 1, 4, 16, and 32 at seed
+42 and 100 observations, with one shared batch-size-4 result per device.
+
+Place the pinned GNM v3.0 Head file at `.gnm-cache/v3_0/gnm_head.npz`.
+Run from the repository root with fresh output directories.
+
+```sh
+mkdir -p datasets models outputs .gnm-cache/v3_0
+export PERSONALAB_UID="$(id -u)" PERSONALAB_GID="$(id -g)"
+printf '%s  %s\n' \
+  '61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb' \
+  '.gnm-cache/v3_0/gnm_head.npz' | sha256sum -c -
+
+docker compose build personalab
+docker compose run --rm -e PERSONALAB_GNM_MODEL_FILE=/cache/gnm/v3_0/gnm_head.npz \
+  personalab python -m pytest -v tests
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float32 \
+  --seeds 42 43 44 --scalability-counts 50 100 300 600 --scalability-batch-size 4 \
+  --scalability-datasets-out datasets/synthetic/focal-scalability-fp32 \
+  --spectra --output outputs/identity-study-v6-cpu
+
+docker compose --profile cuda build personalab-cuda
+docker compose --profile cuda run --rm -e PERSONALAB_GNM_MODEL_FILE=/cache/gnm/v3_0/gnm_head.npz \
+  personalab-cuda python -m pytest -v tests
+docker compose --profile cuda run --rm personalab-cuda python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cuda --dtype float32 \
+  --seeds 42 43 44 --scalability-counts 50 100 300 600 --scalability-batch-size 4 \
+  --scalability-datasets-in datasets/synthetic/focal-scalability-fp32 \
+  --spectra --output outputs/identity-study-v6-cuda
+
+docker compose run --rm personalab python -m persona_lab.benchmark.scalability_report \
+  --cpu-report outputs/identity-study-v6-cpu/report.json \
+  --cuda-report outputs/identity-study-v6-cuda/report.json \
+  --output outputs/identity-study-v6-comparison
+```
+
+The CPU command creates three 600-observation Scenario C parents and an index
+in the explicitly selected persistent `datasets/synthetic/` directory.
+Reference generation requires a writable synthetic directory mount; the
+original real-image datasets can remain read-only. Use a fresh directory
+with `--scalability-datasets-out`. CUDA requires `--scalability-datasets-in`
+with that index and its archives. Each case verifies the archive hashes, the
+ordered parent prefix, its full scientific input hash, and the landmarks,
+masks and weights on the fitting device. The focal factors repeat on the same
+cycle as the nine Scenario C viewpoints. The reports give actual viewpoint,
+expression preset and focal counts for every subset. Repeated viewpoints and
+expressions should be interpreted in the context of those distributions.
+
+Each device writes `report.json` and `summary.json` under its output directory.
+The comparison writes `comparison.json` under its output directory. Detailed
+reports retain native parameter snapshots, camera and geometry recovery,
+optimization histories and each selected singular spectrum. Use `--spectra`
+to request both initial and final observability. A diagnostic failure is
+recorded alongside the saved fit. Reports identify failed and unexecuted
+cases, including unavailable CUDA devices and invalid datasets.
+
+Batch size sets the pose grid, sparse objective, batched observation Jacobian
+and local QR elimination batch sizes. V6.1 computes independent per-view
+Jacobians in observation batches and eliminates local blocks by Householder QR. The observation count and actual
+accepted updates are reported with per-observation objective and Jacobian
+timings. Reported Schur time includes damping. Observation-Jacobian
+construction and column equilibration have their own measurements.
+
+Worker timings use elapsed wall time for CPU and synchronize CUDA at phase
+boundaries. CUDA operation timings use stream events. The trace, event
+bookkeeping, diagnostic and serialization costs have separate fields.
+Generation time is recorded per parent. Worker wall time includes process
+startup, and optimization time covers the fitting phase only. RSS
+high-water marks cover the whole worker, and Linux phase RSS uses 20 ms
+samples and phase boundary readings. CUDA peaks record allocated and
+reserved memory separately. The report times host and device copies used by
+model transfer, input verification, scoring and record creation.
+
+For paired numerical comparisons, each field uses an absolute tolerance
+plus a relative tolerance against the larger magnitude of the two values.
+The comparison JSON lists the tolerances, exact rank checks, and any
+disagreements independently of the exact-recovery target results. Matched
+time and memory growth is reported between adjacent verified counts, with
+per-linearization timing and update counts alongside total optimization time.
+
+V6.2 FP32 uses `lm.arithmetic_dtype: float32` and a square-root block QR solver.
+The old normal-equation path remains exclusively in the explicitly configured
+FP64 LM mode. FP32 currently requires the zero-prior joint per-observation
+perspective protocol; unsupported configurations raise an error. The fitting
+objective and Jacobians use the same sparse GNM forward, while the independent
+full-native evaluator and all scientific targets are unchanged. Reference
+archives remain the V6 CPU FP32 archives (reference schema v2); the result
+schema is v4. TF32 remains disabled. Local Householder reflectors eliminate
+local coordinates without forming a dense global Jacobian or J-transpose-J.
+
+Strict stopping tolerances are preserved. If all trial steps are rejected at
+a near-roundoff objective (normalized residual RMS <= 4 FP32 eps and scaled
+gradient <= 8 FP32 eps), the result is explicitly `stopped`, not `converged`.
+Strict convergence, target recovery and infrastructure status remain separate.
+For a failed optimizer, the last valid committed state is scored in
+`last_accepted_evaluation`, never substituted for a successful final fit.
+CPU/CUDA comparison tolerances are unchanged and may expose differences.
+
+Worker progress is streamed. Use `--scalability-primary-only` for an explicit
+pilot without the batching sweep, for example one seed (42) and count (50).
+Reuse the verified V6 FP32 datasets with `--scalability-datasets-in` for both
+CPU and CUDA pilots, and choose a fresh output directory. Optionally add
+`--scalability-profile-kernels` to a single CUDA primary-only case to capture
+one separate initial linearization and QR solve into a Chrome trace; these
+runs are excluded from timing comparisons. A missing CUDA profiler is a
+reported diagnostic failure. No automatic CPU or FP64 fallback is permitted.
+
+### V6.2 compensated residual and reference precision audit
+
+The FP32 objective and both single-view and batched Jacobians now evaluate
+`(f * X - (observed - principal) * Z) / Z`, without rounding absolute
+predicted raster coordinates before subtraction. Error-free FP32 sums and
+products compensate the camera-space translation, observation centering
+and numerator products. The backward pass uses the analytic smooth
+perspective derivative evaluated in FP32 rather than differentiating
+discrete roundoff corrections. Fixed camera matrices are cached per fit,
+and finite checks and pixel-statistic transfers are grouped. The optimizer
+uses the original sparse GNM geometry, original selection, damping, QR,
+priors, scientific thresholds and original immutable raster observations.
+The independent full-native pixel/mesh evaluator is unchanged.
+
+The separate `reference_precision` phase runs only after publishing the
+blind fit. It replays the archived truth with full GNM single-view, sparse
+single-view, sparse batched and compensated residual evaluation on the
+requested device. It reports 3D and 2D path differences, stored pixel
+half-ULP envelopes, the truth-state objective and projected gradient, and
+one QR correction at the damping floor (never applied). This correction
+is a local bias diagnostic, not a lower bound on recovery error. The ULP
+envelope describes only the final raster rounding, not GNM or camera
+roundoff. No truth reaches the solver. The diagnostic time is separated
+from optimization; diagnostic failure is explicit and makes the benchmark
+return nonzero. Small-residual stagnation is still not convergence.
+
+Reuse the existing V6 archives and the V6.1 primary-only pilot commands,
+with a fresh V6.2 output directory. Reports use schema 4 and cannot be
+compared as matched V6.1 schema-3 runs. No device, precision or solver
+fallback; no regeneration of observations, and no automatic relaxation
+of the scientific targets. Neither a more accurate residual nor a full
+rank Jacobian guarantees recovery of exact latent coefficients from
+rounded observations.
+
+
+### V6.3 experimental end-to-end compensated FP32 control
+
+Select `--scalability-precision-forward` explicitly. The normal V6.2 FP32
+mode remains available only through its original explicit experiment
+configuration; it is never invoked automatically on a numerical failure.
+The experimental forward carries FP32 high/low components through the
+identity/expression/joint bases, pose correctives, Rodrigues rotation,
+forward kinematics, skinning, barycentrics and perspective projection.
+Reduction order is fixed across view batching. The rotation polynomial is
+restricted to axis-angle norms at most 2*pi; an invalid trial is rejected,
+not retried with different arithmetic. Smooth native GNM derivatives are
+still computed by FP32 autograd, and the QR solver remains unchanged.
+
+In this mode the independent camera coordinates are `camera_native`
+(translation in meters) and `local_focal` (isotropic focal length in pixels),
+not offsets and logarithms. Positive depth and focal length are enforced
+explicitly. The strict tolerance numbers and all scientific targets are
+unchanged, but native-step norms and camera-coordinate spectra have
+changed units and must not be interpreted as legacy log-coordinate norms.
+Initialization still uses the high raster component. The independent full
+native evaluator still uses the rounded high pixel component for the
+historical scientific metrics; the objective uses high plus low when
+available. The report includes the actual physical-snapshot objective,
+legacy absolute and projection-compensated reference QR probes, and the
+original camera log/exp roundtrip error. No probe is applied to fitting.
+
+First run the new forward on the verified historical raster archive. For
+an additional controlled experiment, explicitly generate a separate
+high/low archive from the same reference parameters, with the same
+identity, views, expressions, cameras, masks and weights. This is a
+matched-forward synthetic control, not independent evidence of real-photo
+accuracy. The source is verified and never modified. The new archive has
+its own schema, source provenance, data ID and input fingerprint including
+the low component. It cannot be used without the experimental flag.
+
+```sh
+# Requires a writable datasets/synthetic directory in the CPU container.
+docker compose run --rm personalab python -m persona_lab.benchmark.precision_archive \
+  --source datasets/synthetic/focal-scalability-fp32 \
+  --output datasets/synthetic/focal-scalability-fp32-high-low \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --seeds 42 --batch-size 8
+
+# Run once with the historical input, and separately with the high/low input.
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float32 \
+  --seeds 42 --scalability-counts 50 --scalability-batch-size 32 \
+  --scalability-primary-only --scalability-precision-forward \
+  --scalability-datasets-in datasets/synthetic/focal-scalability-fp32-high-low \
+  --spectra --output outputs/v6.3-control-cpu
+```
+
+Reports use schema 5. Do not treat historical-raster and high/low-control
+reports as matched identical-input comparisons. The compensated forward
+adds elementwise work and may cost more time or memory, especially on
+CUDA; measure pilot costs before any full-scale campaign. CPU/CUDA exact
+agreement and exact GNM identity recovery require actual integration runs.
+
+### V6.6 native FP64 square-root validation
+
+The explicit `--scalability-fp64-qr --dtype float64` protocol uses the
+existing native sparse GNM deformation functions and standard camera
+projection for both the objective and the batched autograd Jacobian.
+It uses the original logarithmic camera coordinates, FP64 parameter
+updates, and the same augmented local/shared QR without forming normal
+matrices. No compensated FP32 forward, precision change, solver fallback,
+truth initialization or relaxed stopping/acceptance/recovery threshold is
+used. The V6.6 benchmark selects the joint, zero-prior, per-observation
+perspective protocol. V7 extends the same FP64 QR to staged regularized
+fitting, as described below. Other fitting modes are explicitly selected;
+they are not a fallback from this protocol.
+
+FP32 observations (including high/low controls) are not native FP64
+reference observations. Promoting an archived FP32 raster to FP64 does
+not remove its generation error. Preserve the historical archives and
+create a separate native CPU FP64 reference index, using the same seed,
+scenario, ordered views and focal schedule. The native reference is a
+new experimental dataset, not a matched-input timing comparison with the
+FP32 experiments. Dataset fingerprints and dtype are validated before
+fitting. FP32-only legacy truth probes are explicitly not applicable to
+this mode; native/sparse residual and geometry comparisons, truth QR,
+final gradient, full-native metrics and observability remain reported.
+
+```sh
+# Generate only the previously failing seed's native FP64 parent and fit 50 views.
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 43 --scalability-counts 50 --scalability-batch-size 32 \
+  --scalability-primary-only --scalability-fp64-qr \
+  --scalability-datasets-out datasets/synthetic/focal-scalability-fp64-43 \
+  --spectra --output outputs/v6.6-pilot-43-cpu
+
+# Reuse the identical verified reference on CUDA.
+docker compose --profile cuda run --rm personalab-cuda python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cuda --dtype float64 \
+  --seeds 43 --scalability-counts 50 --scalability-batch-size 32 \
+  --scalability-primary-only --scalability-fp64-qr \
+  --scalability-datasets-in datasets/synthetic/focal-scalability-fp64-43 \
+  --spectra --output outputs/v6.6-pilot-43-cuda
+```
+
+Use the existing `scalability_report` reader for the two native FP64 reports.
+The reader rejects mixed precision reports. The scientific and spectral
+comparison tolerances are unchanged. FP64 batch-32 primary and batching
+rows at seed 42/count 100 reuse one fit; no duplicate execution is needed.
+### V7 staged native FP64 square-root fitting
+
+The opt-in `--fp64-qr --dtype float64` fit CLI uses the same native sparse
+GNM and grouped native camera projection for residuals and Jacobians.
+Camera groups preserve the input order and permit different raster sizes.
+Independent shared-coordinate copies exist only during differentiation.
+Local and shared priors are residual rows with the existing full-group
+normalization; the identity prior is included once, not once per image.
+Fixed-group priors remain constant in the full objective. LM acceptance,
+expression bounds, damping and convergence rules are unchanged. The
+reported `runtime.square_root_stages` describes each actual linearization
+layout, precision, device and active prior count. No normal equations,
+precision switching or automatic solver fallback are used in this mode.
+
+The first real pilot uses the existing 170 head identity coefficients and
+24 expression coefficients, all eligible DFL correspondences, positive
+logarithmic perspective focal/depth parameters, and the default three
+stages (30/70/100). The initial focal factor 1.5 is an explicit starting
+value, not known camera calibration. The aligned raster center is the
+chosen principal point; the estimated focal lengths are effective crop
+parameters, not measured original-camera intrinsics. The existing default
+identity/expression priors are 1e-6/2e-5; pose and camera priors are zero.
+Focal coordinates have no additional prior. The real fit has no ground-truth
+identity; a low reprojection error alone does not establish 3D accuracy.
+
+The measured pilot used `datasets/light.zip`. Supply the actual local DFL
+dataset path under the mounted datasets directory; private datasets are not
+tracked by Git.
+
+```sh
+DFL_INPUT=datasets/light.zip
+docker compose --profile cuda run --rm personalab-cuda \
+  python -m persona_lab.fit --input "$DFL_INPUT" --max-images 50 --require-images 50 \
+  --selection sample --seed 42 --model-file /cache/gnm/v3_0/gnm_head.npz \
+  --device cuda --dtype float64 --solver levenberg-marquardt --fp64-qr \
+  --camera-mode estimated --camera perspective --focal-mode per-observation \
+  --initial-focal-factor 1.5 --batch-size 32 --jacobian-rows 32 --iterations 30 70 100 \
+  --identity-weight 1e-6 --expression-weight 2e-5 --pose-weight 0 --camera-weight 0 \
+  --train-identity head --overlays 12 --require-convergence --output outputs/v7-real-50-cuda
+```
+
+`--require-images` checks the selected count before fitting;
+`--require-convergence` returns nonzero for a final status other than
+converged, while retaining the explicitly labelled diagnostic result.
+No automatic retry is performed. Inspect `result.json`, `parameters.npz`,
+`neutral.obj` and the before/after overlays. Budget exhaustion is not
+convergence. The official-asset tests and the real pilot are distinct from
+the asset-free algebra tests; run them on the selected target device.
+
+#### Issue #5 validation evidence and limitations
+
+The native FP64 V6.6 campaign (commit
+`7674a1d9fc2fb66f6700d88371a865e3252f252b`) covered seeds 42, 43 and 44,
+50, 100, 300 and 600 observations on CPU and CUDA, and the batch-size
+1/4/16/32 comparison at seed 42 with 100 observations. All 30 distinct
+fits, including the two initial pilots, met the clean recovery targets.
+The maximum trainable identity RMSE was approximately 2.12e-8, and the
+maximum neutral geometry RMS error was approximately 3.94e-11 m.
+The comparisons passed the original numerical and spectral tolerances.
+These are clean head-only, zero-prior, joint-stage results, not real-world
+accuracy measurements or evidence of recovery of arbitrary full-native
+identities.
+
+The initial real-data test used V7 (commit
+`0c64226c8fea9043d0f653fc7ce3d4904abad73b`) with the command above,
+50 selected observations from 300 accepted JPEGs, seed 42, CUDA FP64
+and 3,400 eligible landmarks. All three stages converged, with 57
+accepted updates in total. RMS reprojection decreased from 22.1763 to
+2.3993 pixels. Optimization took 13.114 seconds on the tested hardware.
+All three stages reported zero normal-equation storage. The result,
+parameter archive, neutral OBJ and 12 initial/final overlay pairs were
+produced. This verifies real-data pipeline operation, not identity accuracy.
+
+The real fit exhibited visibly implausible neutral geometry and excessive
+identity coefficients (approximately -9.71 to +7.50, with 58 of 170
+selected coefficients outside the documented typical interval [-3, 3]).
+The typical range is not a hard validity bound or an anatomical guarantee.
+The configured native-coordinate L2 penalty is implemented, but its strength
+did not prevent excessive deformation in this pilot. Independently estimated
+focal lengths and depths are also strongly coupled and do not establish
+physical calibration. These limitations are not numerical solver failures.
+The existing fixed-focal and weak-perspective modes offer explicit camera
+gauges; none is selected automatically after a failed fit. Robustness,
+expression leakage and practical prior/camera tuning belong to Issue #6;
+held-out and cross-dataset quality evaluation belong to Issue #7. The
+observed shortcomings must not be treated as evidence that anatomical
+plausibility has been validated.
+
+Before closing Issue #5, run the complete test suite on both services with
+the pinned official model asset. The V7 pre-fix suite reported 447 passed,
+27 skipped and 2 failed on CPU; 474 passed and 2 failed on CUDA. Both failures
+were in the nonfinite-residual/Jacobian fault-injection test, whose wrapper
+did not accept the `dtype` keyword. The correction forwards keyword
+arguments without changing failure assertions or runtime fitting behavior.
+Passing post-fix runs are required before reporting a clean suite.

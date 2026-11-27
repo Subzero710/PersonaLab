@@ -67,6 +67,7 @@ class LandmarkObservation:
     alignment: AlignmentMetadata | None = None
     known_camera: Camera | None = None
     camera_initialization: Camera | None = None
+    pixel_low: Tensor | None = None
 
     landmark_ordering: ClassVar[str] = "deepfacelab_68"
 
@@ -83,6 +84,11 @@ class LandmarkObservation:
         if self.landmarks.ndim != 2:
             raise ValueError("An observation stores exactly one set of (68, 2) landmarks")
 
+        if self.pixel_low is not None:
+            _validate_tensor(self.pixel_low, "Low pixel component", (DFL_LANDMARK_COUNT, 2), like=self.landmarks)
+            if (self.pixel_low.shape != self.landmarks.shape or self.landmarks.dtype != torch.float32
+                    or self.coordinate_convention != "aligned_pixels"):
+                raise ValueError("Low pixel components require FP32 aligned pixels")
         device = self.landmarks.device
         if self.validity is None:
             validity = torch.ones(DFL_LANDMARK_COUNT, dtype=torch.bool, device=device)

@@ -37,6 +37,7 @@ STREAMS = {
     "identity": 0, "expression": 1, "camera": 2, "gaussian": 3,
     "missing": 4, "outlier_indices": 5, "outlier_offsets": 6,
 }
+IDENTITY_SELECTIONS = ("full", "head")
 
 
 def rng(seed, stream, subject, observation=0):
@@ -129,9 +130,17 @@ class GenerationConfig:
     noise: dict[str, Noise]
     dtype: str
     device: str
+    identity_selection: str | None = None
+    gaussian_noise_px: float | None = None
+    perspective_focal_factors: tuple[float, ...] | None = None
 
     def metadata(self):
-        return asdict(self)
+        metadata = asdict(self)
+        # Omission denotes the original full-native protocol and retains its dataset ID.
+        for name in ("identity_selection", "gaussian_noise_px", "perspective_focal_factors"):
+            if metadata[name] is None:
+                del metadata[name]
+        return metadata
 
     def schedule(self, index):
         """Return view, expression, camera type and noise profile for one index."""
@@ -141,7 +150,7 @@ class GenerationConfig:
         camera = self.camera
         if camera == "both":
             camera = ("perspective", "weak-perspective")[index % 2]
-        profiles = SCENARIO_NOISE[self.scenario]
+        profiles = SCENARIO_NOISE[self.scenario] if self.gaussian_noise_px is None else ("gaussian",)
         return view, expression, camera, profiles[index % len(profiles)]
 
 
@@ -170,8 +179,8 @@ def _resolve_views(value, scenario):
     return angles
 
 
-def _resolve_noise(value, scenario):
-    profiles = SCENARIO_NOISE[scenario]
+def _resolve_noise(value, scenario, gaussian_noise_px=None):
+    profiles = SCENARIO_NOISE[scenario] if gaussian_noise_px is None else ("gaussian",)
     if not isinstance(value, dict) or set(value) != set(profiles):
         raise ValueError(f"Scenario {scenario} requires these noise profiles: {', '.join(profiles)}")
     noise = {}
@@ -185,6 +194,8 @@ def _resolve_noise(value, scenario):
                 raise ValueError(f"Unknown fields in the {name} noise profile") from error
         else:
             raise ValueError(f"The {name} noise profile must be an object")
+    if gaussian_noise_px is not None and noise["gaussian"] != Noise(gaussian_px=gaussian_noise_px):
+        raise ValueError("The Gaussian profile must match the configured deviation and use only Gaussian noise")
     if "clean" in noise:
         clean = noise["clean"]
         if clean.gaussian_px or clean.missing or clean.outliers or clean.occlude:
@@ -227,6 +238,9 @@ def resolve_config(scenario="F", **overrides):
         "camera": "perspective" if single_view else "both",
         "image_size": (512, 512),
         "identity_half_range": 0.5,
+        "identity_selection": None,
+        "gaussian_noise_px": None,
+        "perspective_focal_factors": None,
         "expression_strength": (0.8, 1.0),
         "expressions": required_expressions,
         "view_degrees": {
@@ -242,6 +256,8 @@ def resolve_config(scenario="F", **overrides):
     if unknown := sorted(overrides.keys() - defaults.keys()):
         raise ValueError(f"Unknown generation options: {', '.join(unknown)}")
     values = defaults | overrides
+    if "identity_selection" in overrides and values["identity_selection"] not in IDENTITY_SELECTIONS:
+        raise ValueError("Identity selection must be full or head")
     subjects, observations, seed = (values[name] for name in (
         "subjects", "observations_per_subject", "seed",
     ))
@@ -260,6 +276,14 @@ def resolve_config(scenario="F", **overrides):
         single_view and camera == "both"
     ):
         raise ValueError("Select perspective, weak-perspective, or both for a multi-view scenario")
+    if "perspective_focal_factors" in overrides:
+        schedule = values["perspective_focal_factors"]
+        if camera != "perspective" or not isinstance(schedule, (list, tuple)) or len(schedule) != observations:
+            raise ValueError("A focal schedule requires one factor per observation and perspective cameras")
+        factors = tuple(finite_number(factor, "Perspective focal factor") for factor in schedule)
+        if any(factor <= 0 for factor in factors):
+            raise ValueError("Perspective focal factors must be positive")
+        values["perspective_focal_factors"] = factors
     if not isinstance(values["image_size"], (tuple, list)) or len(values["image_size"]) != 2:
         raise ValueError("Image size requires [width, height]")
     ImageSize(*values["image_size"])
@@ -281,7 +305,15 @@ def resolve_config(scenario="F", **overrides):
     values["view_degrees"] = _resolve_views(values["view_degrees"], scenario)
     for name in ("distance_m", "weak_scale_per_short_edge"):
         values[name] = interval(values[name], name)
-    values["noise"] = _resolve_noise(values["noise"], scenario)
+    deviation = None
+    if "gaussian_noise_px" in overrides:
+        deviation = finite_number(values["gaussian_noise_px"], "Gaussian noise deviation (px)")
+        if scenario != "C" or deviation <= 0:
+            raise ValueError("Uniform Gaussian noise requires Scenario C and a positive deviation")
+        values["gaussian_noise_px"] = deviation
+        if "noise" not in overrides:
+            values["noise"] = {"gaussian": Noise(gaussian_px=deviation)}
+    values["noise"] = _resolve_noise(values["noise"], scenario, deviation)
     if not isinstance(values["dtype"], str) or values["dtype"] not in ("float32", "float64"):
         raise ValueError("Generation dtype must be float32 or float64")
     if not isinstance(values["device"], str):

@@ -11,7 +11,7 @@ import pytest
 
 from persona_lab.benchmark.configuration import resolve_config
 from persona_lab.benchmark.dataset import _manifest_id, load_dataset
-from persona_lab.benchmark.evaluate import evaluate_predictions
+from persona_lab.benchmark.evaluate import evaluate_predictions, main as evaluate_main
 from persona_lab.benchmark.generate import generate_dataset
 from persona_lab.benchmark.predictions import oracle_predictions, read_predictions, write_predictions
 from persona_lab.benchmark.storage import read_json, write_json
@@ -63,6 +63,74 @@ def _edit_manifest(path, edit, *, dataset=False):
     if dataset:
         manifest["dataset_id"] = _manifest_id(manifest)
     write_json(file, manifest)
+
+
+def test_dataset_identity_for_complete_partial_and_reordered_observations(mixed, tmp_path, asset):
+    ground_truth, dataset = mixed
+    subject, other = dataset.subject_ids
+    ids = dataset.observation_ids(subject)
+    assert dataset.select_observations(subject) is dataset
+    assert dataset.select_observations(subject, ids) is dataset
+    assert dataset.select_observations(subject, ids).subject_ids == (subject, other)
+    complete = tmp_path / "complete"
+    write_predictions(complete, dataset, oracle_predictions(dataset, subject_ids=(subject,)))
+
+    for index, selection in enumerate(((), ids)):
+        report_path = tmp_path / f"report-{index}"
+        arguments = [
+            "--ground-truth", str(ground_truth), "--predictions", str(complete),
+            "--output", str(report_path), "--subject", subject, "--mode", "complete",
+        ]
+        for key in selection:
+            arguments.extend(("--observation-id", key))
+        if asset is not None:
+            arguments.extend(("--model-file", asset))
+        evaluate_main(arguments)
+        report = read_json(report_path / "report.json")
+        assert report["evaluation_dataset_id"] == report["source_dataset_id"] == dataset.dataset_id
+        assert report["scored_observation_count"] == len(ids)
+
+    partial_ids = (ids[0], ids[2], ids[5])
+    partial = dataset.select_observations(subject, partial_ids)
+    reversed_ids = partial_ids[::-1]
+    reordered = dataset.select_observations(subject, reversed_ids)
+    full_reordered = dataset.select_observations(subject, ids[::-1])
+    assert len({dataset.dataset_id, partial.dataset_id, reordered.dataset_id, full_reordered.dataset_id}) == 4
+    assert partial.source_dataset_id == reordered.source_dataset_id == dataset.dataset_id
+    assert reordered.observation_ids(subject) == reversed_ids
+    assert reordered.select_observations(subject, partial_ids).dataset_id == partial.dataset_id
+    assert full_reordered.select_observations(subject, ids) is dataset
+    assert partial.subject_ids == (subject,)
+    with pytest.raises(ValueError, match="Unknown benchmark subject"):
+        partial.select_observations(other)
+
+    path = tmp_path / "subset"
+    write_predictions(path, partial, oracle_predictions(partial))
+    assert tuple(read_predictions(path, partial)[subject].observations) == partial_ids
+    other_subset = dataset.select_observations(other, dataset.observation_ids(other)[:1])
+    for wrong in (dataset, reordered, full_reordered, other_subset):
+        with pytest.raises(ValueError, match="different benchmark dataset"):
+            read_predictions(path, wrong)
+    with pytest.raises(ValueError, match="duplicate or unknown"):
+        dataset.select_observations(subject, (ids[0], ids[0]))
+    with pytest.raises(ValueError, match="duplicate or unknown"):
+        dataset.select_observations(subject, (dataset.observation_ids(other)[0],))
+    _edit_manifest(path, lambda manifest: manifest.update(source_dataset_id="0" * 64))
+    with pytest.raises(ValueError, match="different source benchmark dataset"):
+        read_predictions(path, partial)
+
+
+def test_prediction_manifest_version_one_is_readable(mixed, tmp_path):
+    _, dataset = mixed
+    path = tmp_path / "legacy"
+    write_predictions(path, dataset, oracle_predictions(dataset, mode="identity-only"))
+
+    def version_one(manifest):
+        manifest.pop("source_dataset_id")
+        manifest["schema_version"] = 1
+
+    _edit_manifest(path, version_one)
+    assert tuple(read_predictions(path, dataset)) == dataset.subject_ids
 
 
 @pytest.mark.parametrize("case,match", [
