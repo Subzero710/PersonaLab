@@ -18,16 +18,17 @@ from .storage import digest_arrays, digest_json, json_bytes
 
 
 REFERENCE_SCHEMA = f"{STUDY}-reference-v2-fp32"
+FP64_REFERENCE_SCHEMA = f"{STUDY}-reference-v4-native-fp64"
 PRECISION_REFERENCE_SCHEMA = f"{STUDY}-reference-v3-fp32-high-low"
 SCHEDULE = tuple(islice(cycle(HETEROGENEOUS_FACTORS), PARENT_SIZE))
 INPUT_FIELDS = {"observed": "landmarks", "validity": "validity", "weights": "weights"}
 REFERENCE_FILES = ("manifest.json", "topology.npz", "subject_0000.npz")
 
 
-def generation_config(seed):
+def generation_config(seed, dtype="float32"):
     return resolve_config(
         "C", seed=seed, subjects=1, observations_per_subject=PARENT_SIZE,
-        camera="perspective", identity_selection="head", device="cpu", dtype="float32",
+        camera="perspective", identity_selection="head", device="cpu", dtype=dtype,
         perspective_focal_factors=SCHEDULE,
     )
 
@@ -40,9 +41,14 @@ def file_digests(path):
     return result
 
 
-def generate_parent(path, seed, model_file):
-    dataset = generate_dataset(path, generation_config(seed), model_file=model_file)
-    return {"dataset_id": dataset.dataset_id, "files_sha256": file_digests(path)}
+def generate_parent(path, seed, model_file, *, dtype="float32"):
+    if dtype not in ("float32", "float64"):
+        raise ValueError("Unsupported reference arithmetic")
+    dataset = generate_dataset(path, generation_config(seed, dtype), model_file=model_file)
+    record = {"dataset_id": dataset.dataset_id, "files_sha256": file_digests(path)}
+    if dtype == "float64":
+        record["pixel_representation"] = "raster-fp64"
+    return record
 
 
 def load_parent(path, seed, reference):
@@ -50,13 +56,13 @@ def load_parent(path, seed, reference):
     if files != reference["files_sha256"]:
         raise ValueError(f"Reference archive fingerprint mismatch for seed {seed}")
     dataset = load_dataset(path)
-    if (reference.get("pixel_representation") not in (None, "raster-fp32", "compensated-fp32-high-low-v1")
+    if (reference.get("pixel_representation") not in (None, "raster-fp32", "compensated-fp32-high-low-v1", "raster-fp64")
             or dataset.has_precision_pixels != (reference.get("pixel_representation") == "compensated-fp32-high-low-v1")
             or dataset.has_precision_pixels and dataset.precision_source_dataset_id != reference.get("source_dataset_id")):
         raise ValueError("Reference pixel representation differs from dataset schema")
     if (
         dataset.dataset_id != reference["dataset_id"]
-        or json_bytes(dataset.config.metadata()) != json_bytes(generation_config(seed).metadata())
+        or json_bytes(dataset.config.metadata()) != json_bytes(generation_config(seed, "float64" if reference.get("pixel_representation") == "raster-fp64" else "float32").metadata())
         or dataset.model_metadata["asset_sha256"] != MODEL_SHA256
         or dataset.correspondences != DFL_TO_GNM
     ):
@@ -74,6 +80,7 @@ def _input_digest(arrays, ids, image_sizes, dataset_id):
 def verify_fitter_input(observations, provenance, *, device):
     """Verify the transferred observation values without exposing truth to the fitter."""
     precise = provenance.get("pixel_representation") == "compensated-fp32-high-low-v1"
+    dtype = torch.float64 if provenance.get("pixel_representation") == "raster-fp64" else torch.float32
     fields = INPUT_FIELDS | ({"pixel_low": "pixel_low"} if precise else {})
     for item in observations:
         if (item.pixel_low is not None) != precise:
@@ -84,8 +91,8 @@ def verify_fitter_input(observations, provenance, *, device):
             raise ValueError("V6 fitting requires estimated cameras and observations on the requested device")
         if item.correspondences != DFL_TO_GNM or item.coordinate_convention != "aligned_pixels":
             raise ValueError("V6 fitting requires the original correspondences and aligned-pixel coordinates")
-        if item.landmarks.dtype != torch.float32 or item.weights.dtype != torch.float32:
-            raise ValueError("V6 fitting requires float32 landmarks and weights")
+        if item.landmarks.dtype != dtype or item.weights.dtype != dtype:
+            raise ValueError("Fitting observation dtype differs from the immutable reference")
     arrays = {name: torch.stack([getattr(obs, field) for obs in observations]).cpu().numpy()
               for name, field in fields.items()}
     ids = tuple(obs.observation_id for obs in observations)
@@ -106,13 +113,14 @@ def verified_subset(parent, count):
     sizes = (parent.config.image_size,) * count
     factors = [row["camera"]["focal_length"][0] / min(parent.config.image_size)
                for row in truth.observations]
-    if not np.allclose(factors, SCHEDULE[:count], atol=0, rtol=2 * np.finfo("float32").eps):
+    if not np.allclose(factors, SCHEDULE[:count], atol=0, rtol=2 * np.finfo(parent.config.dtype).eps):
         raise ValueError("Reference focal factors differ from the requested V6 schedule")
     expression_norms = np.linalg.norm(truth.arrays["expression"], axis=1)
     precise = dataset.has_precision_pixels
     fields = INPUT_FIELDS | ({"pixel_low": "pixel_low"} if precise else {})
     provenance = {
-        "pixel_representation": "compensated-fp32-high-low-v1" if precise else "raster-fp32",
+        "pixel_representation": "compensated-fp32-high-low-v1" if precise else (
+            "raster-fp64" if parent.config.dtype == "float64" else "raster-fp32"),
         "precision_source_dataset_id": dataset.precision_source_dataset_id,
         "source_dataset_id": parent.dataset_id, "dataset_id": dataset.dataset_id,
         "observation_ids": ids, "actual_observations": len(ids),

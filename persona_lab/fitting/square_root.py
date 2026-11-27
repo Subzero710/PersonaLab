@@ -1,4 +1,4 @@
-"""FP32 block least-squares: eliminate local coordinates in residual space.
+"""FP32 or FP64 block least-squares: eliminate local coordinates in residual space.
 
 No normal matrix or subtractive Schur complement is formed. Damping is an
 explicit augmented residual, and prediction uses the actual rounded step.
@@ -21,8 +21,9 @@ class SquareRootBlocks:
 
     @classmethod
     def create(cls, jacobian, residual, width, batch_size):
-        if jacobian.dtype != torch.float32 or residual.dtype != torch.float32:
-            raise ValueError("Square-root FP32 requires float32 Jacobians and residuals")
+        if (jacobian.dtype not in (torch.float32, torch.float64)
+                or residual.dtype != jacobian.dtype or residual.device != jacobian.device):
+            raise ValueError("Square-root requires matching FP32 or FP64 Jacobians and residuals on one device")
         a, b = jacobian[..., :width], jacobian[..., width:]
         gradient = BlockVector(
             (a.mT @ residual.unsqueeze(-1)).squeeze(-1).sum(0),

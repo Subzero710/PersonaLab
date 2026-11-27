@@ -152,3 +152,16 @@ class ScalabilityReportTests(unittest.TestCase):
         joint = comparison["observability"]["final"]["blocks"]["joint_identity_and_focal"]
         self.assertEqual(joint["ranks"], [1, 2])
         self.assertFalse(joint["singular_values"]["matches"])
+
+
+def test_explicit_fp64_report_pair_and_precision_mismatch():
+    cpu = _header("cpu") | {"cases": [_completed("cpu")]}
+    cuda = _header("cuda") | {"cases": [_completed("cuda")]}
+    for report in (cpu, cuda):
+        report.update(dtype="float64", fp64_square_root=True)
+        report["cases"][0].update(dtype="float64", actual_dtype="float64")
+    result = scalability_report.compare_reports(cpu, cuda)
+    assert result["pairs"][0]["status"] == "consistent"
+    cuda = _header("cuda") | {"cases": [_completed("cuda")]}
+    with unittest.TestCase().assertRaises(ValueError):
+        scalability_report.compare_reports(cpu, cuda)

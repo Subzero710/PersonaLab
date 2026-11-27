@@ -103,7 +103,7 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
     active_blocks = []
     rows = 0
     def jacobians():
-        if parameters.config.lm.arithmetic_dtype != "float32":
+        if not parameters.config.lm.uses_square_root:
             for index in range(len(data)):
                 yield jacobian_at(data, parameters, layout, base, position, index)[1]
             return

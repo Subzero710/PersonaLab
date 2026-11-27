@@ -16,27 +16,29 @@ BATCHING_SEED = 42
 BATCHING_COUNT = 100
 
 
-def _case(experiment, seed, count, device, batch_size):
+def _case(experiment, seed, count, device, batch_size, dtype="float32"):
     return {
         "case": f"{experiment}-{device.replace(':', '-')}-{seed}-{count}-batch{batch_size}",
         "experiment": experiment, "scenario": "C", "seed": seed,
-        "requested_observations": count, "requested_device": device, "dtype": "float32",
+        "requested_observations": count, "requested_device": device, "dtype": dtype,
         "batch_size": batch_size, "focal_mode": "per-observation",
         "configured_initial_focal_factor": 1.5, "identity_ground_truth": "head-only",
         "strategy": "J200",
     }
 
 
-def case_matrix(seeds=SEEDS, counts=COUNTS, devices=DEVICES, batch_size=PRIMARY_BATCH_SIZE, *, primary_only=False):
+def case_matrix(seeds=SEEDS, counts=COUNTS, devices=DEVICES, batch_size=PRIMARY_BATCH_SIZE, *, primary_only=False, dtype="float32"):
     """List every configuration, including the shared primary/batching case."""
-    primary = [_case("primary", seed, count, device, batch_size)
+    if dtype not in ("float32", "float64"):
+        raise ValueError("Unsupported scalability arithmetic")
+    primary = [_case("primary", seed, count, device, batch_size, dtype)
                for device, count, seed in product(devices, counts, seeds)]
     if primary_only:
         return primary
     batching = []
     for device, size in product(devices, BATCH_SIZES):
-        case = _case("batching", BATCHING_SEED, BATCHING_COUNT, device, size)
-        if size == batch_size == PRIMARY_BATCH_SIZE and BATCHING_SEED in seeds and BATCHING_COUNT in counts:
-            case["reuse_case"] = _case("primary", BATCHING_SEED, BATCHING_COUNT, device, size)["case"]
+        case = _case("batching", BATCHING_SEED, BATCHING_COUNT, device, size, dtype)
+        if size == batch_size and (dtype == "float64" or size == PRIMARY_BATCH_SIZE) and BATCHING_SEED in seeds and BATCHING_COUNT in counts:
+            case["reuse_case"] = _case("primary", BATCHING_SEED, BATCHING_COUNT, device, size, dtype)["case"]
         batching.append(case)
     return primary + batching

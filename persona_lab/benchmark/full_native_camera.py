@@ -105,7 +105,7 @@ def final_gradient(model, observations, fit, groups):
         layout = StageCoordinates.from_parameters(parameters, groups)
         base = parameters.values()
         point = layout.pack(base, model.reference, len(data))
-        if config.lm.arithmetic_dtype == "float32":
+        if config.lm.uses_square_root:
             system = square_root_blocks(data, parameters, layout, point)
             scales = system.scales(config.lm.diagonal_floor)
         else:

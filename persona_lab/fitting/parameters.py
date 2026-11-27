@@ -260,7 +260,7 @@ class FittingParameters:
         cameras = self.initial.cameras
         if any(not isinstance(c, PerspectiveCamera) or c.image_size != cameras[0].image_size
                for c in cameras):
-            raise ValueError("Batched FP32 fitting requires one perspective raster size")
+            raise ValueError("Batched square-root fitting requires one perspective raster size")
         with torch.no_grad():
             camera = stack_cameras(cameras)
             return camera, _rotation_matrix(camera.rotation)

@@ -1717,3 +1717,55 @@ reports as matched identical-input comparisons. The compensated forward
 adds elementwise work and may cost more time or memory, especially on
 CUDA; measure pilot costs before any full-scale campaign. CPU/CUDA exact
 agreement and exact GNM identity recovery require actual integration runs.
+
+### V6.6 native FP64 square-root validation
+
+The explicit `--scalability-fp64-qr --dtype float64` protocol uses the
+existing native sparse GNM deformation functions and standard camera
+projection for both the objective and the batched autograd Jacobian.
+It uses the original logarithmic camera coordinates, FP64 parameter
+updates, and the same augmented local/shared QR without forming normal
+matrices. No compensated FP32 forward, precision change, solver fallback,
+truth initialization or relaxed stopping/acceptance/recovery threshold is
+used. This mode currently requires the joint, zero-prior, per-observation
+perspective protocol with a common raster size. Other fitting modes are
+unchanged; they are not a fallback from this protocol.
+
+FP32 observations (including high/low controls) are not native FP64
+reference observations. Promoting an archived FP32 raster to FP64 does
+not remove its generation error. Preserve the historical archives and
+create a separate native CPU FP64 reference index, using the same seed,
+scenario, ordered views and focal schedule. The native reference is a
+new experimental dataset, not a matched-input timing comparison with the
+FP32 experiments. Dataset fingerprints and dtype are validated before
+fitting. FP32-only legacy truth probes are explicitly not applicable to
+this mode; native/sparse residual and geometry comparisons, truth QR,
+final gradient, full-native metrics and observability remain reported.
+
+```sh
+# Generate only the previously failing seed's native FP64 parent and fit 50 views.
+docker compose run --rm personalab python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cpu --dtype float64 \
+  --seeds 43 --scalability-counts 50 --scalability-batch-size 32 \
+  --scalability-primary-only --scalability-fp64-qr \
+  --scalability-datasets-out datasets/synthetic/focal-scalability-fp64-43 \
+  --spectra --output outputs/v6.6-pilot-43-cpu
+
+# Reuse the identical verified reference on CUDA.
+docker compose --profile cuda run --rm personalab-cuda python -m persona_lab.benchmark.fitting_study \
+  --protocol corrected-identity --identity-studies focal-scalability \
+  --model-file /cache/gnm/v3_0/gnm_head.npz --device cuda --dtype float64 \
+  --seeds 43 --scalability-counts 50 --scalability-batch-size 32 \
+  --scalability-primary-only --scalability-fp64-qr \
+  --scalability-datasets-in datasets/synthetic/focal-scalability-fp64-43 \
+  --spectra --output outputs/v6.6-pilot-43-cuda
+```
+
+Use the existing `scalability_report` reader for the two native FP64 reports.
+The reader rejects mixed precision reports. The scientific and spectral
+comparison tolerances are unchanged. FP64 batch-32 primary and batching
+rows at seed 42/count 100 reuse one fit; no duplicate execution is needed.
+Official-asset CPU/CUDA integration, recovery and scalability still need
+measured validation. The full real-image regularized/staged QR protocol is
+not introduced by this experiment.

@@ -78,12 +78,13 @@ def _scoring_geometry(model, state, truth, trainable):
     }
 
 
-def _scalability_config(batch_size, *, precision_forward=False):
+def _scalability_config(batch_size, *, precision_forward=False, fp64_square_root=False):
     return _fit_config("levenberg-marquardt", focal_convergence.STRATEGIES["J200"], {
         "camera_mode": "estimated", "camera_model": "perspective",
         "focal_mode": "per-observation", "initial_focal_factor": 1.5,
         "batch_size": batch_size, "train_identity": ("head",),
-        "lm": replace(STRICT_LM, arithmetic_dtype="float32", jacobian_rows=32,
+        "lm": replace(STRICT_LM, arithmetic_dtype="float64" if fp64_square_root else "float32",
+                      fp64_square_root=fp64_square_root, jacobian_rows=32,
                       fp32_forward="compensated" if precision_forward else "projection"),
         "identity_weight": 0.0, "expression_weight": 0.0, "pose_weight": 0.0, "camera_weight": 0.0,
     })
@@ -866,8 +867,11 @@ def _compare_reference(record, historical):
 def _run_scalability(args, parser):
     if args.protocol != "corrected-identity" or args.identity_studies != [SCALABILITY_STUDY]:
         parser.error("select focal-scalability alone under --protocol corrected-identity")
-    if args.dtype != "float32":
-        parser.error("focal-scalability requires explicit --dtype float32")
+    if args.scalability_fp64_qr:
+        if args.dtype != "float64" or args.scalability_precision_forward:
+            parser.error("FP64 QR requires --dtype float64 without --scalability-precision-forward")
+    elif args.dtype != "float32":
+        parser.error("focal-scalability requires --dtype float32 or explicit --scalability-fp64-qr --dtype float64")
     if any(getattr(args, name) is not None for name in (
         "experiments", "adam_iterations", "lm_iterations", "noise_levels", "identity_weights",
         "expression_weights", "historical_report", "camera_study_budgets", "focal_study_budget",
@@ -909,7 +913,8 @@ def _run_scalability(args, parser):
     ):
         parser.error("the reference output directory must not contain the study output directory")
     try:
-        return focal_scalability.run(args, lambda batch: _scalability_config(batch, precision_forward=args.scalability_precision_forward),
+        return focal_scalability.run(args, lambda batch: _scalability_config(batch, precision_forward=args.scalability_precision_forward,
+                                         fp64_square_root=args.scalability_fp64_qr),
                                      scalability_report.write_reports)
     except (OSError, ValueError) as error:
         parser.error(str(error))
@@ -943,6 +948,8 @@ def main(argv=None):
     parser.add_argument("--scaling-full", action="store_true")
     parser.add_argument("--scalability-counts", type=int, nargs="+", metavar="N")
     parser.add_argument("--scalability-batch-size", type=int, metavar="N")
+    parser.add_argument("--scalability-fp64-qr", action="store_true",
+                        help="native FP64 geometry, observations, parameters and batched square-root QR")
     parser.add_argument("--scalability-precision-forward", action="store_true",
                         help="Explicit experimental compensated GNM forward and native camera coordinates")
     parser.add_argument("--scalability-primary-only", action="store_true", help="Explicit pilot without the batching sweep")
@@ -965,7 +972,7 @@ def main(argv=None):
         parser.error("--output is required")
     if SCALABILITY_STUDY in (args.identity_studies or ()):
         return _run_scalability(args, parser)
-    if args.scalability_primary_only or args.scalability_profile_kernels or args.scalability_precision_forward or any(getattr(args, name) is not None for name in (
+    if args.scalability_primary_only or args.scalability_profile_kernels or args.scalability_precision_forward or args.scalability_fp64_qr or any(getattr(args, name) is not None for name in (
         "scalability_counts", "scalability_batch_size", "scalability_datasets_in", "scalability_datasets_out",
     )):
         parser.error("scalability options require the corrected-identity focal-scalability study")

@@ -9,7 +9,7 @@ from dataclasses import replace
 
 import torch
 
-from ..fitting.batched_jacobian import batch_jacobian, fp32_geometry_batch, residual_fp32_batch
+from ..fitting.batched_jacobian import batch_jacobian, fp32_geometry_batch, residual_fp32_batch, residual_fp64_batch
 from ..fitting.levenberg_marquardt import StageCoordinates, bound_mask, square_root_blocks
 from ..fitting.observations import prepare_observations
 from ..fitting.parameters import FittingParameters, TensorState
@@ -82,6 +82,8 @@ def reference_precision(model, dataset, subject, observations, fit):
     """Replay reference parameters and estimate the local least-squares bias."""
     truth = dataset.ground_truth(subject)
     config = fit.config
+    if config.lm.fp64_square_root:
+        return _reference_fp64(model, dataset, subject, observations, fit)
     data = prepare_observations(observations, model.reference, config)
     arrays = truth.arrays
     clean = model.tensor(arrays["clean"])
@@ -178,3 +180,69 @@ def reference_precision(model, dataset, subject, observations, fit):
         "archived_low_component": _stats(target_low, mask),
         "final_objective_recomputed_from_physical_snapshot": final_objective,
     }
+
+
+@torch.no_grad()
+def _reference_fp64(model, dataset, subject, observations, fit):
+    """Independent native FP64 oracle; FP32-only legacy comparisons are not applicable."""
+    config = fit.config
+    if dataset.config.dtype != "float64" or dataset.has_precision_pixels or model.reference.dtype != torch.float64:
+        raise ValueError("FP64 oracle requires a native FP64 archive and model")
+    data = prepare_observations(observations, model.reference, config)
+    truth = dataset.ground_truth(subject)
+    arrays = truth.arrays
+    if tuple(row["id"] for row in truth.observations) != data.ids:
+        raise ValueError("Oracle observation order differs from fitted order")
+    clean = model.tensor(arrays["clean"])
+    if not torch.equal(clean[data.eligible], data.pixels[data.eligible]):
+        raise ValueError("FP64 oracle requires clean eligible observations")
+    cameras = tuple(camera_from_record(row["camera"], dtype=torch.float64, device=model.reference.device)
+                    for row in truth.observations)
+    state = TensorState(*(model.tensor(arrays[name]) for name in ("identity", "expression", "rotations", "translation")), cameras)
+    parameters = FittingParameters(model, data, state, fit.selection, config)
+    layout = StageCoordinates.from_parameters(parameters, config.stages[-1].groups)
+    point = layout.pack(parameters.values(), model.reference, len(data))
+    native, sparse, batched = [], [], []
+    native_xyz, sparse_xyz, batch_xyz = [], [], []
+    for i, camera in enumerate(cameras):
+        args = (arrays["identity"], arrays["expression"][i], arrays["rotations"][i], arrays["translation"][i])
+        points = model.landmarks(*args)
+        native_xyz.append(points)
+        native.append(project_dfl(points, camera, dataset.correspondences))
+        points = parameters.landmark_geometry(state.identity, state.expression[i:i+1], state.rotations[i:i+1], state.translation[i:i+1])[0]
+        sparse_xyz.append(points)
+        sparse.append(project_dfl(points, camera, dataset.correspondences))
+    for start in range(0, len(data), config.batch_size):
+        stop = min(start + config.batch_size, len(data))
+        values = parameters.values().batch(start, stop)
+        batch_xyz.append(parameters.landmark_geometry(state.identity, state.expression[start:stop],
+                                                       state.rotations[start:stop], state.translation[start:stop]))
+        _, r = residual_fp64_batch(data, parameters, start, stop, values)
+        batched.append(r)
+    native, sparse, residual = torch.stack(native), torch.stack(sparse), torch.cat(batched)
+    def geometry_error(a, b):
+        delta = a - b
+        if not torch.isfinite(delta).all():
+            raise ValueError("Nonfinite FP64 oracle geometry")
+        return {"landmark_rms_m": float(delta.square().sum(-1).mean().sqrt()),
+                "max_absolute_coordinate_m": float(delta.abs().max())}
+    final_objective = None
+    if fit.final is not None:
+        from ..fitting.observability import _state
+        final_state = _state(model, data, config, fit.selection, None, fit, "final")
+        final_parameters = FittingParameters(model, data, final_state, fit.selection, config)
+        final_objective = evaluate_objective(model, data, final_parameters, least_squares=True)[0].total
+    half_ulp = torch.maximum(torch.nextafter(clean, torch.full_like(clean, float("inf"))) - clean,
+                            clean - torch.nextafter(clean, torch.full_like(clean, -float("inf")))) * 0.5
+    return {"status": "evaluated", "used_for_fitting": False, "device": str(model.reference.device),
+            "dtype": str(model.reference.dtype), "forward_mode": "native-fp64", "target_representation": "raster-fp64",
+            "native_single_view_minus_archive": _stats(native-clean, data.eligible),
+            "sparse_single_view_minus_native": _stats(sparse-native, data.eligible),
+            "sparse_batched_minus_sparse_single": _stats(residual-(sparse-clean), data.eligible),
+            "sparse_batched_absolute_minus_archive": _stats(residual, data.eligible),
+            "sparse_single_view_geometry_minus_native": geometry_error(torch.stack(sparse_xyz), torch.stack(native_xyz)),
+            "sparse_batched_geometry_minus_sparse_single": geometry_error(torch.cat(batch_xyz), torch.stack(sparse_xyz)),
+            "stored_pixel_half_ulp_envelope": _stats(half_ulp, data.eligible),
+            "truth_linearization": _probe(data, parameters, layout, point),
+            "legacy_fp32_probes": {"status": "not_applicable", "reason": "Native FP64 protocol; no FP32 conversion"},
+            "final_objective_recomputed_from_physical_snapshot": final_objective}

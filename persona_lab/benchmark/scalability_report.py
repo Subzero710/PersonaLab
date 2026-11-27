@@ -46,7 +46,7 @@ def _paired_rows(records):
             raise ValueError(f"Invalid detailed report pointer for {row['case']}")
         elif row["experiment"] == "primary" and (
             row["seed"], row["requested_observations"], row["batch_size"]
-        ) == (BATCHING_SEED, BATCHING_COUNT, PRIMARY_BATCH_SIZE):
+        ) == (BATCHING_SEED, BATCHING_COUNT, row["batch_size"] if row["dtype"] == "float64" else PRIMARY_BATCH_SIZE):
             reusable[row["case"]] = row
         yield raw, row
 
@@ -416,7 +416,8 @@ def _validate_report(report, device_type):
         or report.get("requested_identity_studies") != [STUDY]
         or report.get("protocol") != "corrected-identity"
         or report.get("reference_base_commit") != BASE_COMMIT
-        or report.get("dtype") != "float32"
+        or report.get("dtype") not in ("float32", "float64")
+        or report.get("dtype") == "float64" and report.get("fp64_square_root") is not True
         or requested.split(":", 1)[0] != device_type
         or not isinstance(report.get("cases"), list) or not report["cases"]
     ):
@@ -425,7 +426,7 @@ def _validate_report(report, device_type):
     for _, row in _paired_rows(report["cases"]):
         requested_device = row["requested_device"]
         actual = row.get("actual_execution_device")
-        if requested_device != requested or (
+        if row["dtype"] != report["dtype"] or requested_device != requested or (
             actual is not None and not (actual == requested or requested == "cuda" and actual.startswith("cuda:"))
         ):
             raise ValueError(f"Case {row['case']} device disagrees with its report")
@@ -445,7 +446,7 @@ def _validate_report(report, device_type):
 
 def compare_reports(cpu, cuda):
     cpu_cases, cuda_cases = _validate_report(cpu, "cpu"), _validate_report(cuda, "cuda")
-    unequal = [key for key in ("model_asset_sha256", "focal_schedule", "spectra_requested") if cpu.get(key) != cuda.get(key)]
+    unequal = [key for key in ("model_asset_sha256", "focal_schedule", "spectra_requested", "dtype", "fp64_square_root") if cpu.get(key) != cuda.get(key)]
     if unequal or not is_sha256(cpu.get("model_asset_sha256")) or len(cpu.get("focal_schedule", ())) != 600:
         raise ValueError(f"Incompatible V6 report metadata: {', '.join(unequal) or 'missing model or focal schedule'}")
     keys = cpu_cases.keys() & cuda_cases.keys()

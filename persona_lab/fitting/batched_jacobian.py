@@ -12,25 +12,27 @@ from .precise_projection import perspective_residual
 from .parameters import InvalidGeometry
 from . import precision_geometry as pg
 from .losses import _landmark_residuals
+from ..camera import project
+from ..coordinates import gnm_to_frontal_axes
 
 
 def _require_supported(parameters, layout):
     config = parameters.config
     camera_names = ("camera_native", "local_focal") if config.lm.fp32_forward == "compensated" else ("camera_delta", "local_log_focal")
-    if (config.lm.arithmetic_dtype != "float32" or config.camera_mode != "estimated"
+    if (not config.lm.uses_square_root or config.camera_mode != "estimated"
         or config.camera_model != "perspective" or config.focal_mode != "per-observation"
         or not layout.identity or layout.shared_focal or set(layout.names) != {"expression", "pose", *camera_names}
         or any(getattr(config, f"{group}_weight") != 0 for group in ("identity", "expression", "pose", "camera"))):
-        raise ValueError("FP32 square-root fitting currently requires the explicit zero-prior joint per-observation perspective protocol")
+        raise ValueError("Square-root fitting currently requires the explicit zero-prior joint per-observation perspective protocol")
 
 
-def _fp32_inputs(parameters, start, stop, values):
-    """Shared sparse geometry and decoded physical camera for FP32 fitting."""
+def _batched_inputs(parameters, start, stop, values):
+    """Shared sparse geometry and decoded physical camera for batched fitting."""
     count = stop - start
     initial = parameters.initial
     if (values.identity is None or values.expression is None or values.pose is None
         or values.root is not None or values.shared_log_focal is not None):
-        raise ValueError("FP32 square-root projection requires joint per-view perspective fitting")
+        raise ValueError("Square-root projection requires joint per-view perspective fitting")
     identity = initial.identity.expand(count, -1).index_copy(1, parameters.identity_indices,
                                                             values.identity.expand(count, -1))
     expression = initial.expression[start:stop].index_copy(1, parameters.expression_indices, values.expression)
@@ -57,16 +59,35 @@ def _fp32_inputs(parameters, start, stop, values):
 
 
 def fp32_geometry_batch(parameters, start, stop, values):
-    args, camera, matrices = _fp32_inputs(parameters, start, stop, values)
+    args, camera, matrices = _batched_inputs(parameters, start, stop, values)
     landmarks = parameters.landmark_geometry(*args)
     rotated = (landmarks * landmarks.new_tensor((1, -1, -1))) @ matrices.mT
     return rotated, camera, landmarks
 
 
+def residual_fp64_batch(data, parameters, start, stop, values):
+    """Native GNM sparse forward and standard projection, wholly in FP64."""
+    if not parameters.config.lm.fp64_square_root:
+        raise ValueError("Select the FP64 square-root protocol explicitly")
+    args, camera, _ = _batched_inputs(parameters, start, stop, values)
+    if any(t.dtype != torch.float64 for t in (*args, camera.translation, camera.focal_length)):
+        raise ValueError("FP64 square-root requires FP64 geometry and camera coordinates")
+    if data.pixel_low is not None:
+        raise ValueError("FP64 square-root requires native raster observations, not FP32 high/low archives")
+    if not bool((camera.translation[:, 2] > 0).all()):
+        raise InvalidGeometry("Estimated perspective translation Z must be positive")
+    landmarks = parameters.landmark_geometry(*args)
+    try:
+        projected = project(gnm_to_frontal_axes(landmarks), camera)
+    except ValueError as error:
+        raise InvalidGeometry(str(error)) from error
+    return _landmark_residuals(projected, data, start, stop)
+
+
 def residual_fp32_batch(data, parameters, start, stop, values):
     """Evaluate one common compensated residual for trials and derivatives."""
     if parameters.config.lm.fp32_forward == "compensated":
-        args, camera, matrices = _fp32_inputs(parameters, start, stop, values)
+        args, camera, matrices = _batched_inputs(parameters, start, stop, values)
         indices = data.gnm_indices[start:stop, :, None].expand(-1, -1, 2)
         eligible = data.eligible[start:stop, :, None]
         with torch.no_grad():
@@ -112,7 +133,11 @@ def batch_jacobian(data, parameters, layout, position, start, stop, *, legacy_ab
     values = replace(parameters.values().batch(start, stop), identity=point[:, :width], **{
         name: point[:, width:][:, columns] for name, columns in layout.columns()
     })
-    if legacy_absolute:
+    if parameters.config.lm.fp64_square_root:
+        if legacy_absolute:
+            raise ValueError("FP32 legacy probe is not defined for FP64 square-root")
+        normalized, _ = residual_fp64_batch(data, parameters, start, stop, values)
+    elif legacy_absolute:
         # Explicit diagnostic only: V6.1-style absolute raster residual.
         rotated, camera, _ = fp32_geometry_batch(parameters, start, stop, values)
         xyz = rotated + camera.translation[:, None, :]

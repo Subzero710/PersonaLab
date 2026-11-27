@@ -22,7 +22,7 @@ from .model import MODEL_SHA256, load_benchmark_model
 from .residual_precision import reference_precision
 from .scalability_cases import BASE_COMMIT, SCHEMA_VERSION, STUDY, case_matrix
 from .scalability_data import (
-    REFERENCE_SCHEMA, PRECISION_REFERENCE_SCHEMA, SCHEDULE, generate_parent, load_parent, verified_subset, verify_fitter_input,
+    REFERENCE_SCHEMA, PRECISION_REFERENCE_SCHEMA, FP64_REFERENCE_SCHEMA, SCHEDULE, generate_parent, load_parent, verified_subset, verify_fitter_input,
 )
 from .scalability_monitoring import CaseMeasurements, environment
 from .storage import json_bytes, read_json, write_json
@@ -167,12 +167,14 @@ def run_worker(job, fit_function, score_fit):
         measurements.start("environment")
         record["environment"] = environment(device)
         config = FitConfig.from_dict(job["config"])
-        if dtype != torch.float32 or config.lm.arithmetic_dtype != "float32":
-            raise ValueError("V6 requires FP32 model and LM arithmetic")
+        if config.lm.arithmetic_dtype != job["case"]["dtype"] or not config.lm.uses_square_root:
+            raise ValueError("Scalability requires explicitly matched model and square-root arithmetic")
 
         phase, error_kind = "dataset_loading", "invalid_dataset"
         measurements.start(phase)
         parent = load_parent(Path(job["dataset"]), record["seed"], job["reference"])
+        if parent.config.dtype != job["case"]["dtype"]:
+            raise ValueError("Reference archive dtype does not match the requested fitting precision")
         dataset, subject, provenance = verified_subset(parent, record["requested_observations"])
         record.update(provenance, generation=parent.config.metadata())
         del parent
@@ -205,7 +207,7 @@ def run_worker(job, fit_function, score_fit):
                   f"objective={log.losses.total:.7g} rms_px={log.reprojection.rms_px:.7g} "
                   f"elapsed={log.elapsed_seconds:.2f}s device={model.reference.device}", flush=True)
 
-        print(f"{record['case']} fitting on {model.reference.device} FP32 square-root QR compensated residual", flush=True)
+        print(f"{record['case']} fitting on {model.reference.device} {config.lm.arithmetic_dtype} square-root QR", flush=True)
         fit = fit_function(model, observations, config, initial=None, trace_stages=True, profile=measurements,
                            progress=progress)
         measurements.start("fit_record_preparation")
@@ -320,9 +322,11 @@ def _references(args, output, seeds, *, model_available, device_error):
     if args.scalability_datasets_in is not None:
         try:
             reference = read_json(index_path)
+            if args.scalability_fp64_qr != (reference.get("schema") == FP64_REFERENCE_SCHEMA):
+                raise ValueError("Native FP64 fitting requires a native FP64 reference index, never a converted FP32 archive")
             if reference.get("schema") == PRECISION_REFERENCE_SCHEMA and not args.scalability_precision_forward:
                 raise ValueError("High/low references require --scalability-precision-forward")
-            if (reference.get("schema") not in (REFERENCE_SCHEMA, PRECISION_REFERENCE_SCHEMA) or reference.get("focal_schedule") != list(SCHEDULE)
+            if (reference.get("schema") not in (REFERENCE_SCHEMA, PRECISION_REFERENCE_SCHEMA, FP64_REFERENCE_SCHEMA) or reference.get("focal_schedule") != list(SCHEDULE)
                     or reference.get("model_asset_sha256") != MODEL_SHA256
                     or not isinstance(reference.get("parents"), dict)):
                 raise ValueError("V6 reference index has incompatible schema, focal schedule or model asset")
@@ -331,6 +335,9 @@ def _references(args, output, seeds, *, model_available, device_error):
         parents = reference["parents"]
         for seed in seeds:
             entry = parents.get(str(seed))
+            if isinstance(entry, dict) and ((entry.get("pixel_representation") == "raster-fp64")
+                    != (reference["schema"] == FP64_REFERENCE_SCHEMA)):
+                return root, {}, {s: _failure("invalid_dataset", "dataset_loading", "Reference index/parent dtype mismatch") for s in seeds}
             if isinstance(entry, dict) and ((entry.get("pixel_representation") == "compensated-fp32-high-low-v1")
                     != (reference["schema"] == PRECISION_REFERENCE_SCHEMA)):
                 return root, {}, {s: _failure("invalid_dataset", "dataset_loading", "Reference index/parent representation mismatch") for s in seeds}
@@ -344,14 +351,14 @@ def _references(args, output, seeds, *, model_available, device_error):
     parents, failures = {}, {}
     for seed in seeds:
         started = perf_counter()
-        print(f"Generating CPU float32 reference dataset for seed {seed}", flush=True)
+        print(f"Generating CPU {args.dtype} reference dataset for seed {seed}", flush=True)
         try:
-            parents[str(seed)] = generate_parent(root / f"seed-{seed}", seed, args.model_file)
+            parents[str(seed)] = generate_parent(root / f"seed-{seed}", seed, args.model_file, dtype=args.dtype)
             parents[str(seed)]["generation_seconds"] = perf_counter() - started
         except (ArithmeticError, OSError, RuntimeError, ValueError, MemoryError) as error:
             failures[seed] = _failure(backend_failure(error) or "dataset_generation_failure", "dataset_generation", error)
     _publish(index_path, {
-        "schema": REFERENCE_SCHEMA, "focal_schedule": SCHEDULE,
+        "schema": FP64_REFERENCE_SCHEMA if args.scalability_fp64_qr else REFERENCE_SCHEMA, "focal_schedule": SCHEDULE,
         "model_asset_sha256": MODEL_SHA256, "parents": parents,
     })
     return root, parents, failures
@@ -399,7 +406,7 @@ def run(args, config_for, write_reports):
     cases_path = output / "cases"
     cases_path.mkdir()
     cases = case_matrix(args.seeds, args.scalability_counts, (args.device,), args.scalability_batch_size,
-                        primary_only=args.scalability_primary_only)
+                        primary_only=args.scalability_primary_only, dtype=args.dtype)
     model_available = args.model_file is not None and Path(args.model_file).is_file()
     device_error = None
     try:
@@ -416,16 +423,18 @@ def run(args, config_for, write_reports):
         "seeds": args.seeds, "observation_counts": args.scalability_counts,
         "primary_batch_size": args.scalability_batch_size, "spectra_requested": args.spectra,
         "precision_forward": args.scalability_precision_forward,
+        **({"fp64_square_root": True} if args.scalability_fp64_qr else {}),
         "primary_only": args.scalability_primary_only, "kernel_profiling_requested": args.scalability_profile_kernels,
         "preflight": {"model_file_exists": model_available, "device_error": device_error,
                       "reference_errors": {str(seed): error for seed, error in reference_errors.items()}},
-        "implementation_patch_base_commit": "3bce6df71a94d285e84ade27f61a77772b75757b",
+        "implementation_patch_base_commit": "47ac3f8d32c60102264cad99045dfccfe68ba0e9",
         "reference_directory": str(root), "reference_parents": parents, "focal_schedule": SCHEDULE,
         "batch_semantics": {
             "configurable": ["pose grid initialization", "sparse objective", "observation Jacobians", "local QR elimination"],
             "observation_jacobians": "independent batched view coordinates; bounded autograd residual-row batches",
             "schur": "square-root local QR elimination and shared residual QR; no normal equations",
-            "residual": ("compensated GNM and perspective high/low FP32; native translation/focal coordinates"
+            "residual": ("native sparse GNM and standard FP64 perspective; logarithmic camera coordinates"
+                         if args.scalability_fp64_qr else "compensated GNM and perspective high/low FP32; native translation/focal coordinates"
                          if args.scalability_precision_forward else "compensated homogeneous perspective FP32; immutable V6 raster observations"),
         },
         "device_transfers": [

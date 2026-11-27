@@ -131,6 +131,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     use_adam = config.solver == "adam"
     if config.lm.arithmetic_dtype == "float32" and (use_adam or model.reference.dtype != torch.float32):
         raise ValueError("FP32 LM arithmetic requires an FP32 model and Levenberg-Marquardt")
+    if config.lm.fp64_square_root and (use_adam or model.reference.dtype != torch.float64):
+        raise ValueError("FP64 square-root requires an FP64 model and Levenberg-Marquardt")
     if trace_stages and use_adam:
         raise ValueError("Stage tracing requires the Levenberg–Marquardt solver")
     device = model.reference.device

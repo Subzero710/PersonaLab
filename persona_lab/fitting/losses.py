@@ -139,9 +139,10 @@ def evaluate_objective(model, data, parameters, active=(), *, candidate=None, le
         for start in range(0, len(data), batch_size):
             stop = min(start + batch_size, len(data))
             values = None if candidate is None else candidate.batch(start, stop)
-            if least_squares and parameters.config.lm.arithmetic_dtype == "float32":
-                from .batched_jacobian import residual_fp32_batch
-                normalized, pixel_residual = residual_fp32_batch(data, parameters, start, stop,
+            if least_squares and parameters.config.lm.uses_square_root:
+                from .batched_jacobian import residual_fp32_batch, residual_fp64_batch
+                residual = residual_fp64_batch if parameters.config.lm.fp64_square_root else residual_fp32_batch
+                normalized, pixel_residual = residual(data, parameters, start, stop,
                     parameters.values().batch(start, stop) if values is None else values)
                 projected = None
             else:
