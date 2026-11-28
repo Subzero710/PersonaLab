@@ -8,7 +8,6 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from ..benchmark.storage import digest_json
 from .configuration import FitConfig
 from .initialization import initialize
 from .levenberg_marquardt import fit_stage as fit_lm_stage
@@ -266,16 +265,8 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     if config.lm.fp64_square_root:
         instrumentation["square_root_stages"] = run.square_root_stages
     elapsed = perf_counter() - started
-    dense_provenance = {}
-    if data.surface is not None:
-        observation = data.observations[0]
-        dense_provenance = {"dense_observations": {
-            "schema": observation.schema.identifier, "schema_version": observation.schema.version,
-            "coordinate_convention": observation.coordinate_convention, "provider": observation.provider,
-            "provider_version": observation.provider_version, "provider_asset_sha256": observation.asset.sha256,
-            "correspondences_sha256": digest_json(correspondences.to_record()),
-            "ordered_point_count": len(observation.schema.points), "mapped_point_count": len(data.surface.slots),
-        }}
+    provenance = data.dense_provenance()
+    dense_provenance = {} if provenance is None else {"dense_observations": provenance}
     return FitResult(
         model=deepcopy(model.metadata), dtype=model.numpy_dtype.name,
         device=str(device), config=config, selection=selection,

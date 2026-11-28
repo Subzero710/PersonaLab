@@ -10,7 +10,7 @@ import torch
 
 from persona_lab.coordinates import ImageSize
 from persona_lab.dense_dataset import load_dense_dataset
-from persona_lab.extract_dense import extract_dataset
+from persona_lab.extract_dense import _selected, extract_dataset
 from persona_lab.mediapipe_face import ASSET, PROVIDER, PROVIDER_VERSION, SCHEMAS, MediaPipeFaceLandmarker, as_pixels
 
 
@@ -76,6 +76,13 @@ def test_dfl_zip_attempt_order_and_failures(tmp_path, dfl_jpeg, monkeypatch):
     assert dataset.attempts[0].error
     assert dataset.observations[0].source.source_image_size is None
     assert [x["observation_id"] for x in a["attempts"]] == [x["observation_id"] for x in b["attempts"]]
+    explicit = settings | {"selection": "first", "max_images": None, "observation_ids": ("zip:c.jpg", "zip:a.jpg"),
+                           "require_images": 2}
+    c = extract_dataset(path, tmp_path / "explicit", **explicit)
+    assert [row["observation_id"] for row in c["attempts"]] == ["zip:c.jpg", "zip:a.jpg"]
+    assert (c["succeeded"], c["failed"]) == (1, 1)
+    with pytest.raises(ValueError, match="required image count"):
+        extract_dataset(path, tmp_path / "wrong-count", **(explicit | {"require_images": 3}))
 
 
 def test_pinned_mediapipe_real_image(tmp_path):
@@ -88,3 +95,14 @@ def test_pinned_mediapipe_real_image(tmp_path):
     assert info["attempts"][0]["valid"] == 478
     assert info["attempts"][0]["mapped"] == 0
     assert info["attempts"][0]["score_slots"] == {"confidence": 0, "visibility": 0, "presence": 0}
+
+
+def test_explicit_selection_preserves_order_and_rejects_missing():
+    inputs = [SimpleNamespace(reference=name) for name in ("a.jpg", "b.jpg", "c.jpg")]
+    assert [row.reference for row in _selected(inputs, None, "first", 42, ("c.jpg", "a.jpg"))] == [
+        "c.jpg", "a.jpg",
+    ]
+    with pytest.raises(ValueError, match="Requested observations missing"):
+        list(_selected(inputs, None, "first", 42, ("absent.jpg",)))
+    with pytest.raises(ValueError, match="Duplicate requested observation ID"):
+        list(_selected(inputs + inputs, None, "first", 42, ("a.jpg",)))

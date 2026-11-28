@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 import torch
 
-from .benchmark.storage import publish_directory, write_json
+from .benchmark.storage import publish_directory, read_json, write_json
 from .coordinates import ImageSize
 from .dense_dataset import ExtractionAttempt, _write_rows
 from .dense_observations import DenseObservation, ImageProvenance
@@ -55,7 +55,20 @@ def _ordinary_sources(path):
         raise ValueError("Image input must be JPEG, PNG, WebP or an image directory; use dfl for a DFL ZIP")
 
 
-def _selected(items, limit, selection, seed):
+def _selected(items, limit, selection, seed, observation_ids=None):
+    if observation_ids is not None:
+        wanted = set(observation_ids)
+        found = {}
+        for item in items:
+            identifier = item.sample_id if isinstance(item, (DFLFaceSample, SampleRejection)) else item.reference
+            if identifier in wanted:
+                if identifier in found:
+                    raise ValueError(f"Duplicate requested observation ID: {identifier}")
+                found[identifier] = item
+        if missing := wanted - found.keys():
+            raise ValueError(f"Requested observations missing: {', '.join(sorted(missing))}")
+        yield from (found[identifier] for identifier in observation_ids)
+        return
     if selection == "first":
         yield from items if limit is None else islice(items, limit)
         return
@@ -146,7 +159,7 @@ def observation_statistics(obs, mapped_slots=()):
 
 def extract_dataset(path, output, *, input_kind, schema_name, provider, asset_version, asset_path,
                     device, batch_size, max_images=None, selection="first", seed=42, overlays=0,
-                    score_threshold=0.5):
+                    score_threshold=0.5, observation_ids=None, require_images=None):
     """Write observations and failure/coverage diagnostics even for zero detections."""
     if provider != PROVIDER or schema_name not in SCHEMAS:
         raise ValueError("Select an implemented provider and schema explicitly")
@@ -158,11 +171,25 @@ def extract_dataset(path, output, *, input_kind, schema_name, provider, asset_ve
         raise ValueError("Require a positive batch size and limit, and nonnegative seed and overlay count")
     if selection not in ("first", "sample") or (selection == "sample" and max_images is None):
         raise ValueError("Select first or sample with an explicit maximum image count")
+    if observation_ids is not None:
+        if not isinstance(observation_ids, (list, tuple)) or not observation_ids or any(
+            not isinstance(identifier, str) or not identifier.strip() for identifier in observation_ids
+        ) or len(set(observation_ids)) != len(observation_ids):
+            raise ValueError("Explicit selection requires nonempty unique ordered observation IDs")
+        if selection != "first" or max_images is not None:
+            raise ValueError("Explicit observation IDs cannot be combined with sampling or a maximum image count")
+        observation_ids = tuple(observation_ids)
+    if require_images is not None and (type(require_images) is not int or require_images < 1):
+        raise ValueError("Required image count must be a positive integer")
+    if observation_ids is not None and require_images is not None and len(observation_ids) != require_images:
+        raise ValueError("Explicit observation IDs do not match the required image count")
     schema = SCHEMAS[schema_name]
     path = Path(path).absolute()
     configuration = {
         "input": str(path), "input_kind": input_kind, "device": device, "application_batch_size": batch_size,
-        "native_inference_batch_size": 1, "max_images": max_images, "selection": selection,
+        "native_inference_batch_size": 1, "max_images": max_images,
+        "selection": "explicit" if observation_ids is not None else selection,
+        "observation_ids": None if observation_ids is None else list(observation_ids), "require_images": require_images,
         "seed": seed, "overlays": overlays, "score_threshold": score_threshold, "num_faces": 2,
         "model_path": str(Path(asset_path).absolute()), "preprocessing": PREPROCESSING,
     }
@@ -174,7 +201,7 @@ def extract_dataset(path, output, *, input_kind, schema_name, provider, asset_ve
                                       score_threshold=score_threshold) as detector:
             initialization_seconds = perf_counter() - start
             items = iter_dataset(path) if input_kind == "dfl" else _ordinary_sources(path)
-            candidates = _selected(items, max_images, selection, seed)
+            candidates = _selected(items, max_images, selection, seed, observation_ids)
             overlay_count = 0
             input_error = None
 
@@ -246,6 +273,9 @@ def extract_dataset(path, output, *, input_kind, schema_name, provider, asset_ve
                         yield ExtractionAttempt(identifier, reference, obs, error, size, digest)
 
             _write_rows(stage, schema, provider, PROVIDER_VERSION, ASSET, configuration, attempts())
+        if require_images is not None and len(report_rows) != require_images:
+            message = f"Expected exactly {require_images} selected observations, got {len(report_rows)}"
+            input_error = message if input_error is None else f"{input_error}; {message}"
         report = {
             "attempted": len(report_rows), "succeeded": sum(row["error"] is None for row in report_rows),
             "failed": sum(row["error"] is not None for row in report_rows),
@@ -272,17 +302,29 @@ def main(argv=None):
     parser.add_argument("--device", required=True)
     parser.add_argument("--batch-size", required=True, type=int, help="application batches; the task detects one image at a time")
     parser.add_argument("--max-images", type=int)
+    parser.add_argument("--require-images", type=int)
+    explicit = parser.add_mutually_exclusive_group()
+    explicit.add_argument("--observation-id", action="append", help="ordered input observation ID; repeatable")
+    explicit.add_argument("--observation-ids-from-fit", type=Path,
+                          help="read exact ordered observation_ids from a previous fitting result.json")
     parser.add_argument("--selection", choices=("first", "sample"), default="first")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overlays", type=int, default=0)
     parser.add_argument("--score-threshold", type=float, default=0.5)
     args = parser.parse_args(argv)
     try:
+        ids = args.observation_id
+        if args.observation_ids_from_fit is not None:
+            record = read_json(args.observation_ids_from_fit)
+            ids = record.get("observation_ids")
+            if not isinstance(ids, list) or not ids:
+                raise ValueError("Previous fitting result requires a nonempty observation_ids array")
         report = extract_dataset(
             args.input, args.output, input_kind=args.input_kind, schema_name=args.schema,
             provider=args.provider, asset_version=args.model_version, asset_path=args.model_file,
             device=args.device, batch_size=args.batch_size, max_images=args.max_images,
             selection=args.selection, seed=args.seed, overlays=args.overlays, score_threshold=args.score_threshold,
+            observation_ids=ids, require_images=args.require_images,
         )
     except (OSError, DFLError, ValueError, RuntimeError) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")

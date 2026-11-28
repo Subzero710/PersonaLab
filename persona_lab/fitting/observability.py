@@ -240,6 +240,8 @@ def _state(model, data, config, selection, initial, fit, at, *, geometry=None):
         or fit.observation_ids != data.ids or fit.selection != selection
     ):
         raise ValueError("Observability requires the same model, configuration and ordered observations as the fit")
+    if fit.runtime.get("dense_observations") != data.dense_provenance():
+        raise ValueError("Observability requires the same dense schema, provider and correspondence definition as the fit")
     if at in ("initial", "final"):
         snapshot = getattr(fit, at)
     else:

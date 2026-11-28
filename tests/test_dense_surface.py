@@ -13,12 +13,13 @@ from persona_lab.dense_fit_diagnostics import write_dense_projections
 from persona_lab.dense_observations import ImageProvenance
 from persona_lab.dense_observability import ProjectionProtocol, analyze_jacobians, projection_jacobian
 from persona_lab.dense_reference import oracle_definition, oracle_observations, oracle_state
-from persona_lab.fitting import FitConfig, LevenbergMarquardtConfig, Stage, fit_identity
+from persona_lab.fitting import FitConfig, LevenbergMarquardtConfig, Stage, fit_identity, load_result, save_result
 from persona_lab.fitting.batched_jacobian import batch_jacobian
 from persona_lab.fitting.configuration import GROUPS
 from persona_lab.fitting.initialization import initialize
 from persona_lab.fitting.levenberg_marquardt import StageCoordinates, observation_jacobian
 from persona_lab.fitting.observations import prepare_observations
+from persona_lab.fitting.observability import identity_observability
 from persona_lab.fitting.parameters import FitInitialization, FittingParameters, TensorState, resolve_selection
 from persona_lab.surface_correspondences import NativeLocation, load_correspondences
 from persona_lab.validate_dense import validate_geometry
@@ -66,6 +67,24 @@ def test_native_location_validation_and_order(tmp_path, model):
     torch.testing.assert_close(bound.evaluate(vertices)[0], landmarks[30], rtol=0, atol=1e-12)
 
 
+def test_mediapipe_lip_native_group_validation(model):
+    # Synthetic binding probe only, not a reviewed detector-to-mesh association.
+    from persona_lab.mediapipe_face import SCHEMAS
+    from persona_lab.surface_correspondences import SurfaceCorrespondence, SurfaceCorrespondences
+
+    schema = SCHEMAS["mediapipe-face-478-dfl"]
+    groups = dict(zip(model.head.vertex_group_names,
+                      model.head.vertex_groups.detach().cpu().numpy(), strict=True))
+    entries = [SurfaceCorrespondence(point.identifier, None, (), "Unmapped test slot", "Synthetic test")
+               for point in schema.points]
+    for slot, group in ((0, "upper_lip"), (17, "lower_lip")):
+        vertex = int((groups[group] > 0).nonzero()[0][0])
+        entries[slot] = SurfaceCorrespondence(schema.points[slot].identifier, NativeLocation("vertex", vertex),
+                                             (group,), "Synthetic native group test", "Not a real association")
+    definition = SurfaceCorrespondences(schema, model.metadata["topology_sha256"], tuple(entries))
+    assert definition.bind(model).slots == (0, 17)
+
+
 def test_visibility_does_not_supply_mapping_or_confidence(model):
     definition = oracle_definition(model, 45)
     state = oracle_state(model, 44, 1)
@@ -84,7 +103,7 @@ def test_visibility_does_not_supply_mapping_or_confidence(model):
 
 
 @pytest.mark.parametrize("count", [79, 131])
-def test_dense_fit_residual_order_and_batch_parity(model, count):
+def test_dense_fit_residual_order_and_batch_parity(model, count, tmp_path):
     definition = oracle_definition(model, count)
     state = oracle_state(model, 42, 3)
     observations = oracle_observations(model, definition, 42, state)
@@ -118,6 +137,45 @@ def test_dense_fit_residual_order_and_batch_parity(model, count):
         torch.testing.assert_close(jacobian[index, active], j, rtol=1e-10, atol=1e-12)
     result = fit_identity(model, observations, config, correspondences=definition)
     assert result.final_reprojection.overall.rms_px < result.initial_reprojection.overall.rms_px
+    output = tmp_path / "fit"
+    save_result(output, result)
+    restored = load_result(output, model=model)
+    assert restored.runtime["dense_observations"] == result.runtime["dense_observations"]
+    assert restored.initial_reprojection == result.initial_reprojection
+    assert restored.final_reprojection == result.final_reprojection
+    assert restored.history == result.history
+    assert restored.optimization == result.optimization
+    assert restored.observation_ids == result.observation_ids
+    import numpy as np
+    for name in ("identity", "expression", "rotations", "translation"):
+        np.testing.assert_array_equal(getattr(restored.final, name), getattr(result.final, name))
+    manifest_path = output / "result.json"
+    manifest = read_json(manifest_path)
+    assert manifest["schema_version"] == 5
+    from copy import deepcopy
+    for corrupt in ("slots", "mapped", "digest", "legacy", "statistics", "history"):
+        bad = deepcopy(manifest)
+        provenance = bad["runtime"]["dense_observations"]
+        if corrupt == "slots":
+            provenance["ordered_point_count"] += 1
+        elif corrupt == "mapped":
+            provenance["mapped_point_count"] = 1
+        elif corrupt == "digest":
+            provenance["correspondences_sha256"] = "invalid"
+        elif corrupt == "legacy":
+            bad["schema_version"] = 3
+        elif corrupt == "statistics":
+            bad["final_reprojection"]["observations"][0]["excluded_count"] += 1
+        else:
+            bad["history"][0]["reprojection"]["excluded_count"] += 1
+        write_json(manifest_path, bad)
+        with pytest.raises(ValueError):
+            load_result(output, model=model)
+    write_json(manifest_path, manifest)
+    first, *rest = definition.entries
+    changed = replace(definition, entries=(replace(first, evidence=first.evidence + "; changed"), *rest))
+    with pytest.raises(ValueError, match="same dense schema, provider and correspondence"):
+        identity_observability(model, observations, config, fit=restored, at="final", correspondences=changed)
     chosen = replace(config, landmark_subset=(68, 69, 70))
     data = prepare_observations(observations, model.reference, chosen, model=model, correspondences=definition)
     assert data.counts.tolist() == [3, 3, 3]

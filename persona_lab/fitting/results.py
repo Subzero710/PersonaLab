@@ -10,7 +10,7 @@ import torch
 from ..benchmark.dataset import camera_from_record, camera_to_record
 from ..benchmark.predictions import ObservationPrediction, SubjectPrediction
 from ..benchmark.storage import (
-    json_bytes, publish_directory, read_arrays, read_json, require_keys, validate_arrays, write_json,
+    is_sha256, json_bytes, publish_directory, read_arrays, read_json, require_keys, validate_arrays, write_json,
 )
 from ..camera import Camera, PerspectiveCamera
 from ..correspondences import DFL_LANDMARK_COUNT
@@ -21,7 +21,8 @@ from .monitoring import AcceptedState, Linearization, OptimizationDiagnostics, O
 from .parameters import ParameterSelection, TensorState, copy_camera, resolve_selection, validate_model
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+FOCAL_SCHEMA_VERSION = 4
 FAILED_STATUSES = ("failed", "numerical_failure", "no_acceptable_step")
 STATUSES = ("budget_exhausted", "converged", "stopped", *FAILED_STATUSES)
 ARRAY_FIELDS = ("identity", "expression", "rotations", "translation")
@@ -173,8 +174,18 @@ def _camera_records(state, ids):
 
 
 def _metadata(result):
+    dense = "dense_observations" in result.runtime
+    version = SCHEMA_VERSION if dense else (3 if result.config.focal_mode == "fixed" else FOCAL_SCHEMA_VERSION)
+    slots, mapped = _reprojection_dimensions(result.runtime, version)
+    if dense:
+        # Validate counts before publishing, not only on loading a result.
+        for stats in (result.initial_reprojection, result.final_reprojection):
+            _decode_reprojection(None if stats is None else asdict(stats), len(result.observation_ids), slots, mapped)
+        for item in result.history:
+            _validate_pixel_statistics(item.reprojection, len(result.observation_ids) * slots,
+                                       len(result.observation_ids) * mapped)
     return {
-        "schema_version": 3 if result.config.focal_mode == "fixed" else SCHEMA_VERSION,
+        "schema_version": version,
         "model": deepcopy(result.model),
         "dtype": result.dtype,
         "device": result.device,
@@ -227,29 +238,59 @@ def _fields(cls, value, *, legacy=False, optional=()):
     return value
 
 
-def _decode_reprojection(record, count):
+def _reprojection_dimensions(runtime, version):
+    """Versions 1–4 are legacy DFL results; version 5 declares dense provenance."""
+    if not isinstance(runtime, dict):
+        raise ValueError("Fitting runtime metadata must be an object")
+    if version < SCHEMA_VERSION:
+        if "dense_observations" in runtime:
+            raise ValueError("Dense fitting results require schema 5; rerun the dense fit")
+        return DFL_LANDMARK_COUNT, DFL_LANDMARK_COUNT
+    dense = runtime.get("dense_observations")
+    require_keys(dense, {"schema", "schema_version", "coordinate_convention", "provider",
+                        "provider_version", "provider_asset_sha256", "correspondences_sha256",
+                        "ordered_point_count", "mapped_point_count"}, "Dense fitting provenance")
+    if any(not isinstance(dense[name], str) or not dense[name].strip()
+           for name in ("schema", "provider", "provider_version")) or (
+        type(dense["schema_version"]) is not int or dense["schema_version"] < 1
+        or dense["coordinate_convention"] not in ("source_pixels", "aligned_pixels")
+        or not is_sha256(dense["provider_asset_sha256"])
+        or not is_sha256(dense["correspondences_sha256"])
+    ):
+        raise ValueError("Invalid dense fitting provenance")
+    slots, mapped = dense["ordered_point_count"], dense["mapped_point_count"]
+    if type(slots) is not int or type(mapped) is not int or not 0 < mapped <= slots:
+        raise ValueError("Invalid dense fitting point counts")
+    return slots, mapped
+
+
+def _validate_pixel_statistics(item, slots, mapped):
+    if (
+        type(item.eligible_count) is not int or type(item.excluded_count) is not int
+        or not 0 < item.eligible_count <= mapped or item.excluded_count < 0
+        or item.eligible_count + item.excluded_count != slots
+        or any(type(value) not in (int, float) or not np.isfinite(value) or value < 0
+               for value in (item.mean_px, item.rms_px, item.max_px))
+    ):
+        raise ValueError("Invalid reprojection statistics")
+
+
+def _decode_reprojection(record, count, slots=DFL_LANDMARK_COUNT, mapped=None):
     if record is None:
         return None
+    mapped = slots if mapped is None else mapped
     fields_ = _fields(Reprojection, record)
     per_observation = tuple(PixelStatistics(**_fields(PixelStatistics, item))
                             for item in fields_["observations"])
     overall = PixelStatistics(**_fields(PixelStatistics, fields_["overall"]))
-    if len(per_observation) != count or overall.eligible_count != sum(
-        item.eligible_count for item in per_observation
+    if len(per_observation) != count or any(
+        getattr(overall, field) != sum(getattr(item, field) for item in per_observation)
+        for field in ("eligible_count", "excluded_count")
     ):
         raise ValueError("Reprojection statistics do not match the fitting observations")
-    for item, slots in (
-        (overall, count * DFL_LANDMARK_COUNT),
-        *((item, DFL_LANDMARK_COUNT) for item in per_observation),
-    ):
-        if (
-            type(item.eligible_count) is not int or type(item.excluded_count) is not int
-            or item.eligible_count <= 0 or item.excluded_count < 0
-            or item.eligible_count + item.excluded_count != slots
-            or any(type(value) not in (int, float) or value < 0
-                   for value in (item.mean_px, item.rms_px, item.max_px))
-        ):
-            raise ValueError("Invalid reprojection statistics")
+    _validate_pixel_statistics(overall, count * slots, count * mapped)
+    for item in per_observation:
+        _validate_pixel_statistics(item, slots, mapped)
     return Reprojection(overall, per_observation)
 
 
@@ -348,7 +389,7 @@ def _load_result(path, model):
     # Also rejects finite-looking literals that overflow the JSON decoder's float.
     json_bytes(manifest)
     version = manifest.get("schema_version")
-    if type(version) is not int or version not in (1, 2, 3, SCHEMA_VERSION):
+    if type(version) is not int or version not in (1, 2, 3, FOCAL_SCHEMA_VERSION, SCHEMA_VERSION):
         raise ValueError("Unsupported fitting result schema")
     keys = {
         "schema_version", "model", "dtype", "device", "config", "selection", "gauge", "observation_ids",
@@ -379,6 +420,7 @@ def _load_result(path, model):
     if version == 1 and isinstance(options, dict):
         options = {"solver": "adam"} | options
     config = FitConfig.from_dict(options)
+    slots, mapped = _reprojection_dimensions(manifest["runtime"], version)
     if version < 4 and config.focal_mode != "fixed":
         raise ValueError("Trainable focal length requires fitting result schema 4")
     if version == 1 and (config.solver != "adam" or "lm" in manifest["config"]):
@@ -447,6 +489,8 @@ def _load_result(path, model):
         entry = _fields(Iteration, item).copy()
         entry["losses"] = LossValues(**_fields(LossValues, entry["losses"]))
         entry["reprojection"] = PixelStatistics(**_fields(PixelStatistics, entry["reprojection"]))
+        if version == SCHEMA_VERSION:
+            _validate_pixel_statistics(entry["reprojection"], len(ids) * slots, len(ids) * mapped)
         history.append(Iteration(**entry))
     stages = tuple(
         StageSummary(**(_fields(StageSummary, item, legacy=version < 3) | {
@@ -459,8 +503,8 @@ def _load_result(path, model):
     result = FitResult(
         deepcopy(model.metadata), dtype.name, manifest["device"], config, selection, tuple(ids),
         initialization, states["initial"], states.get("final"),
-        _decode_reprojection(manifest["initial_reprojection"], len(ids)),
-        _decode_reprojection(manifest["final_reprojection"], len(ids)),
+        _decode_reprojection(manifest["initial_reprojection"], len(ids), slots, mapped),
+        _decode_reprojection(manifest["final_reprojection"], len(ids), slots, mapped),
         tuple(history), stages, status, reason, manifest["runtime"],
         _decode_optimization(manifest.get("optimization"), config, len(ids), legacy=version < 3),
     )

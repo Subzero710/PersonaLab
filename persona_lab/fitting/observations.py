@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from ..benchmark.storage import digest_json
 from ..coordinates import _validate_tensor
 from ..correspondences import DFL_LANDMARK_COUNT
 from ..dense_observations import DenseObservation, subset_mask
@@ -34,6 +35,18 @@ class FittingObservations:
 
     def __len__(self):
         return len(self.observations)
+
+    def dense_provenance(self):
+        if self.surface is None:
+            return None
+        observation = self.observations[0]
+        return {
+            "schema": observation.schema.identifier, "schema_version": observation.schema.version,
+            "coordinate_convention": observation.coordinate_convention, "provider": observation.provider,
+            "provider_version": observation.provider_version, "provider_asset_sha256": observation.asset.sha256,
+            "correspondences_sha256": digest_json(self.surface.definition.to_record()),
+            "ordered_point_count": len(observation.schema.points), "mapped_point_count": len(self.surface.slots),
+        }
 
 
 def prepare_observations(observations, reference: Tensor, config: FitConfig, *,

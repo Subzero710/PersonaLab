@@ -1,0 +1,19 @@
+# Use with: docker compose -f compose.yaml -f compose.facepoints.yaml --profile facepoints ...
+services:
+  facepoints-cuda:
+    profiles: [facepoints]
+    image: personalab:facepoints-cu128
+    build:
+      context: .
+      dockerfile: docker/facepoints.Dockerfile
+      args:
+        TORCH_VARIANT: cu128
+    gpus: all
+    network_mode: none
+    user: "${PERSONALAB_UID:-1000}:${PERSONALAB_GID:-1000}"
+    environment:
+      HOME: /tmp
+    volumes:
+      - ./datasets:/app/datasets:ro
+      - ./models:/app/models:ro
+      - ./outputs:/app/outputs

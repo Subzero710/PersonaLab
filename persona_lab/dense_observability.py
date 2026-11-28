@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from .benchmark.model import load_benchmark_model
-from .benchmark.storage import digest_arrays, publish_directory, write_json
+from .benchmark.storage import digest_arrays, digest_json, publish_directory, write_json
 from .camera import project
 from .coordinates import gnm_to_frontal_axes
 from .correspondences import DFL_TO_GNM
@@ -289,6 +289,15 @@ def run_study(model, output, *, seeds, views, reference_count, column_batch, thr
                         print(f"seed {seed} {name} {budget} {camera}: "
                               f"identity rank {report['identity']['after_all_nuisance']['rank']}/253", flush=True)
         write_json(stage / "oracle_correspondences.json", definition.to_record())
+        mapped_record = None
+        if mapped is not None:
+            write_json(stage / "mapped_correspondences.json", mapped.to_record())
+            mapped_record = {
+                "schema": mapped.schema.identifier, "schema_version": mapped.schema.version,
+                "sha256": digest_json(mapped.to_record()),
+                "ordered_mapped_point_ids": [mapped.entries[index].point_id for index in bound.slots],
+                "path": "mapped_correspondences.json",
+            }
         write_json(stage / "report.json", {
             "format": "personalab-full-native-observation-study-v1",
             "model": model.metadata, "seeds": list(seeds), "views": views,
@@ -306,6 +315,7 @@ def run_study(model, output, *, seeds, views, reference_count, column_batch, thr
                 "each local expression block in view order."
             ),
             "elapsed_seconds": perf_counter() - start, "peak_process_rss_bytes": peak_rss_bytes(),
+            "mapped_correspondences": mapped_record,
             "blockers": blockers, "studies": studies,
         })
 
