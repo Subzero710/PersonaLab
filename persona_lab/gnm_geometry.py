@@ -47,25 +47,29 @@ def load_sparse_landmarks(
 
 
 class SparseHeadLandmarks:
-    """Evaluate the official landmark vertices with the native GNM operations."""
+    """Evaluate weighted native surface locations with the existing GNM operations."""
 
-    def __init__(self, head):
-        config = load_sparse_landmarks(head)
+    def __init__(self, head, *, indices=None, weights=None):
+        if indices is None and weights is None:
+            config = load_sparse_landmarks(head)
+            indices, weights = config.indices, config.weights
+        elif indices is None or weights is None:
+            raise ValueError("Surface geometry requires both native indices and weights")
         template = head.template_vertex_positions
-        vertices, triangles = np.unique(config.indices, return_inverse=True)
-        indices = torch.as_tensor(vertices, dtype=torch.long, device=template.device)
+        vertices, triangles = np.unique(indices, return_inverse=True)
+        native = torch.as_tensor(vertices, dtype=torch.long, device=template.device)
         self.triangles = torch.as_tensor(
-            triangles.reshape(config.indices.shape), dtype=torch.long, device=template.device,
+            triangles.reshape(indices.shape), dtype=torch.long, device=template.device,
         )
-        self.weights = torch.as_tensor(config.weights, dtype=template.dtype, device=template.device)
-        self.template = template.index_select(0, indices)
-        self.identity_basis = head.vertex_identity_basis.index_select(1, indices)
-        self.expression_basis = head.expression_basis.index_select(1, indices)
-        self.skinning_weights = head.skinning_weights.index_select(1, indices)
+        self.weights = torch.as_tensor(weights, dtype=template.dtype, device=template.device)
+        self.template = template.index_select(0, native)
+        self.identity_basis = head.vertex_identity_basis.index_select(1, native)
+        self.expression_basis = head.expression_basis.index_select(1, native)
+        self.skinning_weights = head.skinning_weights.index_select(1, native)
         self.pose_regressor = head.pose_correctives_regressor
         if self.pose_regressor is not None:
             self.pose_regressor = self.pose_regressor.reshape(-1, head.num_vertices, 3).index_select(
-                1, indices,
+                1, native,
             ).flatten(1)
         self.head = head
 

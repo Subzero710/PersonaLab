@@ -18,11 +18,11 @@ from .parameters import (
 from .results import ARRAY_FIELDS, FitResult
 
 
-def _remove_nuisance(identity, nuisance, rtol, svd=torch.linalg.svd):
+def _remove_nuisance(identity, nuisance, rtol, svd=torch.linalg.svd, *, atol=0.0):
     if not nuisance.shape[1]:
         return identity
     u, s, _ = svd(nuisance, full_matrices=False)
-    basis = u[:, s > s[0] * rtol]
+    basis = u[:, s > torch.maximum(s[0] * rtol, s.new_tensor(atol))]
     return identity - basis @ (basis.mT @ identity)
 
 
@@ -227,11 +227,12 @@ def _focal_observability(data, parameters, layout, base, position, width, rtol, 
     return result
 
 
-def _state(model, data, config, selection, initial, fit, at):
+def _state(model, data, config, selection, initial, fit, at, *, geometry=None):
     if fit is None:
         if at != "initial":
             raise ValueError("Final-state observability requires a fitted result")
-        state, _ = initialize(model, data, config, FitInitialization() if initial is None else initial)
+        state, _ = initialize(model, data, config, FitInitialization() if initial is None else initial,
+                              geometry=geometry)
         return state
     if (
         initial is not None or not isinstance(fit, FitResult) or fit.config != config
@@ -255,7 +256,7 @@ def _state(model, data, config, selection, initial, fit, at):
 
 @torch.no_grad()
 def identity_observability(model, observations, config, *, initial=None, fit=None,
-                           at="initial", rtol=1e-6, atol=0.0, operations=None):
+                           at="initial", rtol=1e-6, atol=0.0, operations=None, correspondences=None):
     """Measure unregularized sensitivity at initialization, final fit or focal calibration.
 
     Use the same landmark weights as fitting. One view is differentiated at a
@@ -277,13 +278,15 @@ def identity_observability(model, observations, config, *, initial=None, fit=Non
     if torch.is_inference_mode_enabled():
         raise ValueError("Jacobian analysis requires PyTorch autograd outside inference mode")
     validate_model(model)
-    data = prepare_observations(observations, model.reference, config)
+    data = prepare_observations(observations, model.reference, config, model=model,
+                                correspondences=correspondences)
     selection = resolve_selection(model, config)
     width = len(selection.identity)
     if not width:
         raise ValueError("Jacobian analysis requires selected identity coefficients")
-    state = _state(model, data, config, selection, initial, fit, at)
-    parameters = FittingParameters(model, data, state, selection, config)
+    geometry = None if data.surface is None else data.surface.sparse_geometry(model)
+    state = _state(model, data, config, selection, initial, fit, at, geometry=geometry)
+    parameters = FittingParameters(model, data, state, selection, config, geometry=geometry)
     layout = StageCoordinates.from_parameters(parameters, GROUPS)
     base = parameters.values()
     position = layout.pack(base, model.reference, len(data))

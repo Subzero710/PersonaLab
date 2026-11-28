@@ -155,10 +155,16 @@ def evaluate_objective(model, data, parameters, active=(), *, candidate=None, le
                 projected = None
             else:
                 state = parameters.state(start, stop, values)
-                projected = project_batch(
-                    model, state, tuple(obs.observation_id for obs in data.observations[start:stop]),
-                    check_geometry=least_squares,
-                )
+                identifiers = tuple(obs.observation_id for obs in data.observations[start:stop])
+                if data.surface is None:
+                    projected = project_batch(model, state, identifiers, check_geometry=least_squares)
+                else:
+                    points = parameters.landmark_geometry(
+                        state.identity, state.expression, state.rotations, state.translation,
+                    )
+                    if not torch.isfinite(points).all():
+                        raise InvalidGeometry("Nonfinite dense GNM coordinates")
+                    projected = project_landmarks(points, state.cameras, identifiers)
                 del state
             if least_squares:
                 if projected is not None:

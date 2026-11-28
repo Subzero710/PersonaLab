@@ -1862,3 +1862,8 @@ were in the nonfinite-residual/Jacobian fault-injection test, whose wrapper
 did not accept the `dtype` keyword. The correction forwards keyword
 arguments without changing failure assertions or runtime fitting behavior.
 Passing post-fix runs are required before reporting a clean suite.
+
+## Dense facial observations
+
+See [dense GNM observations](docs/dense-gnm.md) for extraction, schemas and fitting diagnostics,
+and [provider research](docs/dense-gnm-research.md) for the GNM release and correspondence evidence.

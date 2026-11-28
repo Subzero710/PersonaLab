@@ -1,4 +1,4 @@
-"""Fit one shared GNM v3 identity from a DeepFaceLab dataset or benchmark subject."""
+"""Fit one shared GNM v3 identity from explicit dense, DFL or benchmark observations."""
 
 import argparse
 from collections.abc import Sequence
@@ -13,13 +13,19 @@ from .benchmark.configuration import torch_options
 from .benchmark.dataset import load_dataset
 from .benchmark.model import load_benchmark_model
 from .benchmark.predictions import write_predictions
-from .benchmark.storage import publish_directory, read_json
+from .benchmark.storage import digest_json, publish_directory, read_json, write_json
+from .dense_dataset import load_dense_dataset
+from .dense_fit_diagnostics import write_dense_fit_overlays, write_dense_projections
 from .dfl import DFLFaceSample, iter_dataset
-from .fitting import FitConfig, fit_identity
+from .fitting import FitConfig, FitInitialization, fit_identity
 from .fitting.configuration import FOCAL_MODES, SOLVERS
 from .fitting.diagnostics import write_neutral_mesh, write_overlays
+from .fitting.initialization import initialize
+from .fitting.observations import prepare_observations
 from .fitting.results import FAILED_STATUSES, _write_result
+from .mediapipe_face import ASSET, PROVIDER, PROVIDER_VERSION, SCHEMAS
 from .observations import LandmarkObservation
+from .surface_correspondences import load_correspondences
 
 
 def _positive_int(text):
@@ -34,6 +40,11 @@ def _parser():
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--input", type=Path, help="DeepFaceLab ZIP, JPEG, or directory")
     inputs.add_argument("--benchmark", type=Path, help="Issue #4 benchmark dataset directory")
+    inputs.add_argument("--dense-input", type=Path, help="versioned dense observation directory")
+    parser.add_argument("--observation-schema", choices=SCHEMAS)
+    parser.add_argument("--correspondences", type=Path, help="reviewed dense surface definition")
+    parser.add_argument("--dense-images", type=Path, help="explicit original extraction input for dense overlays")
+    parser.add_argument("--diagnose-only", action="store_true", help="project the initialized dense fit without optimizing")
     parser.add_argument("--subject", help="explicit benchmark subject ID")
     parser.add_argument("--max-images", type=_positive_int)
     parser.add_argument("--require-images", type=_positive_int, help="reject unless exactly N observations are selected")
@@ -72,7 +83,7 @@ def _parser():
 
 def _config(args):
     values = read_json(args.config) if args.config else {}
-    if args.input and "camera_mode" not in values:
+    if (args.input or args.dense_input) and "camera_mode" not in values:
         values["camera_mode"] = "estimated"
     for name in (
         "camera_mode", "batch_size", "identity_weight", "expression_weight", "pose_weight",
@@ -151,10 +162,21 @@ def _run(args):
     dtype, device = torch_options(args.dtype, args.device)
     if args.benchmark and args.subject is None:
         raise ValueError("--benchmark requires --subject")
-    if args.input and (args.subject is not None or args.predictions is not None):
+    if not args.benchmark and (args.subject is not None or args.predictions is not None):
         raise ValueError("--subject and --predictions require --benchmark")
-    if args.observation_id and (not args.benchmark or args.max_images is not None or args.selection != "first"):
-        raise ValueError("--observation-id requires --benchmark without sampling or --max-images")
+    if args.observation_id and (
+        not (args.benchmark or args.dense_input) or args.max_images is not None or args.selection != "first"
+    ):
+        raise ValueError("--observation-id requires --benchmark or --dense-input without sampling or --max-images")
+    if args.dense_input:
+        if args.observation_schema is None or args.correspondences is None:
+            raise ValueError("--dense-input requires --observation-schema and --correspondences")
+        if bool(args.overlays) != bool(args.dense_images):
+            raise ValueError("Dense overlays require both --overlays and --dense-images")
+        if args.diagnose_only and (not args.overlays or args.require_convergence):
+            raise ValueError("Dense diagnostics require --overlays and do not optimize")
+    elif args.observation_schema or args.correspondences or args.dense_images or args.diagnose_only:
+        raise ValueError("Dense schema, mapping and image arguments require --dense-input")
     for path in (args.output, args.predictions):
         if path is not None and (path.exists() or path.is_symlink()):
             raise FileExistsError(f"Output already exists: {path}")
@@ -167,6 +189,7 @@ def _run(args):
     model = load_benchmark_model(args.model_file, dtype=dtype, device=device)
     load_seconds = perf_counter() - started
     samples = ()
+    mapping = None
     if args.benchmark:
         dataset = load_dataset(args.benchmark)
         if model.metadata != dataset.model_metadata:
@@ -183,6 +206,22 @@ def _run(args):
             "evaluation_dataset_id": evaluation_data.dataset_id, "subject": args.subject,
             "selected": len(ids), "selection": "explicit" if args.observation_id else args.selection,
         }
+    elif args.dense_input:
+        schema = SCHEMAS[args.observation_schema]
+        dataset = load_dense_dataset(
+            args.dense_input, schema=schema, provider=PROVIDER, provider_version=PROVIDER_VERSION,
+            asset=ASSET, device=model.reference.device, dtype=dtype,
+        )
+        mapping = load_correspondences(args.correspondences, schema)
+        all_ids = tuple(attempt.observation_id for attempt in dataset.attempts)
+        ids = tuple(args.observation_id) if args.observation_id else _selection(all_ids, args, config.seed)
+        observations = dataset.select(ids)
+        source_info = {
+            "source": str(args.dense_input), "schema": schema.identifier, "schema_version": schema.version,
+            "provider": dataset.provider, "provider_version": dataset.provider_version,
+            "asset_sha256": dataset.asset.sha256, "correspondences_sha256": digest_json(mapping.to_record()),
+            "selected": len(ids), "failed_extractions": sum(attempt.error is not None for attempt in dataset.attempts),
+        }
     else:
         observations, samples, source_info = _real_input(args, config, dtype, model.reference.device)
     if not observations:
@@ -191,20 +230,38 @@ def _run(args):
     if args.require_images is not None and len(observations) != args.require_images:
         raise ValueError(f"Expected exactly {args.require_images} observations, selected {len(observations)}")
 
+    if args.diagnose_only:
+        data = prepare_observations(observations, model.reference, config,
+                                    model=model, correspondences=mapping)
+        initial, _ = initialize(model, data, config, FitInitialization(),
+                                geometry=data.surface.sparse_geometry(model))
+        with publish_directory(args.output, completion="dense_mapping_diagnostics.json") as stage:
+            write_dense_projections(
+                stage, model, observations, data.surface, (("initial", initial),),
+                tuple(range(min(args.overlays, len(observations)))), args.dense_images,
+            )
+        print(f"Projected initialized dense observations -> {args.output}")
+        return 0
+
     def log(item):
         print(f"{item.stage} step {item.stage_iteration} (total {item.iteration}) "
               f"loss={item.losses.total:.6g} RMS={item.reprojection.rms_px:.4f} px", flush=True)
 
-    result = fit_identity(model, observations, config, progress=log)
+    result = fit_identity(model, observations, config, progress=log, correspondences=mapping)
     runtime = result.runtime | {
         "input": source_info, "model_loading_seconds": load_seconds,
     }
     result = replace(result, runtime=runtime)
     with publish_directory(args.output, completion="result.json") as stage:
+        if mapping is not None:
+            write_json(stage / "dense_correspondences.json", mapping.to_record())
         if result.final is not None:
             if args.neutral_mesh:
                 write_neutral_mesh(stage / "neutral.obj", model, result)
-            if args.overlays:
+            if args.overlays and mapping is not None:
+                write_dense_fit_overlays(stage, model, result, observations, mapping, args.overlays,
+                                         args.dense_images)
+            elif args.overlays:
                 write_overlays(stage, model, result, observations, args.overlays, samples)
         _write_result(stage, result)
     if result.status in FAILED_STATUSES:

@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     TF_NUM_INTEROP_THREADS=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libgl1 libglib2.0-0 libgomp1 \
+    ca-certificates libgl1 libglib2.0-0 libgomp1 libportaudio2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Select the PyTorch wheel explicitly. A CUDA build must not install a CPU wheel.
@@ -28,6 +28,12 @@ RUN python -m pip install --no-cache-dir \
         --constraint /tmp/constraints.txt '/tmp/gnm-shape[pytorch,jax,dev]' Pillow \
     && python -m pip check \
     && rm -rf /tmp/gnm-shape
+
+# Keep MediaPipe's contrib OpenCV wheel separate from GNM's OpenCV wheel.
+RUN python -m venv --system-site-packages /opt/mediapipe \
+    && /opt/mediapipe/bin/python -m pip install --no-cache-dir \
+        --constraint /tmp/constraints.txt mediapipe==0.10.32 \
+    && /opt/mediapipe/bin/python -m pip check
 
 WORKDIR /app
 COPY persona_lab/ /app/persona_lab/

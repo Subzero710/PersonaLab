@@ -8,6 +8,7 @@ from time import perf_counter
 import numpy as np
 import torch
 
+from ..benchmark.storage import digest_json
 from .configuration import FitConfig
 from .initialization import initialize
 from .levenberg_marquardt import fit_stage as fit_lm_stage
@@ -113,7 +114,7 @@ def _stage_boundary(model, data, parameters):
 
 
 def fit_identity(model, observations, config=None, *, initial=None, progress=None,
-                 trace_stages=False, profile=None) -> FitResult:
+                 trace_stages=False, profile=None, correspondences=None) -> FitResult:
     """Fit a single subject using only observations, a verified model and explicit inputs.
 
     Configuration and initialization errors raise ValueError. Numerical failures
@@ -139,10 +140,16 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     if profile is not None:
         profile.start("initialization")
     started = perf_counter()
-    data = prepare_observations(observations, model.reference, config)
+    data = prepare_observations(observations, model.reference, config, model=model,
+                                correspondences=correspondences)
     selection = resolve_selection(model, config)
-    initial_state, choices = initialize(model, data, config, initial)
-    parameters = FittingParameters(model, data, initial_state, selection, config)
+    geometry = None
+    if data.surface is not None:
+        if len(selection.identity) == model.head.identity_dim or len(selection.expression) == model.head.expression_dim:
+            raise ValueError("Dense fitting requires a restricted native parameter selection")
+        geometry = data.surface.sparse_geometry(model)
+    initial_state, choices = initialize(model, data, config, initial, geometry=geometry)
+    parameters = FittingParameters(model, data, initial_state, selection, config, geometry=geometry)
     groups = parameters.groups()
     if not any(stage.iterations and any(groups[name] for name in stage.groups)
                for stage in config.stages):
@@ -259,6 +266,16 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
     if config.lm.fp64_square_root:
         instrumentation["square_root_stages"] = run.square_root_stages
     elapsed = perf_counter() - started
+    dense_provenance = {}
+    if data.surface is not None:
+        observation = data.observations[0]
+        dense_provenance = {"dense_observations": {
+            "schema": observation.schema.identifier, "schema_version": observation.schema.version,
+            "coordinate_convention": observation.coordinate_convention, "provider": observation.provider,
+            "provider_version": observation.provider_version, "provider_asset_sha256": observation.asset.sha256,
+            "correspondences_sha256": digest_json(correspondences.to_record()),
+            "ordered_point_count": len(observation.schema.points), "mapped_point_count": len(data.surface.slots),
+        }}
     return FitResult(
         model=deepcopy(model.metadata), dtype=model.numpy_dtype.name,
         device=str(device), config=config, selection=selection,
@@ -266,6 +283,7 @@ def fit_identity(model, observations, config=None, *, initial=None, progress=Non
         final=final, initial_reprojection=initial_stats, final_reprojection=final_stats,
         history=tuple(history), stages=tuple(stages), status=status, reason=reason,
         runtime={
+            **dense_provenance,
             "python": platform.python_version(), "numpy": np.__version__,
             "torch": str(torch.__version__), "initialization_seconds": initialization_seconds,
             "optimization_seconds": elapsed - initialization_seconds, "total_seconds": elapsed,

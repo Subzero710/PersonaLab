@@ -24,7 +24,7 @@ class InitializationChoice:
     admissible: int
 
 
-def _candidates(model, identity, expression, rotations, translation, grid, batch_size):
+def _candidates(model, identity, expression, rotations, translation, grid, batch_size, geometry=None):
     if grid:
         angles = list(product((0, -40, 40, -75, 75), (0, -25, 25), (0, -20, 20)))
         offsets = Rotation.from_euler("yxz", angles, degrees=True).as_rotvec()
@@ -34,10 +34,15 @@ def _candidates(model, identity, expression, rotations, translation, grid, batch
         rotations = rotations.unsqueeze(0)
     landmarks = []
     for batch in rotations.split(batch_size):
-        _, points = extract_landmarks(
-            model.head, identity=identity, expression=expression.expand(len(batch), -1),
-            rotations=batch, translation=translation.expand(len(batch), -1),
-        )
+        expressions = expression.expand(len(batch), -1)
+        translations = translation.expand(len(batch), -1)
+        if geometry is None:
+            _, points = extract_landmarks(
+                model.head, identity=identity, expression=expressions,
+                rotations=batch, translation=translations,
+            )
+        else:
+            points = geometry(identity, expressions, batch, translations)
         landmarks.append(gnm_to_frontal_axes(points))
     return rotations, torch.cat(landmarks)
 
@@ -136,7 +141,7 @@ def _choose_pose(data, index, candidates, camera, kind, config, strategy):
 
 
 @torch.no_grad()
-def initialize(model, data, config, initial):
+def initialize(model, data, config, initial, *, geometry=None):
     if not isinstance(initial, FitInitialization):
         raise ValueError("Expected a FitInitialization with native tensors")
     if not isinstance(initial.observations, Mapping) or set(initial.observations) - set(data.ids) or any(
@@ -165,7 +170,9 @@ def initialize(model, data, config, initial):
         if item is base and default_candidates is not None:
             candidates = default_candidates
         else:
-            candidates = _candidates(model, identity, expression, pose, translation, grid, config.batch_size)
+            candidates = _candidates(
+                model, identity, expression, pose, translation, grid, config.batch_size, geometry,
+            )
             if item is base:
                 default_candidates = candidates
         try:

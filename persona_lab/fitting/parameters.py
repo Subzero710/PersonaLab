@@ -217,7 +217,7 @@ def observation_camera(obs, config):
 class FittingParameters:
     """Only selected entries are optimizer leaves. Fixed entries live in the initial state."""
 
-    def __init__(self, model, observations, initial, selection, config):
+    def __init__(self, model, observations, initial, selection, config, *, geometry=None):
         self.initial = initial
         self.selection = selection
         self.config = config
@@ -254,6 +254,8 @@ class FittingParameters:
         self.camera_native = nn.Parameter(torch.stack([c.translation for c in initial.cameras])) if precise else None
         self.local_focal = nn.Parameter(torch.stack([c.focal_length[:1] for c in initial.cameras])) if precise else None
         self._head = head
+        if geometry is not None:
+            self.landmark_geometry = geometry
         self._native_camera_batches = {}
 
     @cached_property

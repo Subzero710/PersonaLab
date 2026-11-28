@@ -4,7 +4,6 @@ from dataclasses import asdict, dataclass, field
 from collections.abc import Mapping
 
 from ..benchmark.configuration import finite_number
-from ..correspondences import DFL_LANDMARK_COUNT
 
 
 GROUPS = ("identity", "expression", "pose", "camera")
@@ -217,8 +216,8 @@ class FitConfig:
             object.__setattr__(self, name, _names(getattr(self, name), name))
         if self.landmark_subset is not None:
             subset = _sequence(self.landmark_subset, "Landmark subset")
-            if any(type(i) is not int or not 0 <= i < DFL_LANDMARK_COUNT for i in subset):
-                raise ValueError("Landmark subset indices must be integers in [0, 67]")
+            if any(type(i) is not int or i < 0 for i in subset):
+                raise ValueError("Landmark subset indices must be nonnegative integers")
             if not subset or len(set(subset)) != len(subset):
                 raise ValueError("Landmark subset must contain at least one index without duplicates")
             object.__setattr__(self, "landmark_subset", subset)
